@@ -133,7 +133,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'outtmpl': temp_path,
         'quiet': True,
         'noplaylist': True,
-        'ffmpeg_location': '/usr/bin/ffmpeg',  # ← ADD THIS LINE
+        'ffmpeg_location': '/usr/bin/ffmpeg',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format,
@@ -141,7 +141,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         }],
     }
     
-    # ... rest of your code unchanged
+   
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
