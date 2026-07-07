@@ -128,18 +128,26 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     temp_id = str(uuid.uuid4())
     temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.%(ext)s")
     
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': temp_path,
-        'quiet': True,
-        'noplaylist': True,
-        'ffmpeg_location': '/usr/bin/ffmpeg',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': format,
-            'preferredquality': '192',
-        }],
-    }
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'outtmpl': temp_path,
+    'quiet': False,
+    'verbose': True,
+    'noplaylist': True,
+    'ffmpeg_location': '/usr/bin/ffmpeg',
+
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android']
+        }
+    },
+
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': format,
+        'preferredquality': '192',
+    }],
+}
     
    
     
