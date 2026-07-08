@@ -308,7 +308,13 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'ffmpeg_location': '/usr/bin/ffmpeg',
         'extractor_args': {
             'youtube': {
-                'player_client': ['web', 'android']
+                # 'mweb' is yt-dlp's recommended client for PO Token-based
+                # GVS requests once a PO Token Provider plugin is installed
+                # (see bgutil-ytdlp-pot-provider in requirements.txt).
+                # 'web' respects cookies properly as a second option.
+                # 'android' stays as a last-resort fallback, though it does
+                # NOT support cookie-based auth on its own.
+                'player_client': ['mweb', 'web', 'android']
             }
         },
         'postprocessors': [{
