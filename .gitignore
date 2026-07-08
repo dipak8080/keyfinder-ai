@@ -5,3 +5,6 @@ uploads/*
 *.mp3
 *.wav
 *.mp4
+# YouTube cookies (DO NOT COMMIT)
+cookies.txt
+cookies*.txt

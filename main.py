@@ -318,6 +318,26 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         }],
     }
 
+    # Optional: use a logged-in YouTube session's cookies to reduce bot
+    # verification walls. Completely inactive unless YT_COOKIES_PATH is set
+    # to a real cookies.txt file on disk (e.g. via a Railway volume or a
+    # file baked into the image). No effect on users - this is purely
+    # server-side and doesn't require any user login or action.
+    cookies_path = os.environ.get('YT_COOKIES_PATH')
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts['cookiefile'] = cookies_path
+        logger.info(f"Using cookies file for yt-dlp: {cookies_path}")
+    elif cookies_path:
+        logger.warning(f"YT_COOKIES_PATH is set to '{cookies_path}' but that file doesn't exist - ignoring")
+
+    # Optional: route yt-dlp traffic through a proxy (e.g. residential proxy)
+    # to reduce IP-based bot detection. Inactive unless YT_PROXY_URL is set,
+    # e.g. "http://user:pass@proxyhost:port".
+    proxy_url = os.environ.get('YT_PROXY_URL')
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        logger.info("Using configured proxy for yt-dlp")
+
     audio_data = None
     try:
         try:
