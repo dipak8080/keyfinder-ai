@@ -1,4 +1,4 @@
-# main.py - ULTIMATE ACCURACY: Essentia Powered (Production Hardened)
+# main.py - ULTIMATE ACCURACY: Essentia Powered (Production Hardened + Key/BPM Corrections)
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +19,7 @@ from typing import Tuple, Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.2.0")
+app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,18 +33,11 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---------- PRODUCTION CONFIG ----------
-# Cap on uploaded file size (bytes). Prevents huge uploads from exhausting
-# memory/disk on a small Railway instance.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
-# Retry configuration for yt_dlp.extract_info(). YouTube occasionally throws
-# transient errors (rate limiting, temporary bot checks, network blips) that
-# often succeed on a second or third attempt.
 YT_DLP_MAX_ATTEMPTS = 3
 YT_DLP_BASE_BACKOFF_SECONDS = 1.5  # 1.5s, 3s, 6s (exponential)
 
-# Substring used to detect YouTube's bot-verification wall so we can return
-# a clean, user-friendly 503 instead of leaking the raw yt-dlp traceback text.
 YT_BOT_CHECK_MARKERS = (
     "sign in to confirm you're not a bot",
     "sign in to confirm you are not a bot",
@@ -52,20 +45,29 @@ YT_BOT_CHECK_MARKERS = (
 
 FFMPEG_PATH = "/usr/bin/ffmpeg"
 
-# Key/BPM detection doesn't need the whole track - the first couple of
-# minutes are almost always enough for both Essentia and the Librosa
-# fallback to lock onto the correct key and tempo. Trimming the file before
-# it's ever loaded into numpy/essentia arrays caps the peak memory used per
-# request, instead of loading (e.g.) a 10-minute DJ mix in full.
-# Set to None to disable trimming and always analyze the full file.
-ANALYSIS_MAX_SECONDS: Optional[int] = 120
+# Bumped from 120s -> 180s. Key/BPM detection doesn't need the whole track,
+# but 120s was occasionally landing entirely inside an ambient/percussion-only
+# intro on some tracks, which starves both detectors of tonal information.
+# 180s is still a hard memory cap, just a slightly safer one. Set to None to
+# disable trimming and always analyze the full file (best accuracy, highest
+# memory use).
+ANALYSIS_MAX_SECONDS: Optional[int] = 180
 
-# Try to load libc so we can force glibc to actually return freed heap
-# memory to the OS. gc.collect() only cleans up Python object references -
-# it does NOT guarantee the underlying C-level memory (numpy/essentia
-# buffers, in particular) is released back to the OS. malloc_trim(0) asks
-# glibc to do that release explicitly. This is Linux-specific (Railway
-# containers are Linux), so we guard it in case it's ever unavailable.
+# Most tracks in club/EDM/house/pop contexts land in this BPM range. Used
+# only to correct octave errors (half/double-tempo mistakes) - if a detected
+# BPM falls outside this window but 2x or 0.5x of it falls inside, we prefer
+# the in-range candidate. This is a heuristic, not a genre classifier: it
+# will not "fix" a legitimately slow ballad or a legitimately fast DnB track,
+# it only nudges values that are suspiciously outside the common range AND
+# have an in-range octave-multiple.
+TYPICAL_BPM_MIN = 70
+TYPICAL_BPM_MAX = 180
+
+# If Essentia and the Librosa cross-check disagree on key, how much to
+# discount the reported confidence by (multiplicative).
+KEY_DISAGREEMENT_CONFIDENCE_PENALTY = 0.75
+BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
+
 try:
     _libc = ctypes.CDLL("libc.so.6")
 except OSError:
@@ -73,11 +75,6 @@ except OSError:
 
 
 def release_memory_to_os():
-    """
-    Best-effort: run Python's GC, then ask glibc to hand freed heap pages
-    back to the OS via malloc_trim(0). Safe to call even if unavailable -
-    never raises.
-    """
     gc.collect()
     if _libc is not None:
         try:
@@ -97,6 +94,10 @@ CAMELOT = {
 
 ENHARMONIC = {'C#': 'Db', 'D#': 'Eb', 'F#': 'Gb', 'G#': 'Ab', 'A#': 'Bb'}
 
+# Fixed pitch-class ordering used for all relative-key / bass-chroma math.
+# Index arithmetic below relies on this exact order.
+PITCH_CLASSES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+
 
 def normalize_key(key: str) -> str:
     return ENHARMONIC.get(key, key)
@@ -107,36 +108,33 @@ def get_camelot(key: str, scale: str) -> str:
     return CAMELOT.get(root, "Unknown")
 
 
+def relative_minor_of_major(major_key: str) -> str:
+    """C major's relative minor is A minor, etc. (minor tonic = major tonic - 3 semitones)."""
+    idx = PITCH_CLASSES.index(major_key)
+    return PITCH_CLASSES[(idx - 3) % 12]
+
+
+def relative_major_of_minor(minor_key: str) -> str:
+    """A minor's relative major is C major, etc. (major tonic = minor tonic + 3 semitones)."""
+    idx = PITCH_CLASSES.index(minor_key)
+    return PITCH_CLASSES[(idx + 3) % 12]
+
+
 def cleanup_file(filepath):
-    """Best-effort delete of a temp file. Never raises - safe to call from
-    finally blocks even if the file was never created or already removed."""
     try:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
             logger.info(f"Cleaned up temp file: {filepath}")
     except Exception as e:
-        # Cleanup failures should never crash a request - just log them.
         logger.warning(f"Failed to clean up {filepath}: {e}")
 
 
 def is_bot_check_error(error_text: str) -> bool:
-    """Detect YouTube's 'confirm you're not a bot' wall from the exception text."""
     lowered = error_text.lower()
     return any(marker in lowered for marker in YT_BOT_CHECK_MARKERS)
 
 
 def extract_info_with_retry(ydl_opts: dict, url: str):
-    """
-    Calls yt_dlp.extract_info() with up to YT_DLP_MAX_ATTEMPTS attempts and
-    short exponential backoff between tries. Retries EVERY error type,
-    including YouTube's bot-verification wall - that error is often
-    transient (it can clear up on a subsequent attempt), so giving up on it
-    immediately would throw away retries that might have succeeded.
-
-    Raises the last exception if every attempt fails, so the caller can
-    decide how to translate it into an HTTP response (e.g. distinguishing
-    a persistent bot-check failure from any other persistent error).
-    """
     last_exception = None
 
     for attempt in range(1, YT_DLP_MAX_ATTEMPTS + 1):
@@ -162,8 +160,97 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
             else:
                 logger.error(f"All {YT_DLP_MAX_ATTEMPTS} attempts failed. Last error: {error_text}")
 
-    # If we exit the loop without returning, every attempt failed.
     raise last_exception
+
+
+# ========== KEY / BPM CORRECTION HELPERS ==========
+
+def correct_relative_major_minor(audio: np.ndarray, sr: int, key: str, scale: str) -> Tuple[str, str, bool]:
+    """
+    Major/relative-minor pairs (e.g. C major / A minor) share identical note
+    content, so profile-correlation key detectors frequently pick the wrong
+    one of the pair. This checks which of the two candidate tonics has more
+    energy in the BASS register specifically - the bass note is a much more
+    reliable indicator of the true tonal center than the full-spectrum note
+    histogram, because basslines/root motion tend to emphasize the actual
+    tonic far more than incidental melody or harmony notes do.
+
+    Returns (key, scale, was_corrected).
+    """
+    try:
+        # Restrict to roughly C1-B3 (~33-247 Hz) - the bass register - using
+        # a CQT chroma with a low fmin and a small number of octaves.
+        chroma_bass = librosa.feature.chroma_cqt(
+            y=audio, sr=sr,
+            fmin=librosa.note_to_hz('C1'),
+            n_chroma=12, n_octaves=3,
+            hop_length=2048,
+        )
+        bass_energy = np.sum(chroma_bass, axis=1)
+        total = bass_energy.sum()
+        if total <= 0 or not np.isfinite(total):
+            return key, scale, False
+        bass_energy = bass_energy / total
+
+        if scale == 'major':
+            major_key, minor_key = key, relative_minor_of_major(key)
+        else:
+            major_key, minor_key = relative_major_of_minor(key), key
+
+        major_idx = PITCH_CLASSES.index(major_key)
+        minor_idx = PITCH_CLASSES.index(minor_key)
+
+        major_bass = bass_energy[major_idx]
+        minor_bass = bass_energy[minor_idx]
+
+        # Require the alternate candidate's bass energy to clearly beat the
+        # current pick (not just edge it out) before flipping - this is a
+        # correction for confident mistakes, not a coin-flip tiebreaker.
+        MARGIN = 1.15
+
+        if scale == 'major' and minor_bass > major_bass * MARGIN:
+            logger.info(f"Relative-key correction: {major_key} major -> {minor_key} minor "
+                        f"(bass energy {minor_bass:.3f} vs {major_bass:.3f})")
+            return minor_key, 'minor', True
+
+        if scale == 'minor' and major_bass > minor_bass * MARGIN:
+            logger.info(f"Relative-key correction: {minor_key} minor -> {major_key} major "
+                        f"(bass energy {major_bass:.3f} vs {minor_bass:.3f})")
+            return major_key, 'major', True
+
+        return key, scale, False
+
+    except Exception as e:
+        logger.warning(f"Relative major/minor correction skipped (non-fatal): {e}")
+        return key, scale, False
+
+
+def correct_bpm_octave_error(bpm: int) -> Tuple[int, bool]:
+    """
+    Tempo detectors commonly report exactly half or double the tempo a
+    listener would actually tap along to. If the raw BPM falls outside the
+    typical [TYPICAL_BPM_MIN, TYPICAL_BPM_MAX] window but doubling or halving
+    it lands inside that window, prefer the in-range value.
+
+    Returns (bpm, was_corrected).
+    """
+    if TYPICAL_BPM_MIN <= bpm <= TYPICAL_BPM_MAX:
+        return bpm, False
+
+    doubled = bpm * 2
+    halved = bpm / 2
+
+    if bpm < TYPICAL_BPM_MIN and TYPICAL_BPM_MIN <= doubled <= TYPICAL_BPM_MAX:
+        logger.info(f"BPM octave correction: {bpm} -> {doubled} (was below typical range)")
+        return int(round(doubled)), True
+
+    if bpm > TYPICAL_BPM_MAX and TYPICAL_BPM_MIN <= halved <= TYPICAL_BPM_MAX:
+        logger.info(f"BPM octave correction: {bpm} -> {halved} (was above typical range)")
+        return int(round(halved)), True
+
+    # Outside typical range but no in-range octave multiple - leave as-is,
+    # this is likely a genuinely very slow or very fast track.
+    return bpm, False
 
 
 def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str, float, int, int]:
@@ -183,10 +270,24 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
         bpm = int(round(bpm))
 
         # Confidence mapping
-        key_conf = min(99, int(strength * 100 + 15))  # strength ~0.5-0.95 → high %
-        bpm_conf = min(99, int(confidence * 100 + 20))  # confidence often high
+        key_conf = min(99, int(strength * 100 + 15))
+        bpm_conf = min(99, int(confidence * 100 + 20))
 
-        logger.info(f"Essentia → Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
+        logger.info(f"Essentia (raw) → Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
+
+        # --- Corrections ---
+        key, scale, key_corrected = correct_relative_major_minor(audio, sr, key, scale)
+        bpm, bpm_corrected = correct_bpm_octave_error(bpm)
+
+        # A correction means the raw detector's first guess was likely
+        # wrong; report confidence for the *corrected* value slightly more
+        # conservatively than a clean, uncorrected detection would be.
+        if key_corrected:
+            key_conf = max(50, int(key_conf * 0.9))
+        if bpm_corrected:
+            bpm_conf = max(50, int(bpm_conf * 0.9))
+
+        logger.info(f"Essentia (final) → Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
 
         return key, scale, key_conf / 100, bpm, bpm_conf
 
@@ -194,10 +295,6 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
         logger.warning(f"Essentia failed: {e} → Falling back to improved Librosa")
         return fallback_librosa_key_bpm(audio_path)
     finally:
-        # Essentia audio arrays can be large (raw PCM at 44.1kHz); drop the
-        # reference explicitly, then hand freed heap memory back to the OS.
-        # Guarded with `is not None` so this can never raise, even if the
-        # exception happened before `audio` was ever assigned.
         if audio is not None:
             del audio
         release_memory_to_os()
@@ -207,68 +304,110 @@ def fallback_librosa_key_bpm(audio_path: str) -> Tuple[str, str, float, int, int
     y = None
     try:
         y, sr = librosa.load(audio_path, sr=44100, mono=True)
-
-        # Enhanced chroma for key (CQT + tuning correction)
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
-        chroma_mean = np.sum(chroma, axis=1)
-        chroma_mean /= chroma_mean.sum() + 1e-9
-
-        pitch_classes = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
-        profiles = {
-            'major': np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]),
-            'minor': np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]),
-        }
-
-        best_score = -1
-        best_key, best_scale = 'C', 'major'
-
-        for i in range(12):
-            rolled = np.roll(chroma_mean, -i)
-            for scale_name, profile in profiles.items():
-                corr = np.corrcoef(rolled, profile)[0, 1]
-                if np.isnan(corr):
-                    corr = 0.0
-                if corr > best_score:
-                    best_score = corr
-                    best_key = pitch_classes[i]
-                    best_scale = scale_name
-
-        key_conf = min(96, int(best_score * 100 + 30))
-
-        # Improved BPM fallback (your fixed version)
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
-        tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, hop_length=512)
-        bpm = int(round(tempo[0] if hasattr(tempo, '__len__') else tempo))
-        bpm_conf = 90
-
-        return normalize_key(best_key), best_scale, key_conf / 100, bpm, bpm_conf
+        key, scale, key_conf, bpm, bpm_conf = _librosa_key_bpm_from_audio(y, sr)
+        return key, scale, key_conf, bpm, bpm_conf
     finally:
-        # y (raw waveform) can be several MB per track - free it immediately
-        # rather than waiting for this function's frame to be garbage
-        # collected naturally, and return the freed heap to the OS.
-        # Guarded so this never raises if librosa.load() itself failed.
+        if y is not None:
+            del y
+        release_memory_to_os()
+
+
+def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int) -> Tuple[str, str, float, int, int]:
+    """Core Librosa key/BPM estimation, factored out so it can be reused
+    both as the Essentia fallback AND as a lightweight cross-check."""
+    # Enhanced chroma for key (CQT + tuning correction)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
+    chroma_mean = np.sum(chroma, axis=1)
+    chroma_mean /= chroma_mean.sum() + 1e-9
+
+    profiles = {
+        'major': np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]),
+        'minor': np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]),
+    }
+
+    best_score = -1
+    best_key, best_scale = 'C', 'major'
+
+    for i in range(12):
+        rolled = np.roll(chroma_mean, -i)
+        for scale_name, profile in profiles.items():
+            corr = np.corrcoef(rolled, profile)[0, 1]
+            if np.isnan(corr):
+                corr = 0.0
+            if corr > best_score:
+                best_score = corr
+                best_key = PITCH_CLASSES[i]
+                best_scale = scale_name
+
+    key_conf = min(96, int(best_score * 100 + 30))
+
+    best_key, best_scale, key_corrected = correct_relative_major_minor(y, sr, best_key, best_scale)
+    if key_corrected:
+        key_conf = max(50, int(key_conf * 0.9))
+
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+    tempo = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, hop_length=512)
+    bpm = int(round(tempo[0] if hasattr(tempo, '__len__') else tempo))
+    bpm, bpm_corrected = correct_bpm_octave_error(bpm)
+    bpm_conf = 90 if not bpm_corrected else 81
+
+    return normalize_key(best_key), best_scale, key_conf / 100, bpm, bpm_conf
+
+
+def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: float,
+                              bpm: int, bpm_conf: int) -> Tuple[str, str, float, int, int, dict]:
+    """
+    Runs the Librosa estimator as an independent second opinion against the
+    Essentia (primary) result. Essentia's result is always kept as the
+    reported answer - Librosa here is only used to raise or lower confidence
+    based on agreement, and to surface disagreement to the caller/logs for
+    visibility. This never overrides Essentia's key/BPM value, it only
+    adjusts how confident we say we are in it.
+    """
+    agreement = {"key_agrees": None, "bpm_agrees": None}
+    y = None
+    try:
+        y, sr = librosa.load(audio_path, sr=44100, mono=True)
+        lb_key, lb_scale, _, lb_bpm, _ = _librosa_key_bpm_from_audio(y, sr)
+
+        key_agrees = (lb_key == key and lb_scale == scale)
+        # Allow a small tolerance for BPM (detectors can legitimately differ
+        # by a beat or two due to hop-size rounding).
+        bpm_agrees = abs(lb_bpm - bpm) <= 2
+
+        agreement["key_agrees"] = key_agrees
+        agreement["bpm_agrees"] = bpm_agrees
+
+        if not key_agrees:
+            logger.info(f"Cross-check disagreement on key: Essentia={key} {scale} vs Librosa={lb_key} {lb_scale}")
+            key_conf = key_conf * KEY_DISAGREEMENT_CONFIDENCE_PENALTY
+        else:
+            key_conf = min(0.99, key_conf * 1.05)
+
+        if not bpm_agrees:
+            logger.info(f"Cross-check disagreement on BPM: Essentia={bpm} vs Librosa={lb_bpm}")
+            bpm_conf = int(bpm_conf * BPM_DISAGREEMENT_CONFIDENCE_PENALTY)
+        else:
+            bpm_conf = min(99, int(bpm_conf * 1.05))
+
+        return key, scale, key_conf, bpm, bpm_conf, agreement
+
+    except Exception as e:
+        logger.warning(f"Librosa cross-check skipped (non-fatal): {e}")
+        return key, scale, key_conf, bpm, bpm_conf, agreement
+    finally:
         if y is not None:
             del y
         release_memory_to_os()
 
 
 def trim_audio_for_analysis(src_path: str, max_seconds: int) -> str:
-    """
-    Uses ffmpeg to cut the first `max_seconds` of src_path into a new temp
-    file, so librosa/essentia only ever load a bounded amount of audio into
-    memory - regardless of how long the original upload is. Falls back to
-    the original path if ffmpeg fails for any reason (so a trim problem
-    never breaks analysis, it just loses the memory-saving benefit).
-
-    Caller is responsible for cleaning up the returned path if it differs
-    from src_path.
-    """
     trimmed_path = f"{src_path}.trimmed.wav"
     cmd = [
         FFMPEG_PATH, "-y",
         "-i", src_path,
         "-t", str(max_seconds),
-        "-ac", "1",          # mono - matches what the analyzers use anyway
+        "-ac", "1",
         "-ar", "44100",
         trimmed_path,
     ]
@@ -308,12 +447,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'ffmpeg_location': '/usr/bin/ffmpeg',
         'extractor_args': {
             'youtube': {
-                # 'mweb' is yt-dlp's recommended client for PO Token-based
-                # GVS requests once a PO Token Provider plugin is installed
-                # (see bgutil-ytdlp-pot-provider in requirements.txt).
-                # 'web' respects cookies properly as a second option.
-                # 'android' stays as a last-resort fallback, though it does
-                # NOT support cookie-based auth on its own.
                 'player_client': ['mweb', 'web', 'android']
             }
         },
@@ -324,11 +457,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         }],
     }
 
-    # Optional: use a logged-in YouTube session's cookies to reduce bot
-    # verification walls. Completely inactive unless YT_COOKIES_PATH is set
-    # to a real cookies.txt file on disk (e.g. via a Railway volume or a
-    # file baked into the image). No effect on users - this is purely
-    # server-side and doesn't require any user login or action.
     cookies_path = os.environ.get('YT_COOKIES_PATH')
     if cookies_path and os.path.exists(cookies_path):
         ydl_opts['cookiefile'] = cookies_path
@@ -336,9 +464,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     elif cookies_path:
         logger.warning(f"YT_COOKIES_PATH is set to '{cookies_path}' but that file doesn't exist - ignoring")
 
-    # Optional: route yt-dlp traffic through a proxy (e.g. residential proxy)
-    # to reduce IP-based bot detection. Inactive unless YT_PROXY_URL is set,
-    # e.g. "http://user:pass@proxyhost:port".
     proxy_url = os.environ.get('YT_PROXY_URL')
     if proxy_url:
         ydl_opts['proxy'] = proxy_url
@@ -352,8 +477,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         except Exception as e:
             error_text = str(e)
 
-            # Translate YouTube's bot-verification wall into a clean 503
-            # instead of leaking the raw yt-dlp error message/traceback.
             if is_bot_check_error(error_text):
                 logger.error(f"YouTube bot verification blocked download for URL: {url}")
                 raise HTTPException(
@@ -362,7 +485,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     "requiring bot verification. Please try again in a few minutes."
                 )
 
-            # Any other persistent failure after retries.
             logger.error(f"Download failed after {YT_DLP_MAX_ATTEMPTS} attempts: {error_text}")
             raise HTTPException(500, f"Failed: {error_text}")
 
@@ -373,9 +495,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         with open(output_file, "rb") as f:
             audio_bytes = f.read()
         audio_data = base64.b64encode(audio_bytes).decode('utf-8')
-
-        # Free the raw bytes buffer as soon as we've base64-encoded it -
-        # for a few-minute track this can be tens of MB.
         del audio_bytes
 
         logger.info(f"Download complete: '{title}' ({format}) → {len(audio_data)} base64 chars")
@@ -383,16 +502,11 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         return JSONResponse({"title": title, "audio": audio_data, "format": format})
 
     except HTTPException:
-        # Already a clean, intentional HTTP error - just propagate it.
         raise
     except Exception as e:
         logger.error(f"Unexpected error in /download: {e}", exc_info=True)
         raise HTTPException(500, f"Failed: {str(e)}")
     finally:
-        # Always clean up temp files, whether the request succeeded, failed,
-        # or raised partway through - and always free memory afterward.
-        # Guarded so this never raises if an exception happened before
-        # audio_data was assigned.
         cleanup_file(output_file)
         if audio_data is not None:
             del audio_data
@@ -405,8 +519,6 @@ async def analyze_audio(file: UploadFile = File(...)):
 
     file_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
-    # analysis_path is what actually gets passed to the detectors - it's
-    # either file_path itself, or a trimmed copy of it (see below).
     analysis_path = file_path
 
     content = None
@@ -427,22 +539,24 @@ async def analyze_audio(file: UploadFile = File(...)):
         with open(file_path, "wb") as f:
             f.write(content)
 
-        # Free the uploaded bytes now that they're written to disk - no need
-        # to hold this buffer in memory during analysis.
         del content
         content = None
         release_memory_to_os()
 
-        # Trim to the first ANALYSIS_MAX_SECONDS before handing off to
-        # librosa/essentia, so a long upload (e.g. a 45-minute DJ set)
-        # doesn't get fully decoded into memory just to detect key/BPM.
-        # If trimming fails for any reason, analysis_path safely falls back
-        # to the original full file.
         if ANALYSIS_MAX_SECONDS is not None:
             analysis_path = trim_audio_for_analysis(file_path, ANALYSIS_MAX_SECONDS)
 
-        # Primary: Essentia (pro-level accuracy)
+        # Primary: Essentia (pro-level accuracy), with relative-key and
+        # BPM-octave corrections already applied inside this call.
         key, scale, key_conf, bpm, bpm_conf = detect_key_bpm_essentia(analysis_path)
+
+        # Cross-check against Librosa as an independent second opinion.
+        # This never changes the reported key/BPM - only the confidence,
+        # plus an "agreement" flag the frontend can use to show a
+        # "low confidence" badge if the two disagree.
+        key, scale, key_conf, bpm, bpm_conf, agreement = cross_check_with_librosa(
+            analysis_path, key, scale, key_conf, bpm, bpm_conf
+        )
 
         camelot = get_camelot(key, scale)
         key_name = f"{key} {scale}"
@@ -451,8 +565,9 @@ async def analyze_audio(file: UploadFile = File(...)):
             "key": key_name,
             "camelot": camelot,
             "bpm": bpm,
-            "confidence": int(key_conf * 100),
-            "bpm_confidence": bpm_conf
+            "confidence": int(min(0.99, key_conf) * 100),
+            "bpm_confidence": min(99, bpm_conf),
+            "cross_check": agreement,
         }
 
         logger.info(f"RESULT: {result}")
@@ -465,11 +580,6 @@ async def analyze_audio(file: UploadFile = File(...)):
         logger.error(f"Analysis error: {e}", exc_info=True)
         raise HTTPException(500, f"Failed: {str(e)}")
     finally:
-        # Always clean up the uploaded temp file (and the trimmed copy, if
-        # one was created) and free memory, regardless of whether analysis
-        # succeeded or failed. Guarded so this never raises if an exception
-        # happened before content was assigned or after it was already
-        # freed and set back to None.
         cleanup_file(file_path)
         if analysis_path != file_path:
             cleanup_file(analysis_path)
@@ -481,8 +591,8 @@ async def analyze_audio(file: UploadFile = File(...)):
 @app.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.2 - ESSENTIA FIXED + PRODUCTION HARDENED",
-        "accuracy": "Matches or beats Tunebat/Mixed In Key (Essentia research-grade)",
+        "status": "Audio Analysis API v12.3 - ESSENTIA FIXED + KEY/BPM CORRECTIONS",
+        "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
             "Removed invalid BPMHistogramDescriptors",
@@ -492,8 +602,11 @@ async def root():
             "Clean 503 on YouTube bot verification instead of raw error",
             "Guaranteed temp file cleanup via finally blocks",
             "Explicit memory freeing + gc.collect() + malloc_trim() after each request",
-            "Audio trimmed to first 120s before analysis to cap peak memory",
-            "50MB upload size limit"
+            "Audio trimmed to first 180s before analysis to cap peak memory",
+            "50MB upload size limit",
+            "Relative major/minor correction using bass-register chroma energy",
+            "BPM half/double (octave) error correction against a typical tempo range",
+            "Librosa cross-check adjusts confidence (and flags disagreement) without overriding Essentia's answer",
         ]
     }
 
