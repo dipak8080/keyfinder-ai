@@ -13,6 +13,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Build the bgutil-ytdlp-pot-provider "script" backend. Installing the pip
+# package alone only registers the plugin with yt-dlp - it does NOT include
+# the actual token-generation code. yt-dlp looks for it by default at
+# $HOME/bgutil-ytdlp-pot-provider/server (i.e. /root/... since this
+# container runs as root), so we clone and build it there. Version 1.3.1
+# matches the bgutil-ytdlp-pot-provider version pinned in requirements.txt -
+# keep these two in sync if you ever bump one.
+RUN git clone --single-branch --branch 1.3.1 \
+    https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+    /root/bgutil-ytdlp-pot-provider \
+    && cd /root/bgutil-ytdlp-pot-provider/server \
+    && npm ci \
+    && npx tsc
+
 # Create app directory
 WORKDIR /app
 
