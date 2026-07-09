@@ -11,6 +11,9 @@ import time
 import uuid
 import base64
 import logging
+import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import librosa
 from essentia.standard import MonoLoader, KeyExtractor, RhythmExtractor2013
@@ -41,6 +44,7 @@ YT_DLP_BASE_BACKOFF_SECONDS = 1.5  # 1.5s, 3s, 6s (exponential)
 YT_BOT_CHECK_MARKERS = (
     "sign in to confirm you're not a bot",
     "sign in to confirm you are not a bot",
+    "requested format is not available",
 )
 
 FFMPEG_PATH = "/usr/bin/ffmpeg"
@@ -67,6 +71,70 @@ TYPICAL_BPM_MAX = 180
 # discount the reported confidence by (multiplicative).
 KEY_DISAGREEMENT_CONFIDENCE_PENALTY = 0.75
 BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
+
+# ---------- CONCURRENCY / LOAD-SHEDDING CONFIG ----------
+# FastAPI's event loop is single-threaded for async code. yt_dlp, ffmpeg
+# (via subprocess.run), and Essentia/Librosa are all blocking, CPU-bound
+# calls - running them directly inside `async def` freezes the WHOLE server
+# (including unrelated requests like /health) until that one call finishes.
+# Every blocking call is now routed through this thread pool via
+# run_blocking() below, so the event loop stays free to accept and queue
+# other requests while heavy work happens in a worker thread.
+#
+# Size this to roughly your CPU core count. Too high just means more
+# threads fighting over the same CPU with no real throughput gain - it does
+# NOT increase how much work the machine can actually do at once.
+THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "4"))
+_executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
+
+
+async def run_blocking(func, *args, **kwargs):
+    """Runs a blocking/synchronous function in the thread pool instead of
+    on the event loop, so it doesn't freeze the whole server while it runs."""
+    loop = asyncio.get_running_loop()
+    call = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(_executor, call)
+
+
+# Hard caps on how many /analyze and /download jobs run AT THE SAME TIME.
+# This is the actual thing standing between you and an OOM crash when a lot
+# of people hit the API at once - it's independent of THREAD_POOL_WORKERS
+# above (that's about not freezing the event loop; this is about not
+# loading 50 audio files into RAM simultaneously).
+#
+# Tune these to your instance's RAM. Essentia/Librosa audio buffers for a
+# ~3 min trimmed track are roughly tens of MB each, so on a small Railway
+# instance (512MB-1GB), keep these low (2-3) rather than generous.
+MAX_CONCURRENT_ANALYSIS = int(os.environ.get("MAX_CONCURRENT_ANALYSIS", "3"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
+
+# How long an incoming request is willing to sit in the queue waiting for a
+# free analysis/download slot before we give up and return 503 instead of
+# holding the connection open forever. This IS your basic "queue" - callers
+# who arrive when the server is busy wait up to this long for a slot to
+# free up rather than being rejected immediately or piling on unbounded.
+QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "30"))
+
+_analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
+_download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+
+async def acquire_slot_or_503(semaphore: asyncio.Semaphore, what: str):
+    """
+    Waits up to QUEUE_WAIT_TIMEOUT_SECONDS for a free slot on the given
+    semaphore. If one frees up in time, the caller proceeds (this IS the
+    queueing behavior - excess requests wait here instead of all running
+    at once). If the timeout is hit, raises a clean 503 instead of letting
+    the request pile on top of an already-overloaded server.
+    """
+    try:
+        await asyncio.wait_for(semaphore.acquire(), timeout=QUEUE_WAIT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(f"Server busy: no {what} slot freed up within {QUEUE_WAIT_TIMEOUT_SECONDS}s")
+        raise HTTPException(
+            503,
+            f"Server is at capacity ({what} slots full). Please try again shortly."
+        )
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -135,6 +203,13 @@ def is_bot_check_error(error_text: str) -> bool:
 
 
 def extract_info_with_retry(ydl_opts: dict, url: str):
+    """
+    NOTE: this function is fully synchronous/blocking (yt_dlp + time.sleep
+    backoff). It must always be called via run_blocking() from an async
+    endpoint - never awaited or called directly from `async def` code - or
+    it will freeze the event loop for the whole server during the retry
+    backoff sleeps and the download itself.
+    """
     last_exception = None
 
     for attempt in range(1, YT_DLP_MAX_ATTEMPTS + 1):
@@ -447,7 +522,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'ffmpeg_location': '/usr/bin/ffmpeg',
         'extractor_args': {
             'youtube': {
-                'player_client': ['mweb', 'web', 'android']
+                'player_client': ['ios', 'android', 'mweb', 'web']
             }
         },
         'postprocessors': [{
@@ -469,20 +544,29 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         ydl_opts['proxy'] = proxy_url
         logger.info("Using configured proxy for yt-dlp")
 
+    # Wait (up to QUEUE_WAIT_TIMEOUT_SECONDS) for a free download slot -
+    # this is what keeps N simultaneous downloads bounded instead of
+    # unbounded, and returns a clean 503 instead of crashing if the server
+    # stays saturated past the wait window.
+    await acquire_slot_or_503(_download_semaphore, "download")
+
     audio_data = None
     try:
         try:
-            info = extract_info_with_retry(ydl_opts, url)
+            # Offloaded to the thread pool - yt_dlp + ffmpeg postprocessing
+            # are fully blocking and would otherwise freeze the event loop.
+            info = await run_blocking(extract_info_with_retry, ydl_opts, url)
             title = info.get('title', 'Unknown')
         except Exception as e:
             error_text = str(e)
 
             if is_bot_check_error(error_text):
-                logger.error(f"YouTube bot verification blocked download for URL: {url}")
+                logger.error(f"YouTube bot verification / format restriction blocked download for URL: {url}")
                 raise HTTPException(
                     503,
                     "This video is temporarily unavailable for download because YouTube is "
-                    "requiring bot verification. Please try again in a few minutes."
+                    "requiring bot verification or is restricting available formats for this client. "
+                    "Please try again in a few minutes."
                 )
 
             logger.error(f"Download failed after {YT_DLP_MAX_ATTEMPTS} attempts: {error_text}")
@@ -511,6 +595,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         if audio_data is not None:
             del audio_data
         release_memory_to_os()
+        _download_semaphore.release()
 
 
 @app.post("/analyze")
@@ -520,6 +605,13 @@ async def analyze_audio(file: UploadFile = File(...)):
     file_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
     analysis_path = file_path
+
+    # Wait (up to QUEUE_WAIT_TIMEOUT_SECONDS) for a free analysis slot -
+    # this bounds how many Essentia/Librosa audio buffers can be in memory
+    # at the same time, which is the actual thing that OOM-kills the
+    # container under load. Requests beyond the cap wait here (this is your
+    # queue) rather than all running - and racing for RAM - at once.
+    await acquire_slot_or_503(_analysis_semaphore, "analysis")
 
     content = None
     try:
@@ -544,18 +636,20 @@ async def analyze_audio(file: UploadFile = File(...)):
         release_memory_to_os()
 
         if ANALYSIS_MAX_SECONDS is not None:
-            analysis_path = trim_audio_for_analysis(file_path, ANALYSIS_MAX_SECONDS)
+            # ffmpeg subprocess call - blocking, offload to thread pool.
+            analysis_path = await run_blocking(trim_audio_for_analysis, file_path, ANALYSIS_MAX_SECONDS)
 
         # Primary: Essentia (pro-level accuracy), with relative-key and
         # BPM-octave corrections already applied inside this call.
-        key, scale, key_conf, bpm, bpm_conf = detect_key_bpm_essentia(analysis_path)
+        # Offloaded - this is the single most CPU-heavy step in the request.
+        key, scale, key_conf, bpm, bpm_conf = await run_blocking(detect_key_bpm_essentia, analysis_path)
 
         # Cross-check against Librosa as an independent second opinion.
         # This never changes the reported key/BPM - only the confidence,
         # plus an "agreement" flag the frontend can use to show a
-        # "low confidence" badge if the two disagree.
-        key, scale, key_conf, bpm, bpm_conf, agreement = cross_check_with_librosa(
-            analysis_path, key, scale, key_conf, bpm, bpm_conf
+        # "low confidence" badge if the two disagree. Also offloaded.
+        key, scale, key_conf, bpm, bpm_conf, agreement = await run_blocking(
+            cross_check_with_librosa, analysis_path, key, scale, key_conf, bpm, bpm_conf
         )
 
         camelot = get_camelot(key, scale)
@@ -586,6 +680,7 @@ async def analyze_audio(file: UploadFile = File(...)):
         if content is not None:
             del content
         release_memory_to_os()
+        _analysis_semaphore.release()
 
 
 @app.get("/")
@@ -599,7 +694,7 @@ async def root():
             "Proper BPM via RhythmExtractor2013 (confidence included)",
             "Robust fallback with enhanced Librosa",
             "Retry with exponential backoff on yt_dlp failures",
-            "Clean 503 on YouTube bot verification instead of raw error",
+            "Clean 503 on YouTube bot verification / format restriction instead of raw error",
             "Guaranteed temp file cleanup via finally blocks",
             "Explicit memory freeing + gc.collect() + malloc_trim() after each request",
             "Audio trimmed to first 180s before analysis to cap peak memory",
@@ -607,6 +702,10 @@ async def root():
             "Relative major/minor correction using bass-register chroma energy",
             "BPM half/double (octave) error correction against a typical tempo range",
             "Librosa cross-check adjusts confidence (and flags disagreement) without overriding Essentia's answer",
+            "All blocking work (yt_dlp, ffmpeg, Essentia, Librosa) offloaded to a thread pool so it never freezes the event loop",
+            "Concurrency capped via semaphores (MAX_CONCURRENT_ANALYSIS / MAX_CONCURRENT_DOWNLOADS) to bound peak memory",
+            "Requests queue for a free slot up to QUEUE_WAIT_TIMEOUT_SECONDS, then return a clean 503 instead of crashing",
+            "Broadened yt_dlp player_client list (ios, android, mweb, web) to reduce 'Requested format is not available' failures",
         ]
     }
 
