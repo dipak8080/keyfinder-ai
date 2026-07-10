@@ -71,13 +71,35 @@ BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
 # is stored as a base64-encoded Railway env var (YT_COOKIES_B64), and
 # reconstructed at startup, once, before any requests are served.
 def ensure_cookies_file():
+    cookies_gz_b64 = os.environ.get('YT_COOKIES_GZ_B64')
     cookies_b64 = os.environ.get('YT_COOKIES_B64')
     cookies_path = os.environ.get('YT_COOKIES_PATH', '/app/cookies.txt')
 
+    if cookies_gz_b64:
+        # Gzip-compressed variant - use this if the plain base64 value
+        # would exceed Railway's 32768-character variable limit (a
+        # cookies.txt exported for ALL sites rather than just youtube.com
+        # can easily be large enough to hit that).
+        try:
+            import gzip
+            compressed = base64.b64decode(cookies_gz_b64)
+            cookies_bytes = gzip.decompress(compressed)
+            with open(cookies_path, 'wb') as f:
+                f.write(cookies_bytes)
+            logger.info(
+                f"[COOKIES] Reconstructed cookies file at {cookies_path} from "
+                f"YT_COOKIES_GZ_B64 ({len(cookies_bytes)} bytes decompressed)"
+            )
+            return
+        except Exception as e:
+            logger.error(f"[COOKIES] Failed to decompress/decode YT_COOKIES_GZ_B64: {e}")
+            return
+
     if not cookies_b64:
         logger.warning(
-            "[COOKIES] YT_COOKIES_B64 not set at startup - cookies.txt will NOT "
-            "be reconstructed. Downloads requiring authentication will fail."
+            "[COOKIES] Neither YT_COOKIES_B64 nor YT_COOKIES_GZ_B64 is set at "
+            "startup - cookies.txt will NOT be reconstructed. Downloads "
+            "requiring authentication will fail."
         )
         return
 
@@ -570,6 +592,15 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             'preferredcodec': format,
             'preferredquality': '192',
         }],
+        # Deno being installed is not enough on its own - yt-dlp additionally
+        # requires explicit opt-in before it will download the actual EJS
+        # challenge-solver script Deno needs to run (a security/privacy
+        # default). Without this, signature/n-parameter solving silently
+        # fails even with Deno present, and YouTube's SABR-only streaming
+        # then leaves no usable audio formats at all ("Requested format is
+        # not available"). 'ejs:github' fetches it directly from the
+        # official yt-dlp-ejs GitHub repo - small, one-time per version.
+        'remote_components': {'ejs:github'},
     }
 
     # Cookies status is logged on EVERY request as one unambiguous,
