@@ -1,7 +1,8 @@
-# main.py - ULTIMATE ACCURACY: Essentia Powered (Production Hardened + Key/BPM Corrections)
+# main.py - ULTIMATE ACCURACY: Essentia Powered (Production Hardened + Key/BPM Corrections + Cookie Bootstrap)
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import yt_dlp
 import os
 import gc
@@ -21,16 +22,6 @@ from typing import Tuple, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.3.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -71,6 +62,54 @@ TYPICAL_BPM_MAX = 180
 # discount the reported confidence by (multiplicative).
 KEY_DISAGREEMENT_CONFIDENCE_PENALTY = 0.75
 BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
+
+# ---------- COOKIES BOOTSTRAP (base64 env var -> real file) ----------
+# cookies.txt is intentionally excluded from git (it contains a real
+# YouTube login session). Railway builds pull source from GitHub, not your
+# local disk - so a gitignored file never makes it into the built image, no
+# matter what the Dockerfile's COPY step does. Instead, the file's content
+# is stored as a base64-encoded Railway env var (YT_COOKIES_B64), and
+# reconstructed at startup, once, before any requests are served.
+def ensure_cookies_file():
+    cookies_b64 = os.environ.get('YT_COOKIES_B64')
+    cookies_path = os.environ.get('YT_COOKIES_PATH', '/app/cookies.txt')
+
+    if not cookies_b64:
+        logger.warning(
+            "[COOKIES] YT_COOKIES_B64 not set at startup - cookies.txt will NOT "
+            "be reconstructed. Downloads requiring authentication will fail."
+        )
+        return
+
+    try:
+        cookies_bytes = base64.b64decode(cookies_b64)
+        with open(cookies_path, 'wb') as f:
+            f.write(cookies_bytes)
+        logger.info(
+            f"[COOKIES] Reconstructed cookies file at {cookies_path} from "
+            f"YT_COOKIES_B64 ({len(cookies_bytes)} bytes)"
+        )
+    except Exception as e:
+        logger.error(f"[COOKIES] Failed to reconstruct cookies file from YT_COOKIES_B64: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    ensure_cookies_file()
+    yield
+    # Shutdown - nothing needed
+
+
+app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.4.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------- CONCURRENCY / LOAD-SHEDDING CONFIG ----------
 # FastAPI's event loop is single-threaded for async code. yt_dlp, ffmpeg
@@ -135,6 +174,7 @@ async def acquire_slot_or_503(semaphore: asyncio.Semaphore, what: str):
             503,
             f"Server is at capacity ({what} slots full). Please try again shortly."
         )
+
 
 try:
     _libc = ctypes.CDLL("libc.so.6")
@@ -532,12 +572,21 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         }],
     }
 
-    cookies_path = os.environ.get('YT_COOKIES_PATH')
-    if cookies_path and os.path.exists(cookies_path):
+    # Cookies status is logged on EVERY request as one unambiguous,
+    # greppable line - search "[COOKIES]" in Railway's Deploy Logs to
+    # instantly see whether this specific download actually had cookies
+    # available, without needing shell access into the container. The
+    # actual file is reconstructed once at startup from YT_COOKIES_B64 (see
+    # ensure_cookies_file() above) - this block just checks it's really
+    # there and wires it into yt-dlp's options for this request.
+    cookies_path = os.environ.get('YT_COOKIES_PATH', '/app/cookies.txt')
+    cookies_active = bool(cookies_path and os.path.exists(cookies_path))
+    if cookies_active:
         ydl_opts['cookiefile'] = cookies_path
-        logger.info(f"Using cookies file for yt-dlp: {cookies_path}")
-    elif cookies_path:
-        logger.warning(f"YT_COOKIES_PATH is set to '{cookies_path}' but that file doesn't exist - ignoring")
+
+    logger.info(
+        f"[COOKIES] status={'ACTIVE' if cookies_active else 'MISSING'} path={cookies_path} url={url}"
+    )
 
     proxy_url = os.environ.get('YT_PROXY_URL')
     if proxy_url:
@@ -686,7 +735,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @app.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.3 - ESSENTIA FIXED + KEY/BPM CORRECTIONS",
+        "status": "Audio Analysis API v12.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + COOKIE BOOTSTRAP",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -706,6 +755,8 @@ async def root():
             "Concurrency capped via semaphores (MAX_CONCURRENT_ANALYSIS / MAX_CONCURRENT_DOWNLOADS) to bound peak memory",
             "Requests queue for a free slot up to QUEUE_WAIT_TIMEOUT_SECONDS, then return a clean 503 instead of crashing",
             "Broadened yt_dlp player_client list (ios, android, mweb, web) to reduce 'Requested format is not available' failures",
+            "cookies.txt reconstructed at startup from base64 Railway env var (YT_COOKIES_B64), since it's gitignored and Railway builds from GitHub, not local disk",
+            "Per-request [COOKIES] status log line (ACTIVE/MISSING) for instant visibility in Railway Deploy Logs",
         ]
     }
 
