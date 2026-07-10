@@ -2,8 +2,9 @@
 FROM python:3.11-slim
 
 # Install ffmpeg (includes ffprobe), git (needed for pip to install yt-dlp from git),
-# and curl/gnupg (needed to add the NodeSource repo for Node.js below)
-RUN apt-get update && apt-get install -y ffmpeg git curl gnupg && rm -rf /var/lib/apt/lists/*
+# curl/gnupg (needed to add the NodeSource repo for Node.js below), and unzip
+# (needed by Deno's install script, which downloads and unzips a release archive)
+RUN apt-get update && apt-get install -y ffmpeg git curl gnupg unzip && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 20.x - required by the bgutil-ytdlp-pot-provider plugin to
 # generate YouTube PO Tokens (Proof-of-Origin). Without a JS runtime, yt-dlp
@@ -12,6 +13,16 @@ RUN apt-get update && apt-get install -y ffmpeg git curl gnupg && rm -rf /var/li
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno - this is a SEPARATE requirement from Node.js above. Node runs
+# the PO Token generation script; Deno is what yt-dlp uses as a "JS Challenge
+# Provider" to solve YouTube's signature/"n-parameter" decryption for
+# higher-quality formats. Without it, yt-dlp logs "Signature solving failed"
+# and "n challenge solving failed", and silently falls back to lower-quality
+# formats (e.g. itag 18) instead of the best available audio.
+# Installs to /root/.deno/bin/deno since this container runs as root ($HOME=/root).
+RUN curl -fsSL https://deno.land/install.sh | sh
+ENV PATH="/root/.deno/bin:${PATH}"
 
 # Build the bgutil-ytdlp-pot-provider "script" backend. Installing the pip
 # package alone only registers the plugin with yt-dlp - it does NOT include
