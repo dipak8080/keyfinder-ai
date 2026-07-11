@@ -1,8 +1,13 @@
 """
 youtube.py - Everything the /download route needs for talking to yt_dlp:
-retry-with-backoff wrapper and YouTube bot-check detection.
+retry-with-backoff wrapper, YouTube bot-check detection, and the
+direct-then-proxy fallback strategy (with a circuit breaker for when the
+proxy runs out of credit).
 """
 import time
+import threading
+from typing import Optional
+
 import yt_dlp
 
 from config import (
@@ -11,7 +16,9 @@ from config import (
     YT_DLP_BASE_BACKOFF_SECONDS,
     YT_BOT_CHECK_MARKERS,
     MAX_VIDEO_DURATION_SECONDS,
+    PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
 )
+from monitoring import alert_now
 
 
 class VideoTooLongError(Exception):
@@ -44,6 +51,25 @@ PERMANENT_ERROR_MARKERS = (
     "unable to extract video data",
 )
 
+# Errors that indicate the PROXY itself is out of credit/quota, as opposed
+# to a normal connection hiccup. Provider wording varies a lot, so this
+# list is intentionally broad - false positives just mean the circuit
+# breaker trips a bit eagerly (cheap: falls back to direct-only for a
+# while), which is far better than false negatives (silently retrying a
+# dead proxy on every single request).
+PROXY_QUOTA_ERROR_MARKERS = (
+    "insufficient balance",
+    "insufficient funds",
+    "insufficient credit",
+    "quota exceeded",
+    "no credit",
+    "out of credit",
+    "payment required",
+    "account suspended",
+    "proxy authentication failed",  # several providers reuse this for "balance = 0", not just bad creds
+    "407",  # HTTP 407 Proxy Authentication Required - overloaded by some providers for "no balance"
+)
+
 
 def is_bot_check_error(error_text: str) -> bool:
     lowered = error_text.lower()
@@ -55,6 +81,54 @@ def is_permanent_error(error_text: str) -> bool:
     no amount of retrying, cookie refreshing, or proxy switching helps."""
     lowered = error_text.lower()
     return any(marker in lowered for marker in PERMANENT_ERROR_MARKERS)
+
+
+def is_proxy_quota_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return any(marker in lowered for marker in PROXY_QUOTA_ERROR_MARKERS)
+
+
+# ---------- PROXY CIRCUIT BREAKER ----------
+# In-memory, per-instance (same pattern as monitoring.py). Once tripped,
+# proxy_available() returns False until the cooldown passes, so
+# download_with_fallback() skips straight to direct-only instead of paying
+# the latency cost of trying (and failing against) a proxy that's known to
+# be dead.
+_proxy_lock = threading.Lock()
+_proxy_disabled_until = 0.0
+
+
+def proxy_available() -> bool:
+    with _proxy_lock:
+        return time.time() >= _proxy_disabled_until
+
+
+def _trip_proxy_circuit_breaker():
+    global _proxy_disabled_until
+    with _proxy_lock:
+        _proxy_disabled_until = time.time() + PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+    cooldown_min = PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60
+    message = (
+        f"[PROXY] Circuit breaker TRIPPED - proxy looks out of credit/quota. "
+        f"Disabling proxy for {cooldown_min} min; falling back to direct "
+        f"(no-proxy, cookies-only) requests in the meantime. Top up the "
+        f"proxy provider balance to restore full bot-check resilience."
+    )
+    logger.critical(message)
+    # Fired immediately - don't wait for monitoring.record_result()'s
+    # failure-threshold/cooldown logic. This is a single distinct event
+    # (proxy billing) worth knowing about the moment it happens, not after
+    # N requests have already failed downstream of it.
+    alert_now(message)
+
+
+def reset_proxy_circuit_breaker():
+    """Manual override - e.g. call this after topping up proxy credit,
+    from a future admin endpoint, instead of waiting out the full cooldown."""
+    global _proxy_disabled_until
+    with _proxy_lock:
+        _proxy_disabled_until = 0.0
+    logger.info("[PROXY] Circuit breaker manually reset - proxy re-enabled.")
 
 
 def check_video_duration(ydl_opts: dict, url: str):
@@ -137,3 +211,69 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 logger.error(f"All {YT_DLP_MAX_ATTEMPTS} attempts failed. Last error: {error_text}")
 
     raise last_exception
+
+
+def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[str]):
+    """
+    Tiered download strategy, cheapest option first:
+
+      Tier 1 - DIRECT (no proxy), cookies still attached if available.
+               Free. Succeeds for most normal, spread-out traffic, since
+               cookies alone clear the plain "sign in to confirm you're not
+               a bot" check most of the time.
+
+      Tier 2 - PROXY + cookies, tried ONLY if tier 1 failed with a
+               bot-check / format-restriction error specifically (not on
+               unrelated errors - is_permanent_error already short-circuits
+               those inside extract_info_with_retry before we'd ever
+               consider a proxy retry). This is the paid fallback, not the
+               default, so normal traffic doesn't burn proxy bandwidth for
+               no reason.
+
+    If tier 2 itself fails with what looks like a proxy billing/quota
+    error, trip the circuit breaker (see _trip_proxy_circuit_breaker) so
+    subsequent requests skip proxy entirely during the cooldown instead of
+    each one separately re-discovering the proxy is dead. The request
+    still fails in that moment (nothing left to fall back to except a
+    clean bot-check error), but every request AFTER it degrades gracefully
+    to direct-only instead of paying the proxy's connection-failure
+    latency every single time.
+    """
+    try:
+        return extract_info_with_retry(base_ydl_opts, url)
+    except Exception as e:
+        first_error = str(e)
+
+        if not is_bot_check_error(first_error):
+            # Not a bot-check/format issue (e.g. permanent error, network
+            # blip) - a proxy wouldn't fix this, don't spend money on it.
+            raise
+
+        if not proxy_url:
+            logger.warning("[PROXY] Direct attempt hit bot-check and no proxy is configured - failing as-is.")
+            raise
+
+        if not proxy_available():
+            logger.warning(
+                "[PROXY] Direct attempt hit bot-check, but proxy circuit breaker is "
+                "currently OPEN (likely out of credit) - failing as-is instead of "
+                "retrying a proxy known to be down."
+            )
+            raise
+
+        logger.warning("[PROXY] Direct attempt hit bot-check - retrying via proxy...")
+        proxied_opts = {**base_ydl_opts, 'proxy': proxy_url}
+        try:
+            result = extract_info_with_retry(proxied_opts, url)
+            logger.info("[PROXY] Proxy retry succeeded.")
+            return result
+        except Exception as proxy_error:
+            proxy_error_text = str(proxy_error)
+            if is_proxy_quota_error(proxy_error_text):
+                _trip_proxy_circuit_breaker()
+            else:
+                logger.warning(f"[PROXY] Proxy retry also failed (non-quota error): {proxy_error_text}")
+            # Whatever the proxy attempt raised is the most informative
+            # error to surface - propagate it (routes.py still applies its
+            # own is_bot_check_error() classification on top of this).
+            raise

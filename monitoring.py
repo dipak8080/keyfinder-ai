@@ -57,6 +57,23 @@ def _send_alert(message: str):
         logger.error(f"[ALERT] Failed to send webhook alert: {e}")
 
 
+def alert_now(message: str):
+    """
+    Public entry point for one-off, immediate alerts that shouldn't wait on
+    the failure-threshold/cooldown logic in record_result() - e.g. the
+    proxy circuit breaker tripping in youtube.py. That's a single, distinct
+    event worth knowing about right away (it usually means "proxy is out of
+    credit"), not something that should require FAILURE_ALERT_THRESHOLD
+    failures to first pile up before you hear about it.
+
+    Wrapped so monitoring can never raise into the caller's request path.
+    """
+    try:
+        _send_alert(message)
+    except Exception as e:
+        logger.warning(f"[monitoring] alert_now failed (non-fatal): {e}")
+
+
 def record_result(endpoint: str, success: bool):
     """
     Call this once per request, right where you already know whether it
@@ -79,7 +96,7 @@ def record_result(endpoint: str, success: bool):
                     message = (
                         f"AudioForges backend: {failures} failures on {endpoint} "
                         f"in the last {FAILURE_ALERT_WINDOW_SECONDS // 60} min. "
-                        f"Check Railway Deploy Logs (search '[COOKIES]' or '{endpoint}')."
+                        f"Check Railway Deploy Logs (search '[COOKIES]', '[PROXY]', or '{endpoint}')."
                     )
                     _send_alert(message)
     except Exception as e:

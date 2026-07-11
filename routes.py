@@ -20,7 +20,14 @@ from utils import (
     _analysis_semaphore,
     _download_semaphore,
 )
-from youtube import extract_info_with_retry, is_bot_check_error, check_video_duration, VideoTooLongError
+from youtube import (
+    download_with_fallback,
+    is_bot_check_error,
+    check_video_duration,
+    VideoTooLongError,
+    proxy_available,
+    reset_proxy_circuit_breaker,
+)
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
 from monitoring import record_result, get_status_snapshot
@@ -37,6 +44,10 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.%(ext)s")
     output_file = os.path.join(UPLOAD_DIR, f"{temp_id}.{format}")
 
+    # Base options WITHOUT a proxy - this is Tier 1 (direct + cookies),
+    # tried first because it's free and clears most bot-checks on its own.
+    # youtube.download_with_fallback() only adds the proxy in as Tier 2 if
+    # this specifically fails with a bot-check/format-restriction error.
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': temp_path,
@@ -71,20 +82,20 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     # available, without needing shell access into the container. The
     # actual file is reconstructed once at startup from YT_COOKIES_B64 (see
     # utils.ensure_cookies_file()) - this block just checks it's really
-    # there and wires it into yt-dlp's options for this request.
+    # there and wires it into yt-dlp's options for this request. Cookies
+    # apply to BOTH tiers (direct and proxy) since they solve a different
+    # problem (session trust) than the proxy does (IP reputation).
     cookies_path = os.environ.get('YT_COOKIES_PATH', YT_COOKIES_PATH_DEFAULT)
     cookies_active = bool(cookies_path and os.path.exists(cookies_path))
     if cookies_active:
         ydl_opts['cookiefile'] = cookies_path
 
-    logger.info(
-        f"[COOKIES] status={'ACTIVE' if cookies_active else 'MISSING'} path={cookies_path} url={url}"
-    )
-
     proxy_url = os.environ.get('YT_PROXY_URL')
-    if proxy_url:
-        ydl_opts['proxy'] = proxy_url
-        logger.info("Using configured proxy for yt-dlp")
+    logger.info(
+        f"[COOKIES] status={'ACTIVE' if cookies_active else 'MISSING'} path={cookies_path} "
+        f"[PROXY] configured={bool(proxy_url)} circuit_breaker={'OPEN' if not proxy_available() else 'CLOSED'} "
+        f"url={url}"
+    )
 
     # Wait (up to QUEUE_WAIT_TIMEOUT_SECONDS) for a free download slot -
     # this is what keeps N simultaneous downloads bounded instead of
@@ -109,7 +120,10 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         try:
             # Offloaded to the thread pool - yt_dlp + ffmpeg postprocessing
             # are fully blocking and would otherwise freeze the event loop.
-            info = await run_blocking(extract_info_with_retry, ydl_opts, url)
+            # download_with_fallback tries direct first, proxy second (only
+            # on bot-check errors), and trips the proxy circuit breaker on
+            # billing/quota-style proxy failures - see youtube.py.
+            info = await run_blocking(download_with_fallback, ydl_opts, url, proxy_url)
             title = info.get('title', 'Unknown')
         except Exception as e:
             error_text = str(e)
@@ -247,7 +261,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.6 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP",
+        "status": "Audio Analysis API v12.7 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -270,7 +284,9 @@ async def root():
             "Requests queue for a free slot up to QUEUE_WAIT_TIMEOUT_SECONDS, then return a clean 503 instead of crashing",
             "Broadened yt_dlp player_client list (ios, android, mweb, web) to reduce 'Requested format is not available' failures",
             "cookies.txt reconstructed at startup from base64 Railway env var (YT_COOKIES_B64), since it's gitignored and Railway builds from GitHub, not local disk",
-            "Per-request [COOKIES] status log line (ACTIVE/MISSING) for instant visibility in Railway Deploy Logs",
+            "Per-request [COOKIES]/[PROXY] status log line for instant visibility in Railway Deploy Logs",
+            "Tiered download strategy: direct+cookies first (free), proxy retry only on bot-check errors (paid fallback, not default)",
+            "Proxy circuit breaker: billing/quota-style proxy failures disable the proxy for a cooldown window instead of retrying a dead proxy on every request, with an immediate webhook alert",
             "CORS locked to ALLOWED_ORIGINS (defaults to '*' until explicitly configured)",
             "Per-IP rate limiting on /download and /analyze",
             "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",
@@ -295,4 +311,22 @@ async def admin_status(key: str = Query(...)):
     """
     if key != ADMIN_STATUS_KEY:
         raise HTTPException(403, "Invalid admin key")
-    return get_status_snapshot()
+    snapshot = get_status_snapshot()
+    snapshot["proxy"] = {
+        "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",
+    }
+    return snapshot
+
+
+@router.post("/admin/reset-proxy")
+async def admin_reset_proxy(key: str = Query(...)):
+    """
+    Manually re-enables the proxy immediately (rather than waiting out
+    PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS) - use this right after topping
+    up the proxy provider balance so downloads can use it again without
+    delay.
+    """
+    if key != ADMIN_STATUS_KEY:
+        raise HTTPException(403, "Invalid admin key")
+    reset_proxy_circuit_breaker()
+    return {"status": "proxy circuit breaker reset"}

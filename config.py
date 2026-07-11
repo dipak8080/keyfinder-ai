@@ -96,6 +96,25 @@ QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "3
 # startup, once, before any requests are served. See utils.ensure_cookies_file().
 YT_COOKIES_PATH_DEFAULT = "/app/cookies.txt"
 
+# ---------- PROXY FALLBACK / CIRCUIT BREAKER ----------
+# Strategy: try every download WITHOUT the proxy first (free - cookies
+# alone clear most bot-checks for normal, spread-out traffic). Only retry
+# through the proxy if that direct attempt specifically hit a bot-check /
+# format-restriction error - unrelated errors (video unavailable, etc.)
+# never touch the proxy, since it wouldn't help and would just burn paid
+# bandwidth. See youtube.download_with_fallback().
+#
+# If the proxy itself then fails with what looks like a billing/quota
+# error (out of credit), we trip a circuit breaker instead of letting
+# every subsequent request rediscover that the hard way: proxy is treated
+# as unavailable for this many seconds, and requests fall back to
+# direct-only during that window. An immediate webhook alert is fired the
+# moment this trips (separate from monitoring.py's failure-threshold
+# alert) so you find out before it becomes a full outage.
+PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(
+    os.environ.get("PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", str(30 * 60))  # 30 min
+)
+
 # ---------- CORS ----------
 # Comma-separated list of EXACT allowed origins, e.g.
 # "https://audioforges.lovable.app,https://audioforges.com"
