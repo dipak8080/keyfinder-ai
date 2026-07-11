@@ -28,6 +28,18 @@ YT_BOT_CHECK_MARKERS = (
     "requested format is not available",
 )
 
+# ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
+# Long videos (podcasts, DJ sets, movies) can take many minutes to download
+# and convert - often longer than the frontend's fetch timeout, so the
+# browser gives up and closes the connection (visible as a 499 in HTTP
+# logs) while the backend keeps working in the background: burning proxy
+# bandwidth (billed per GB) and Railway compute for a result nobody will
+# ever receive. This cap rejects videos longer than the limit BEFORE
+# starting the real download, with a clear message, instead of wasting
+# resources on something that was never going to finish in time for the
+# user. Set to None to disable the check entirely (no duration limit).
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1200"))  # 20 min
+
 # ---------- ANALYSIS TUNING ----------
 # Bumped from 120s -> 180s. Key/BPM detection doesn't need the whole track,
 # but 120s was occasionally landing entirely inside an ambient/percussion-only

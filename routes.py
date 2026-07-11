@@ -20,7 +20,7 @@ from utils import (
     _analysis_semaphore,
     _download_semaphore,
 )
-from youtube import extract_info_with_retry, is_bot_check_error
+from youtube import extract_info_with_retry, is_bot_check_error, check_video_duration, VideoTooLongError
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
 from monitoring import record_result, get_status_snapshot
@@ -95,6 +95,17 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     audio_data = None
     succeeded = False
     try:
+        # Cheap metadata-only check BEFORE the real download - rejects
+        # videos over MAX_VIDEO_DURATION_SECONDS instantly (400) instead of
+        # burning proxy bandwidth + Railway compute on a long download the
+        # frontend's fetch timeout will likely abort anyway (visible as a
+        # 499 in HTTP logs, work continuing uselessly in the background).
+        try:
+            await run_blocking(check_video_duration, ydl_opts, url)
+        except VideoTooLongError as e:
+            logger.warning(f"Rejected download - video too long: {e}")
+            raise HTTPException(400, str(e))
+
         try:
             # Offloaded to the thread pool - yt_dlp + ffmpeg postprocessing
             # are fully blocking and would otherwise freeze the event loop.
@@ -236,7 +247,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.5 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING",
+        "status": "Audio Analysis API v12.6 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -244,6 +255,8 @@ async def root():
             "Proper BPM via RhythmExtractor2013 (confidence included)",
             "Robust fallback with enhanced Librosa",
             "Retry with exponential backoff on yt_dlp failures",
+            "Permanent-error detection (video unavailable/private/removed) skips retries to save proxy bandwidth and fail fast",
+            "Video duration cap rejects overly long videos before download starts, avoiding wasted proxy bandwidth on requests the frontend will time out on anyway",
             "Clean 503 on YouTube bot verification / format restriction instead of raw error",
             "Guaranteed temp file cleanup via finally blocks",
             "Explicit memory freeing + gc.collect() + malloc_trim() after each request",
