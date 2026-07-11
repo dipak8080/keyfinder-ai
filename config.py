@@ -62,7 +62,7 @@ THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "4"))
 # This is the actual thing standing between you and an OOM crash when a lot
 # of people hit the API at once - it's independent of THREAD_POOL_WORKERS
 # above (that's about not freezing the event loop; this is about not
-# loading 50 audio files into RAM simultaneously).
+# loading many audio files into RAM simultaneously).
 #
 # Tune these to your instance's RAM. Essentia/Librosa audio buffers for a
 # ~3 min trimmed track are roughly tens of MB each, so on a small Railway
@@ -83,3 +83,50 @@ QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "3
 # is stored as a base64-encoded Railway env var, and reconstructed at
 # startup, once, before any requests are served. See utils.ensure_cookies_file().
 YT_COOKIES_PATH_DEFAULT = "/app/cookies.txt"
+
+# ---------- CORS ----------
+# Comma-separated list of allowed origins, e.g.
+# "https://audioforges.lovable.app,https://audioforges.com"
+# Defaults to "*" (allow everything) if not set, so this NEVER breaks
+# anything until you explicitly lock it down. Once your domain is final,
+# set ALLOWED_ORIGINS in Railway to your real domain(s) only - "*" means
+# literally any website can call your API from a user's browser, not just
+# yours.
+_allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS", "*")
+if _allowed_origins_raw.strip() == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+
+# ---------- RATE LIMITING ----------
+# Simple per-IP request cap on the heavy endpoints (/download, /analyze).
+# In-memory only - resets on restart, and is PER INSTANCE (not shared
+# across multiple Railway replicas if you ever scale horizontally). Good
+# enough to stop a single abusive IP/script from hammering the API and
+# running up your bill; not a replacement for real infra-level protection
+# at large scale.
+RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "10"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+# ---------- MONITORING / ALERTING ----------
+# Optional webhook URL (Discord/Slack-compatible) that gets a message
+# posted to it when failures spike. Leave unset to disable external
+# alerting - nothing breaks, failures still get logged as CRITICAL in
+# Railway's Deploy Logs, you just won't get pinged outside of checking
+# logs yourself. Discord webhooks are free: Server Settings -> Integrations
+# -> Webhooks -> New Webhook -> Copy Webhook URL.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "")
+
+# If this many (or more) requests to the SAME endpoint fail within
+# FAILURE_ALERT_WINDOW_SECONDS, send one alert. ALERT_COOLDOWN_SECONDS then
+# blocks repeat alerts for that endpoint so a sustained outage doesn't spam
+# you every few seconds.
+FAILURE_ALERT_THRESHOLD = int(os.environ.get("FAILURE_ALERT_THRESHOLD", "5"))
+FAILURE_ALERT_WINDOW_SECONDS = int(os.environ.get("FAILURE_ALERT_WINDOW_SECONDS", "300"))
+ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))
+
+# Secret required (as ?key=... query param) to view /admin/status.
+# CHANGE THIS in Railway to a long random string - if left as the
+# default below, the endpoint still works but with a guessable key.
+ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")

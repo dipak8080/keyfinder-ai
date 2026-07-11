@@ -1,5 +1,5 @@
 """
-routes.py - The two APIs (download, analyze) plus root/health.
+routes.py - The two APIs (download, analyze) plus root/health/admin.
 All business logic lives in youtube.py / audio_analysis.py / utils.py -
 this file just wires HTTP in and out.
 """
@@ -7,10 +7,10 @@ import os
 import uuid
 import base64
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 
-from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, YT_COOKIES_PATH_DEFAULT
+from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, YT_COOKIES_PATH_DEFAULT, ADMIN_STATUS_KEY
 from utils import (
     cleanup_file,
     release_memory_to_os,
@@ -22,11 +22,13 @@ from utils import (
 )
 from youtube import extract_info_with_retry, is_bot_check_error
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
+from rate_limit import check_rate_limit
+from monitoring import record_result, get_status_snapshot
 
 router = APIRouter()
 
 
-@router.post("/download")
+@router.post("/download", dependencies=[Depends(check_rate_limit)])
 async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     if format not in ["mp3", "wav"]:
         raise HTTPException(400, "Format must be 'mp3' or 'wav'")
@@ -91,6 +93,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     await acquire_slot_or_503(_download_semaphore, "download")
 
     audio_data = None
+    succeeded = False
     try:
         try:
             # Offloaded to the thread pool - yt_dlp + ffmpeg postprocessing
@@ -123,6 +126,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
 
         logger.info(f"Download complete: '{title}' ({format}) → {len(audio_data)} base64 chars")
 
+        succeeded = True
         return JSONResponse({"title": title, "audio": audio_data, "format": format})
 
     except HTTPException:
@@ -136,9 +140,12 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             del audio_data
         release_memory_to_os()
         _download_semaphore.release()
+        # Recorded regardless of outcome - this is what /admin/status and
+        # the failure-spike alert in monitoring.py are built on.
+        record_result("/download", succeeded)
 
 
-@router.post("/analyze")
+@router.post("/analyze", dependencies=[Depends(check_rate_limit)])
 async def analyze_audio(file: UploadFile = File(...)):
     logger.info(f"Analyzing: {file.filename}")
 
@@ -154,6 +161,7 @@ async def analyze_audio(file: UploadFile = File(...)):
     await acquire_slot_or_503(_analysis_semaphore, "analysis")
 
     content = None
+    succeeded = False
     try:
         content = await file.read()
 
@@ -206,6 +214,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
         logger.info(f"RESULT: {result}")
 
+        succeeded = True
         return JSONResponse(result)
 
     except HTTPException:
@@ -221,12 +230,13 @@ async def analyze_audio(file: UploadFile = File(...)):
             del content
         release_memory_to_os()
         _analysis_semaphore.release()
+        record_result("/analyze", succeeded)
 
 
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + COOKIE BOOTSTRAP",
+        "status": "Audio Analysis API v12.5 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -248,6 +258,9 @@ async def root():
             "Broadened yt_dlp player_client list (ios, android, mweb, web) to reduce 'Requested format is not available' failures",
             "cookies.txt reconstructed at startup from base64 Railway env var (YT_COOKIES_B64), since it's gitignored and Railway builds from GitHub, not local disk",
             "Per-request [COOKIES] status log line (ACTIVE/MISSING) for instant visibility in Railway Deploy Logs",
+            "CORS locked to ALLOWED_ORIGINS (defaults to '*' until explicitly configured)",
+            "Per-IP rate limiting on /download and /analyze",
+            "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",
         ]
     }
 
@@ -255,3 +268,18 @@ async def root():
 @router.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@router.get("/admin/status")
+async def admin_status(key: str = Query(...)):
+    """
+    Simple operational dashboard, protected by a shared secret query param
+    (?key=...). Set ADMIN_STATUS_KEY in Railway to something random/long -
+    this is NOT the same thing as your site's /admin contact-messages page
+    (that's a separate Lovable/frontend feature); this is just this
+    backend's own health/failure snapshot, useful to hit manually or wire
+    into a frontend dashboard later if you want.
+    """
+    if key != ADMIN_STATUS_KEY:
+        raise HTTPException(403, "Invalid admin key")
+    return get_status_snapshot()
