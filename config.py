@@ -85,18 +85,33 @@ QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "3
 YT_COOKIES_PATH_DEFAULT = "/app/cookies.txt"
 
 # ---------- CORS ----------
-# Comma-separated list of allowed origins, e.g.
+# Comma-separated list of EXACT allowed origins, e.g.
 # "https://audioforges.lovable.app,https://audioforges.com"
 # Defaults to "*" (allow everything) if not set, so this NEVER breaks
 # anything until you explicitly lock it down. Once your domain is final,
-# set ALLOWED_ORIGINS in Railway to your real domain(s) only - "*" means
-# literally any website can call your API from a user's browser, not just
-# yours.
+# set ALLOWED_ORIGINS in Railway to your real production domain(s) only -
+# "*" means literally any website can call your API from a user's browser,
+# not just yours.
 _allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS", "*")
 if _allowed_origins_raw.strip() == "*":
     ALLOWED_ORIGINS = ["*"]
 else:
     ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+
+# CORSMiddleware's allow_origins only does EXACT string matches - it can't
+# do wildcard subdomains like "*.lovable.app". Lovable's in-editor preview
+# sandbox serves your app from a different, randomly-generated subdomain
+# each time (e.g. https://id-preview--xxxx.lovable.app,
+# https://xxxx.lovableproject.com) - none of which match your fixed
+# production domain in ALLOWED_ORIGINS above, so testing inside the editor
+# gets CORS-blocked even though your real published site works fine. This
+# regex additionally allows any Lovable preview/editor subdomain, while
+# ALLOWED_ORIGINS above still locks down real production traffic to your
+# actual domain(s) only.
+# Set ALLOW_LOVABLE_PREVIEW_ORIGINS=false in Railway to disable this once
+# you no longer need editor-preview access (e.g. fully launched product).
+ALLOW_LOVABLE_PREVIEW_ORIGINS = os.environ.get("ALLOW_LOVABLE_PREVIEW_ORIGINS", "true").lower() == "true"
+LOVABLE_PREVIEW_ORIGIN_REGEX = r"https://.*\.lovable\.app|https://.*\.lovableproject\.com"
 
 # ---------- RATE LIMITING ----------
 # Simple per-IP request cap on the heavy endpoints (/download, /analyze).
