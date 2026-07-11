@@ -71,21 +71,47 @@ PROXY_QUOTA_ERROR_MARKERS = (
 )
 
 
-def is_bot_check_error(error_text: str) -> bool:
+def _normalize_error_text(error_text: str) -> str:
+    """
+    Lowercases AND normalizes "smart"/typographic punctuation to its plain
+    ASCII equivalent before marker-matching.
+
+    Real-world case that motivated this: YouTube's actual bot-check message
+    is "Sign in to confirm you\u2019re not a bot" - a CURLY apostrophe
+    (U+2019), not a straight one ('). Our marker strings use straight
+    apostrophes. A plain substring match on the two silently NEVER matches
+    even though they're visually identical, which meant is_bot_check_error()
+    returned False for a textbook bot-check error - the proxy fallback
+    never fired and the request surfaced as a raw 500 instead of a clean
+    503. Normalizing both sides here prevents that entire class of bug for
+    ANY marker list that matches against yt-dlp's error text, not just this
+    one already-known case.
+    """
     lowered = error_text.lower()
-    return any(marker in lowered for marker in YT_BOT_CHECK_MARKERS)
+    return (
+        lowered
+        .replace("\u2019", "'")  # right single quotation mark -> straight apostrophe
+        .replace("\u2018", "'")  # left single quotation mark -> straight apostrophe
+        .replace("\u201c", '"')  # left double quotation mark -> straight quote
+        .replace("\u201d", '"')  # right double quotation mark -> straight quote
+    )
+
+
+def is_bot_check_error(error_text: str) -> bool:
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in YT_BOT_CHECK_MARKERS)
 
 
 def is_permanent_error(error_text: str) -> bool:
     """True if the error means the video itself can never be downloaded -
     no amount of retrying, cookie refreshing, or proxy switching helps."""
-    lowered = error_text.lower()
-    return any(marker in lowered for marker in PERMANENT_ERROR_MARKERS)
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
 
 def is_proxy_quota_error(error_text: str) -> bool:
-    lowered = error_text.lower()
-    return any(marker in lowered for marker in PROXY_QUOTA_ERROR_MARKERS)
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in PROXY_QUOTA_ERROR_MARKERS)
 
 
 # ---------- PROXY CIRCUIT BREAKER ----------
