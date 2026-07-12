@@ -119,17 +119,29 @@ YT_COOKIES_PATH_DEFAULT = "/app/cookies.txt"
 # silently: nothing in the existing alert system (which only fires on
 # request FAILURES) ever sees it. This lets you find out cookies died
 # from a Discord ping instead of stumbling on it in Railway logs.
-#
-# yt-dlp repeats this exact warning once per player client it checks
-# (ios/android/mweb/web) within a SINGLE download - without a cooldown,
-# one download with dead cookies would fire 4+ Discord alerts back to
-# back. COOKIE_ALERT_COOLDOWN_SECONDS collapses that down to one alert
-# per window regardless of how many downloads/warnings happen in it.
 COOKIE_EXPIRY_MARKERS = (
     "cookies are no longer valid",
     "cookies have expired",
     "cookies have been rotated",
 )
+
+# yt-dlp's cookie-validity check is a HEURISTIC, not a hard fact - it can
+# flag cookies as "no longer valid" for one specific video/client combo
+# even when the cookies are genuinely fine (observed in practice: the
+# warning fires once, then several OTHER downloads in the same minute
+# authenticate successfully with the exact same cookies.txt, no issue).
+# Alerting on a single occurrence produces noisy false alarms that don't
+# reflect real, persistent expiry.
+#
+# Instead, require COOKIE_EXPIRY_ALERT_THRESHOLD occurrences within
+# COOKIE_EXPIRY_ALERT_WINDOW_SECONDS before alerting - one flaky check on
+# one odd video won't cross that bar, but genuinely dead/rotated cookies
+# will, since EVERY subsequent authenticated request will keep hitting the
+# same warning in quick succession. COOKIE_ALERT_COOLDOWN_SECONDS still
+# applies after an alert fires, to avoid repeat pings once you're already
+# aware.
+COOKIE_EXPIRY_ALERT_THRESHOLD = int(os.environ.get("COOKIE_EXPIRY_ALERT_THRESHOLD", "3"))
+COOKIE_EXPIRY_ALERT_WINDOW_SECONDS = int(os.environ.get("COOKIE_EXPIRY_ALERT_WINDOW_SECONDS", str(10 * 60)))  # 10 min
 COOKIE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ALERT_COOLDOWN_SECONDS", str(60 * 60)))  # 1 hour
 
 # ---------- PROXY FALLBACK / CIRCUIT BREAKER ----------

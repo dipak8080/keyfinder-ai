@@ -20,6 +20,8 @@ from config import (
     MAX_VIDEO_DURATION_SECONDS,
     PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     COOKIE_EXPIRY_MARKERS,
+    COOKIE_EXPIRY_ALERT_THRESHOLD,
+    COOKIE_EXPIRY_ALERT_WINDOW_SECONDS,
     COOKIE_ALERT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
@@ -266,10 +268,21 @@ def reset_proxy_circuit_breaker():
 # keep succeeding anyway via the direct/proxy fallback, so this would
 # otherwise pass by completely silently: nothing in the existing
 # failure-based alert system ever sees it. We hook into yt-dlp's own
-# logger interface to catch the warning text as it's produced and fire a
-# throttled Discord alert, without changing whether the download itself
-# succeeds or fails.
+# logger interface to catch the warning text as it's produced.
+#
+# IMPORTANT: yt-dlp's cookie-validity check is a HEURISTIC, not ground
+# truth - it can flag cookies invalid for one specific video/client combo
+# while the SAME cookies authenticate other downloads successfully
+# moments later (observed in production logs). Alerting on the first
+# occurrence produced false-alarm pings for cookies that were actually
+# fine. Instead: track occurrences in a rolling window and only alert once
+# COOKIE_EXPIRY_ALERT_THRESHOLD occurrences happen within
+# COOKIE_EXPIRY_ALERT_WINDOW_SECONDS - a single flaky check on an odd
+# video won't cross that bar, but genuinely dead/rotated cookies will,
+# since every subsequent authenticated download keeps hitting the same
+# warning in quick succession.
 _cookie_alert_lock = threading.Lock()
+_cookie_warning_events: list = []  # list of timestamps, pruned to the rolling window
 _cookie_alert_last_sent = 0.0
 
 
@@ -280,26 +293,46 @@ def _is_cookie_expiry_warning(message: str) -> bool:
 
 def _maybe_alert_cookie_expiry(message: str):
     """
-    Throttled to one alert per COOKIE_ALERT_COOLDOWN_SECONDS regardless of
-    how many times the warning fires in that window - yt-dlp repeats this
-    exact warning once per player client (ios/android/mweb/web) it checks
-    WITHIN a single download, so without this gate one dead-cookie
-    download would fire 4+ Discord messages back to back.
+    Records this occurrence, prunes anything outside the rolling window,
+    and only actually alerts once COOKIE_EXPIRY_ALERT_THRESHOLD occurrences
+    are present in that window - see the module-level comment above for
+    why a single occurrence is deliberately NOT enough. After an alert
+    fires, COOKIE_ALERT_COOLDOWN_SECONDS still suppresses repeats so a
+    sustained real outage doesn't spam Discord.
     """
     global _cookie_alert_last_sent
+    now = time.time()
+
     with _cookie_alert_lock:
-        now = time.time()
-        if now - _cookie_alert_last_sent < COOKIE_ALERT_COOLDOWN_SECONDS:
+        _cookie_warning_events.append(now)
+        cutoff = now - COOKIE_EXPIRY_ALERT_WINDOW_SECONDS
+        while _cookie_warning_events and _cookie_warning_events[0] < cutoff:
+            _cookie_warning_events.pop(0)
+        recent_count = len(_cookie_warning_events)
+
+        if recent_count < COOKIE_EXPIRY_ALERT_THRESHOLD:
+            # Not enough occurrences yet to distinguish "genuinely dead
+            # cookies" from "yt-dlp's heuristic had one flaky moment" -
+            # stay quiet.
             return
+
+        if now - _cookie_alert_last_sent < COOKIE_ALERT_COOLDOWN_SECONDS:
+            # Already alerted recently for this same ongoing issue - don't
+            # repeat-ping.
+            return
+
         _cookie_alert_last_sent = now
 
     alert_message = (
-        "[COOKIES] YouTube account cookies are no longer valid (expired/rotated). "
-        "Downloads are still working via the direct/proxy fallback, but re-export "
-        "cookies.txt from a logged-in browser session, base64-encode it, and update "
-        "YT_COOKIES_B64 in Railway when you get a chance - this alert won't repeat "
-        f"for {COOKIE_ALERT_COOLDOWN_SECONDS // 60} min regardless of how many "
-        f"downloads hit the same stale cookies in the meantime."
+        f"[COOKIES] YouTube account cookies look genuinely expired/rotated - "
+        f"seen {recent_count} times in the last "
+        f"{COOKIE_EXPIRY_ALERT_WINDOW_SECONDS // 60} min (not just a one-off "
+        f"flaky check). Downloads are still working via the direct/proxy "
+        f"fallback, but re-export cookies.txt from a logged-in browser "
+        f"session, base64-encode it, and update YT_COOKIES_B64 in Railway "
+        f"when you get a chance - this alert won't repeat for "
+        f"{COOKIE_ALERT_COOLDOWN_SECONDS // 60} min regardless of how many "
+        f"more downloads hit the same stale cookies in the meantime."
     )
     logger.critical(alert_message)
     alert_now(alert_message)
