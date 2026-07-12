@@ -38,10 +38,19 @@ class VideoTooLongError(Exception):
         )
 
 # Errors where retrying can NEVER help - the video itself is the blocker,
-# not anything transient about the network/bot-check. Retrying these just
-# burns proxy bandwidth (each attempt still fires 6-7 requests: webpage +
-# 4 player-client API calls) and makes the user wait through backoff delays
-# for a result that was never going to change. Fail fast on these instead.
+# not anything transient about the network/bot-check/IP. Retrying these
+# just burns proxy bandwidth (each attempt still fires 6-7 requests:
+# webpage + 4 player-client API calls) and makes the user wait through
+# backoff delays for a result that was never going to change. Fail fast
+# on these instead.
+#
+# THIS IS THE ONLY CARVE-OUT that skips the proxy tier entirely (see
+# download_with_fallback below) - every other kind of failure, including
+# ones not on any list here, gets a proxy attempt. Keep this list narrow
+# and only add things that are genuinely permanent/unfixable by any IP or
+# retry - a false positive here means "give up early on something that
+# maybe could have worked", which is the expensive direction to be wrong
+# in.
 PERMANENT_ERROR_MARKERS = (
     "video unavailable",
     "this video is not available",
@@ -93,11 +102,10 @@ def _normalize_error_text(error_text: str) -> str:
     (U+2019), not a straight one ('). Our marker strings use straight
     apostrophes. A plain substring match on the two silently NEVER matches
     even though they're visually identical, which meant is_bot_check_error()
-    returned False for a textbook bot-check error - the proxy fallback
-    never fired and the request surfaced as a raw 500 instead of a clean
-    503. Normalizing both sides here prevents that entire class of bug for
-    ANY marker list that matches against yt-dlp's error text, not just this
-    one already-known case.
+    returned False for a textbook bot-check error. Normalizing both sides
+    here prevents that entire class of bug for ANY marker list that
+    matches against yt-dlp's error text, not just this one already-known
+    case.
     """
     lowered = error_text.lower()
     return (
@@ -134,10 +142,11 @@ def is_valid_youtube_url(url: str) -> bool:
 def is_bot_check_error(error_text: str) -> bool:
     """
     Narrow check for the webpage-level bot-check UI page specifically.
-    Kept separate from is_ip_block_error() because routes.py still uses
-    THIS function to decide the user-facing 503 message wording - a raw
-    CDN 403 on the media fetch shouldn't say "YouTube is requiring bot
-    verification" since that's not literally what happened.
+    Used ONLY by routes.py to decide the user-facing 503 message wording -
+    a raw CDN 403 on the media fetch shouldn't say "YouTube is requiring
+    bot verification" since that's not literally what happened. Has NO
+    effect on whether the proxy gets tried - see download_with_fallback,
+    which now escalates on any non-permanent error.
     """
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in YT_BOT_CHECK_MARKERS)
@@ -145,13 +154,15 @@ def is_bot_check_error(error_text: str) -> bool:
 
 def is_ip_block_error(error_text: str) -> bool:
     """
-    True if this error means 'this IP is untrusted/blocked' - whether that
-    shows up as the webpage-level bot-check page (YT_BOT_CHECK_MARKERS) or
-    as a 403 on the actual media fetch, e.g. "unable to download video
-    data: HTTP Error 403: Forbidden" (the extra markers in
-    IP_BLOCK_MARKERS). Both symptoms get the SAME fix: retry via a
-    different IP (the proxy). This is the function download_with_fallback()
-    uses to decide whether to spend proxy bandwidth.
+    True if this error looks like a KNOWN IP-reputation problem - the
+    webpage-level bot-check page, or a 403 on the actual media fetch (e.g.
+    "unable to download video data: HTTP Error 403: Forbidden"). Used only
+    inside extract_info_with_retry as a fail-fast optimization (skip the
+    remaining same-IP retries and hand off to the caller faster) - it is
+    NOT what decides whether the proxy tier gets tried overall. That
+    decision is now exclude-list based (see download_with_fallback) so
+    error text NOT in this list still gets a proxy attempt, it just
+    doesn't get the fail-fast speed-up.
     """
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in IP_BLOCK_MARKERS)
@@ -159,7 +170,9 @@ def is_ip_block_error(error_text: str) -> bool:
 
 def is_permanent_error(error_text: str) -> bool:
     """True if the error means the video itself can never be downloaded -
-    no amount of retrying, cookie refreshing, or proxy switching helps."""
+    no amount of retrying, cookie refreshing, or proxy switching helps.
+    This is the ONLY thing that skips the proxy tier - see
+    download_with_fallback."""
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
@@ -358,17 +371,22 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
-                # result on a bot-check/403 - stop burning attempts on this
-                # IP immediately instead of doing 2 more pointless retries
-                # with backoff (~4.5s wasted). The CALLER
-                # (download_with_fallback) is what decides whether to
-                # escalate to a DIFFERENT IP via the proxy.
+                # result on a KNOWN bot-check/403 pattern - stop burning
+                # attempts on this IP immediately (saves ~4.5s of pointless
+                # backoff) instead of doing 2 more retries that will fail
+                # identically. The CALLER (download_with_fallback) decides
+                # whether to escalate to a different IP via the proxy.
                 logger.warning(
                     f"Attempt {attempt}: IP-block/bot-check error detected - "
                     f"not retrying on the same IP: {error_text}"
                 )
                 raise
 
+            # Unrecognized error text - could be a genuine transient blip
+            # OR a new/unknown YouTube error pattern we haven't catalogued
+            # yet. Either way, give it the full backoff-retry treatment
+            # here (cheap, no proxy involved) before download_with_fallback
+            # decides whether to also try the proxy tier.
             logger.warning(f"Attempt {attempt} failed: {error_text}")
 
             if attempt < YT_DLP_MAX_ATTEMPTS:
@@ -386,54 +404,57 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     Tiered download strategy, cheapest option first:
 
       Tier 1 - DIRECT (no proxy), cookies still attached if available.
-               Free. Succeeds for most normal, spread-out traffic, since
-               cookies alone clear the plain "sign in to confirm you're not
-               a bot" check most of the time.
+               Free. Retries up to YT_DLP_MAX_ATTEMPTS with backoff first
+               (see extract_info_with_retry) - genuine transient blips get
+               a chance to self-resolve here before any money is spent.
 
-      Tier 2 - PROXY + cookies, tried ONLY if tier 1 failed with an
-               IP-block error - covers BOTH the webpage-level bot-check
-               page AND a 403 at the media-download step (googlevideo.com
-               CDN rejecting the IP after extraction/PO-token/JS-challenge
-               already succeeded - see is_ip_block_error). Unrelated
-               errors (permanent errors, genuine transient blips) never
-               touch the proxy, since is_permanent_error already
-               short-circuits those inside extract_info_with_retry before
-               we'd ever consider a proxy retry. This is the paid
-               fallback, not the default, so normal traffic doesn't burn
-               proxy bandwidth for no reason.
+      Tier 2 - PROXY + cookies, tried for ANY Tier 1 failure EXCEPT a
+               confirmed permanent error (video deleted/private/copyright -
+               see is_permanent_error). This is intentionally an
+               EXCLUDE-list, not an allow-list: known IP-block errors
+               (bot-check page, media-fetch 403s) escalate, same as
+               before, but so does ANY error text we haven't seen or
+               catalogued yet. A hardcoded marker list can only ever
+               recognize failure patterns we already know about - as new
+               yt-dlp/YouTube error wording shows up over time, this way
+               it still gets a proxy attempt instead of silently failing
+               the same way every time until someone notices in the logs
+               and adds a new marker string. Permanent errors are the one
+               deliberate carve-out, since no IP change fixes a deleted
+               video - that would just be pure wasted proxy spend.
 
     If tier 2 itself fails with what looks like a proxy billing/quota
     error, trip the circuit breaker (see _trip_proxy_circuit_breaker) so
     subsequent requests skip proxy entirely during the cooldown instead of
     each one separately re-discovering the proxy is dead. The request
-    still fails in that moment (nothing left to fall back to except a
-    clean bot-check error), but every request AFTER it degrades gracefully
-    to direct-only instead of paying the proxy's connection-failure
-    latency every single time.
+    still fails in that moment (nothing left to fall back to), but every
+    request AFTER it degrades gracefully to direct-only instead of paying
+    the proxy's connection-failure latency every single time.
     """
     try:
         return extract_info_with_retry(base_ydl_opts, url)
     except Exception as e:
         first_error = str(e)
 
-        if not is_ip_block_error(first_error):
-            # Not an IP-reputation issue (e.g. permanent error, network
-            # blip) - a proxy wouldn't fix this, don't spend money on it.
+        if is_permanent_error(first_error):
+            # The one deliberate carve-out - no IP in the world fixes a
+            # deleted/private/copyright-blocked video, so don't spend
+            # proxy money finding that out a second time.
             raise
 
         if not proxy_url:
-            logger.warning("[PROXY] Direct attempt hit IP-block/bot-check and no proxy is configured - failing as-is.")
+            logger.warning("[PROXY] Direct attempt failed and no proxy is configured - failing as-is.")
             raise
 
         if not proxy_available():
             logger.warning(
-                "[PROXY] Direct attempt hit IP-block/bot-check, but proxy circuit breaker is "
+                "[PROXY] Direct attempt failed, but proxy circuit breaker is "
                 "currently OPEN (likely out of credit) - failing as-is instead of "
                 "retrying a proxy known to be down."
             )
             raise
 
-        logger.warning("[PROXY] Direct attempt hit IP-block/bot-check - retrying via proxy...")
+        logger.warning(f"[PROXY] Direct attempt failed ({first_error[:200]}) - retrying via proxy...")
         proxied_opts = {**base_ydl_opts, 'proxy': proxy_url}
         try:
             result = extract_info_with_retry(proxied_opts, url)
