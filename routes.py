@@ -23,6 +23,7 @@ from utils import (
 from youtube import (
     download_with_fallback,
     is_bot_check_error,
+    is_valid_youtube_url,
     check_video_duration,
     VideoTooLongError,
     proxy_available,
@@ -39,6 +40,16 @@ router = APIRouter()
 async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     if format not in ["mp3", "wav"]:
         raise HTTPException(400, "Format must be 'mp3' or 'wav'")
+
+    # Cheap, instant check BEFORE touching yt-dlp, the download semaphore,
+    # or the proxy - a garbage/non-YouTube URL was never going to succeed,
+    # so there's no reason to spend 3 retries-with-backoff (~10s) and a
+    # concurrency slot on it. Real videos that are private/deleted/etc.
+    # still pass this shape check and get caught downstream by
+    # is_permanent_error() during the real yt-dlp call, same as before.
+    if not is_valid_youtube_url(url):
+        logger.warning(f"Rejected download - not a recognizable YouTube URL: {url}")
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
     temp_id = str(uuid.uuid4())
     temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.%(ext)s")

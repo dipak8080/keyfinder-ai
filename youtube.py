@@ -4,6 +4,7 @@ retry-with-backoff wrapper, YouTube bot-check detection, and the
 direct-then-proxy fallback strategy (with a circuit breaker for when the
 proxy runs out of credit).
 """
+import re
 import time
 import threading
 from typing import Optional
@@ -49,6 +50,14 @@ PERMANENT_ERROR_MARKERS = (
     "copyright",
     "this video does not exist",
     "unable to extract video data",
+    # Safety net for junk/garbage/non-YouTube URLs that slip past
+    # is_valid_youtube_url() below for any reason - these are yt-dlp's own
+    # error strings when it can't even recognize the URL, and retrying
+    # them 3x with backoff (or worse, trying a proxy) is pure waste since
+    # no amount of retrying fixes a URL that was never valid.
+    "unsupported url",
+    "is not a valid url",
+    "unable to download webpage",
 )
 
 # Errors that indicate the PROXY itself is out of credit/quota, as opposed
@@ -95,6 +104,28 @@ def _normalize_error_text(error_text: str) -> str:
         .replace("\u201c", '"')  # left double quotation mark -> straight quote
         .replace("\u201d", '"')  # right double quotation mark -> straight quote
     )
+
+
+# Matches the handful of real YouTube URL shapes we actually expect:
+# youtube.com/watch?v=, youtu.be/, youtube.com/shorts/, m.youtube.com,
+# music.youtube.com. This is deliberately a cheap SHAPE check, not full
+# validation - it's meant to catch obvious junk (empty strings, random
+# text, non-YouTube domains, typos) BEFORE spending a single yt-dlp call,
+# a download semaphore slot, or 3 retries-with-backoff on something that
+# was never going to work. It is NOT meant to catch every edge case (e.g.
+# a syntactically valid but deleted/private video) - those still get
+# handled downstream by is_permanent_error() during the real yt-dlp call,
+# same as before.
+_YOUTUBE_URL_PATTERN = re.compile(
+    r"^https?://(www\.|m\.|music\.)?(youtube\.com/(watch\?.*v=|shorts/|live/)|youtu\.be/)",
+    re.IGNORECASE,
+)
+
+
+def is_valid_youtube_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    return bool(_YOUTUBE_URL_PATTERN.match(url.strip()))
 
 
 def is_bot_check_error(error_text: str) -> bool:
