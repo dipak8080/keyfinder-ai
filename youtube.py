@@ -1,8 +1,8 @@
 """
 youtube.py - Everything the /download route needs for talking to yt_dlp:
-retry-with-backoff wrapper, YouTube bot-check detection, and the
+retry-with-backoff wrapper, YouTube bot-check detection, the
 direct-then-proxy fallback strategy (with a circuit breaker for when the
-proxy runs out of credit).
+proxy runs out of credit), and a cookie-expiry Discord alert.
 """
 import re
 import time
@@ -18,6 +18,8 @@ from config import (
     YT_BOT_CHECK_MARKERS,
     MAX_VIDEO_DURATION_SECONDS,
     PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    COOKIE_EXPIRY_MARKERS,
+    COOKIE_ALERT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
 
@@ -186,6 +188,82 @@ def reset_proxy_circuit_breaker():
     with _proxy_lock:
         _proxy_disabled_until = 0.0
     logger.info("[PROXY] Circuit breaker manually reset - proxy re-enabled.")
+
+
+# ---------- COOKIE EXPIRY ALERTING ----------
+# yt-dlp reports dead cookies as a WARNING, not an exception - downloads
+# keep succeeding anyway via the direct/proxy fallback, so this would
+# otherwise pass by completely silently: nothing in the existing
+# failure-based alert system ever sees it. We hook into yt-dlp's own
+# logger interface to catch the warning text as it's produced and fire a
+# throttled Discord alert, without changing whether the download itself
+# succeeds or fails.
+_cookie_alert_lock = threading.Lock()
+_cookie_alert_last_sent = 0.0
+
+
+def _is_cookie_expiry_warning(message: str) -> bool:
+    normalized = _normalize_error_text(message)
+    return any(marker in normalized for marker in COOKIE_EXPIRY_MARKERS)
+
+
+def _maybe_alert_cookie_expiry(message: str):
+    """
+    Throttled to one alert per COOKIE_ALERT_COOLDOWN_SECONDS regardless of
+    how many times the warning fires in that window - yt-dlp repeats this
+    exact warning once per player client (ios/android/mweb/web) it checks
+    WITHIN a single download, so without this gate one dead-cookie
+    download would fire 4+ Discord messages back to back.
+    """
+    global _cookie_alert_last_sent
+    with _cookie_alert_lock:
+        now = time.time()
+        if now - _cookie_alert_last_sent < COOKIE_ALERT_COOLDOWN_SECONDS:
+            return
+        _cookie_alert_last_sent = now
+
+    alert_message = (
+        "[COOKIES] YouTube account cookies are no longer valid (expired/rotated). "
+        "Downloads are still working via the direct/proxy fallback, but re-export "
+        "cookies.txt from a logged-in browser session, base64-encode it, and update "
+        "YT_COOKIES_B64 in Railway when you get a chance - this alert won't repeat "
+        f"for {COOKIE_ALERT_COOLDOWN_SECONDS // 60} min regardless of how many "
+        f"downloads hit the same stale cookies in the meantime."
+    )
+    logger.critical(alert_message)
+    alert_now(alert_message)
+
+
+class _YtdlpAlertLogger:
+    """
+    Passed as ydl_opts['logger'] so we can inspect yt-dlp's own log lines
+    (which include the cookie-expiry warning) as they're produced, without
+    yt-dlp raising an exception for it - downloads succeed anyway via
+    fallback, so nothing would otherwise catch this. Every message is
+    still printed exactly as before (Railway's log capture is unaffected,
+    same verbose [debug]/[youtube]/WARNING output you're used to seeing) -
+    this only ADDS a side-channel check on top, it doesn't suppress or
+    alter yt-dlp's normal output in any way.
+    """
+    def debug(self, msg):
+        print(msg)
+        if _is_cookie_expiry_warning(msg):
+            _maybe_alert_cookie_expiry(msg)
+
+    def warning(self, msg):
+        print(msg)
+        if _is_cookie_expiry_warning(msg):
+            _maybe_alert_cookie_expiry(msg)
+
+    def error(self, msg):
+        print(msg)
+
+
+# Single shared instance - it holds no per-request state (the cooldown
+# gate is already its own module-level lock/timestamp), so one instance
+# passed into every ydl_opts dict is correct and avoids extra allocation
+# per request.
+ytdlp_alert_logger = _YtdlpAlertLogger()
 
 
 def check_video_duration(ydl_opts: dict, url: str):

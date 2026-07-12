@@ -28,6 +28,7 @@ from youtube import (
     VideoTooLongError,
     proxy_available,
     reset_proxy_circuit_breaker,
+    ytdlp_alert_logger,
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
@@ -85,6 +86,15 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         # not available"). 'ejs:github' fetches it directly from the
         # official yt-dlp-ejs GitHub repo - small, one-time per version.
         'remote_components': {'ejs:github'},
+        # Routes every log line yt-dlp produces (including the cookie-
+        # expiry warning) through our logger so a Discord alert can fire
+        # on it - see youtube._YtdlpAlertLogger. Every line still prints
+        # exactly as before; this only adds a side-channel check on top,
+        # it doesn't suppress or change any existing verbose log output.
+        # Applies to BOTH tiers automatically, since download_with_fallback
+        # builds the proxy attempt via {**base_ydl_opts, 'proxy': ...} -
+        # the logger key carries over unchanged either way.
+        'logger': ytdlp_alert_logger,
     }
 
     # Cookies status is logged on EVERY request as one unambiguous,
@@ -272,7 +282,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.7 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK",
+        "status": "Audio Analysis API v12.8 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -298,6 +308,7 @@ async def root():
             "Per-request [COOKIES]/[PROXY] status log line for instant visibility in Railway Deploy Logs",
             "Tiered download strategy: direct+cookies first (free), proxy retry only on bot-check errors (paid fallback, not default)",
             "Proxy circuit breaker: billing/quota-style proxy failures disable the proxy for a cooldown window instead of retrying a dead proxy on every request, with an immediate webhook alert",
+            "Cookie-expiry Discord alert: fires a throttled webhook alert the moment yt-dlp reports dead/rotated cookies, instead of that warning passing by silently in logs",
             "CORS locked to ALLOWED_ORIGINS (defaults to '*' until explicitly configured)",
             "Per-IP rate limiting on /download and /analyze",
             "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",

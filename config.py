@@ -96,6 +96,26 @@ QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "3
 # startup, once, before any requests are served. See utils.ensure_cookies_file().
 YT_COOKIES_PATH_DEFAULT = "/app/cookies.txt"
 
+# ---------- COOKIE EXPIRY ALERTING ----------
+# yt-dlp logs "The provided YouTube account cookies are no longer valid"
+# as a WARNING, not an exception - downloads keep succeeding anyway via
+# the direct/proxy fallback, so this currently passes by completely
+# silently: nothing in the existing alert system (which only fires on
+# request FAILURES) ever sees it. This lets you find out cookies died
+# from a Discord ping instead of stumbling on it in Railway logs.
+#
+# yt-dlp repeats this exact warning once per player client it checks
+# (ios/android/mweb/web) within a SINGLE download - without a cooldown,
+# one download with dead cookies would fire 4+ Discord alerts back to
+# back. COOKIE_ALERT_COOLDOWN_SECONDS collapses that down to one alert
+# per window regardless of how many downloads/warnings happen in it.
+COOKIE_EXPIRY_MARKERS = (
+    "cookies are no longer valid",
+    "cookies have expired",
+    "cookies have been rotated",
+)
+COOKIE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ALERT_COOLDOWN_SECONDS", str(60 * 60)))  # 1 hour
+
 # ---------- PROXY FALLBACK / CIRCUIT BREAKER ----------
 # Strategy: try every download WITHOUT the proxy first (free - cookies
 # alone clear most bot-checks for normal, spread-out traffic). Only retry
