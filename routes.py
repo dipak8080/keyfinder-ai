@@ -23,6 +23,7 @@ from utils import (
 from youtube import (
     download_with_fallback,
     is_bot_check_error,
+    is_geo_restricted_error,
     is_valid_youtube_url,
     check_video_duration,
     VideoTooLongError,
@@ -148,6 +149,21 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             title = info.get('title', 'Unknown')
         except Exception as e:
             error_text = str(e)
+
+            if is_geo_restricted_error(error_text):
+                # Distinct from the generic bot-check message below - this
+                # is a licensing/rights restriction, not an anti-bot
+                # measure, and no amount of "try again later" will ever
+                # fix it for THIS video from a server exit IP outside the
+                # allowed region(s). Give the user an accurate, actionable
+                # message instead of a raw 500/traceback.
+                logger.warning(f"Geo-restricted video blocked download for URL: {url}")
+                raise HTTPException(
+                    451,  # "Unavailable For Legal Reasons" - the semantically correct status for this
+                    "This video is restricted by the uploader to specific countries and "
+                    "isn't available from our server's location. This isn't something we "
+                    "can fix on our end for this particular video - try a different one."
+                )
 
             if is_bot_check_error(error_text):
                 logger.error(f"YouTube bot verification / format restriction blocked download for URL: {url}")
@@ -282,7 +298,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.8 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS",
+        "status": "Audio Analysis API v12.9 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -293,6 +309,7 @@ async def root():
             "Permanent-error detection (video unavailable/private/removed) skips retries to save proxy bandwidth and fail fast",
             "Video duration cap rejects overly long videos before download starts, avoiding wasted proxy bandwidth on requests the frontend will time out on anyway",
             "Clean 503 on YouTube bot verification / format restriction instead of raw error",
+            "Clean 451 on geo-restricted videos, with same-IP fail-fast (no wasted retries) but still escalates to proxy since a different exit region CAN fix it",
             "Guaranteed temp file cleanup via finally blocks",
             "Explicit memory freeing + gc.collect() + malloc_trim() after each request",
             "Audio trimmed to first 180s before analysis to cap peak memory",

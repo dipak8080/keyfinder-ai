@@ -91,6 +91,23 @@ PROXY_QUOTA_ERROR_MARKERS = (
     "407",  # HTTP 407 Proxy Authentication Required - overloaded by some providers for "no balance"
 )
 
+# Errors meaning the video is blocked FOR A SPECIFIC REGION by the
+# uploader/rights holder - distinct from PERMANENT_ERROR_MARKERS because a
+# proxy exit node in an allowed country genuinely CAN fix this (unlike a
+# deleted/private video, where no IP in the world helps). So this is NOT
+# added to PERMANENT_ERROR_MARKERS - download_with_fallback still escalates
+# to the proxy tier for these. It IS treated like an IP-block for the
+# same-IP fail-fast optimization inside extract_info_with_retry, since
+# retrying 3x from the SAME IP against a geo-block can never succeed - only
+# switching IP (i.e. the proxy tier) has any chance.
+GEO_RESTRICTED_MARKERS = (
+    "not made this video available in your country",
+    "the uploader has not made this video available",
+    "content is not available in your country",
+    "video is not available in your country",
+    "not available in your country",
+)
+
 
 def _normalize_error_text(error_text: str) -> str:
     """
@@ -152,27 +169,46 @@ def is_bot_check_error(error_text: str) -> bool:
     return any(marker in normalized for marker in YT_BOT_CHECK_MARKERS)
 
 
+def is_geo_restricted_error(error_text: str) -> bool:
+    """
+    True if the uploader/rights holder has geo-blocked this video for the
+    server's current exit country. Used by routes.py to give the user an
+    accurate, actionable message instead of a generic failure, and by
+    extract_info_with_retry as a same-IP fail-fast signal (see
+    GEO_RESTRICTED_MARKERS above for why this is separate from
+    is_permanent_error).
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in GEO_RESTRICTED_MARKERS)
+
+
 def is_ip_block_error(error_text: str) -> bool:
     """
     True if this error looks like a KNOWN IP-reputation problem - the
-    webpage-level bot-check page, or a 403 on the actual media fetch (e.g.
-    "unable to download video data: HTTP Error 403: Forbidden"). Used only
-    inside extract_info_with_retry as a fail-fast optimization (skip the
-    remaining same-IP retries and hand off to the caller faster) - it is
-    NOT what decides whether the proxy tier gets tried overall. That
-    decision is now exclude-list based (see download_with_fallback) so
-    error text NOT in this list still gets a proxy attempt, it just
-    doesn't get the fail-fast speed-up.
+    webpage-level bot-check page, a 403 on the actual media fetch (e.g.
+    "unable to download video data: HTTP Error 403: Forbidden"), OR a
+    geo-restriction (which is also fundamentally an "this IP/region is
+    wrong" problem, just enforced by licensing instead of anti-bot
+    detection). Used only inside extract_info_with_retry as a fail-fast
+    optimization (skip the remaining same-IP retries and hand off to the
+    caller faster) - it is NOT what decides whether the proxy tier gets
+    tried overall. That decision is exclude-list based (see
+    download_with_fallback) so error text NOT in this list still gets a
+    proxy attempt, it just doesn't get the fail-fast speed-up.
     """
     normalized = _normalize_error_text(error_text)
-    return any(marker in normalized for marker in IP_BLOCK_MARKERS)
+    return (
+        any(marker in normalized for marker in IP_BLOCK_MARKERS)
+        or is_geo_restricted_error(error_text)
+    )
 
 
 def is_permanent_error(error_text: str) -> bool:
     """True if the error means the video itself can never be downloaded -
     no amount of retrying, cookie refreshing, or proxy switching helps.
     This is the ONLY thing that skips the proxy tier - see
-    download_with_fallback."""
+    download_with_fallback. Geo-restriction is deliberately NOT here (see
+    GEO_RESTRICTED_MARKERS) since a differently-located proxy CAN fix it."""
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
@@ -371,14 +407,15 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
-                # result on a KNOWN bot-check/403 pattern - stop burning
-                # attempts on this IP immediately (saves ~4.5s of pointless
-                # backoff) instead of doing 2 more retries that will fail
-                # identically. The CALLER (download_with_fallback) decides
-                # whether to escalate to a different IP via the proxy.
+                # result on a KNOWN bot-check/403/geo-block pattern - stop
+                # burning attempts on this IP immediately (saves ~4.5s of
+                # pointless backoff) instead of doing 2 more retries that
+                # will fail identically. The CALLER (download_with_fallback)
+                # decides whether to escalate to a different IP via the
+                # proxy.
                 logger.warning(
-                    f"Attempt {attempt}: IP-block/bot-check error detected - "
-                    f"not retrying on the same IP: {error_text}"
+                    f"Attempt {attempt}: IP-block/bot-check/geo-restriction error "
+                    f"detected - not retrying on the same IP: {error_text}"
                 )
                 raise
 
@@ -412,9 +449,9 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                confirmed permanent error (video deleted/private/copyright -
                see is_permanent_error). This is intentionally an
                EXCLUDE-list, not an allow-list: known IP-block errors
-               (bot-check page, media-fetch 403s) escalate, same as
-               before, but so does ANY error text we haven't seen or
-               catalogued yet. A hardcoded marker list can only ever
+               (bot-check page, media-fetch 403s, geo-restriction) escalate,
+               same as before, but so does ANY error text we haven't seen
+               or catalogued yet. A hardcoded marker list can only ever
                recognize failure patterns we already know about - as new
                yt-dlp/YouTube error wording shows up over time, this way
                it still gets a proxy attempt instead of silently failing
