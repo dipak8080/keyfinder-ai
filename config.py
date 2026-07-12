@@ -28,6 +28,22 @@ YT_BOT_CHECK_MARKERS = (
     "requested format is not available",
 )
 
+# ---------- IP-REPUTATION FAILURES (proxy-worthy, but not the bot-check UI text) ----------
+# YT_BOT_CHECK_MARKERS above only covers the webpage/API extraction step
+# ("sign in to confirm..."). It does NOT cover a 403 at the actual media
+# download step (googlevideo.com CDN rejecting the connecting IP after
+# extraction, PO tokens, and JS-challenge-solving already succeeded) -
+# that's a different failure point with different error text, but the
+# SAME root cause (IP reputation) and the SAME fix (retry through the
+# proxy). This list is checked separately by is_ip_block_error() in
+# youtube.py, which is what actually gates the proxy retry in
+# download_with_fallback(). YT_BOT_CHECK_MARKERS stays as-is and keeps
+# driving the user-facing 503 message text in routes.py.
+IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
+    "unable to download video data",
+    "http error 403",
+)
+
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
 # Long videos (podcasts, DJ sets, movies) can take many minutes to download
 # and convert - often longer than the frontend's fetch timeout, so the
@@ -119,10 +135,11 @@ COOKIE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ALERT_COOLDOWN_SECOND
 # ---------- PROXY FALLBACK / CIRCUIT BREAKER ----------
 # Strategy: try every download WITHOUT the proxy first (free - cookies
 # alone clear most bot-checks for normal, spread-out traffic). Only retry
-# through the proxy if that direct attempt specifically hit a bot-check /
-# format-restriction error - unrelated errors (video unavailable, etc.)
-# never touch the proxy, since it wouldn't help and would just burn paid
-# bandwidth. See youtube.download_with_fallback().
+# through the proxy if that direct attempt specifically hit an IP-block
+# error (webpage bot-check OR media-fetch 403 - see IP_BLOCK_MARKERS above)
+# - unrelated errors (video unavailable, etc.) never touch the proxy, since
+# it wouldn't help and would just burn paid bandwidth. See
+# youtube.download_with_fallback().
 #
 # If the proxy itself then fails with what looks like a billing/quota
 # error (out of credit), we trip a circuit breaker instead of letting

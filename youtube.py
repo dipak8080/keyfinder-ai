@@ -1,6 +1,6 @@
 """
 youtube.py - Everything the /download route needs for talking to yt_dlp:
-retry-with-backoff wrapper, YouTube bot-check detection, the
+retry-with-backoff wrapper, YouTube bot-check / IP-block detection, the
 direct-then-proxy fallback strategy (with a circuit breaker for when the
 proxy runs out of credit), and a cookie-expiry Discord alert.
 """
@@ -16,6 +16,7 @@ from config import (
     YT_DLP_MAX_ATTEMPTS,
     YT_DLP_BASE_BACKOFF_SECONDS,
     YT_BOT_CHECK_MARKERS,
+    IP_BLOCK_MARKERS,
     MAX_VIDEO_DURATION_SECONDS,
     PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     COOKIE_EXPIRY_MARKERS,
@@ -131,8 +132,29 @@ def is_valid_youtube_url(url: str) -> bool:
 
 
 def is_bot_check_error(error_text: str) -> bool:
+    """
+    Narrow check for the webpage-level bot-check UI page specifically.
+    Kept separate from is_ip_block_error() because routes.py still uses
+    THIS function to decide the user-facing 503 message wording - a raw
+    CDN 403 on the media fetch shouldn't say "YouTube is requiring bot
+    verification" since that's not literally what happened.
+    """
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in YT_BOT_CHECK_MARKERS)
+
+
+def is_ip_block_error(error_text: str) -> bool:
+    """
+    True if this error means 'this IP is untrusted/blocked' - whether that
+    shows up as the webpage-level bot-check page (YT_BOT_CHECK_MARKERS) or
+    as a 403 on the actual media fetch, e.g. "unable to download video
+    data: HTTP Error 403: Forbidden" (the extra markers in
+    IP_BLOCK_MARKERS). Both symptoms get the SAME fix: retry via a
+    different IP (the proxy). This is the function download_with_fallback()
+    uses to decide whether to spend proxy bandwidth.
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in IP_BLOCK_MARKERS)
 
 
 def is_permanent_error(error_text: str) -> bool:
@@ -333,10 +355,21 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
-            if is_bot_check_error(error_text):
-                logger.warning(f"Attempt {attempt}: YouTube bot verification triggered.")
-            else:
-                logger.warning(f"Attempt {attempt} failed: {error_text}")
+            if is_ip_block_error(error_text):
+                # Retrying from the SAME IP (direct-tier or already inside
+                # a proxy-tier call) was never going to produce a different
+                # result on a bot-check/403 - stop burning attempts on this
+                # IP immediately instead of doing 2 more pointless retries
+                # with backoff (~4.5s wasted). The CALLER
+                # (download_with_fallback) is what decides whether to
+                # escalate to a DIFFERENT IP via the proxy.
+                logger.warning(
+                    f"Attempt {attempt}: IP-block/bot-check error detected - "
+                    f"not retrying on the same IP: {error_text}"
+                )
+                raise
+
+            logger.warning(f"Attempt {attempt} failed: {error_text}")
 
             if attempt < YT_DLP_MAX_ATTEMPTS:
                 backoff = YT_DLP_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
@@ -357,13 +390,17 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                cookies alone clear the plain "sign in to confirm you're not
                a bot" check most of the time.
 
-      Tier 2 - PROXY + cookies, tried ONLY if tier 1 failed with a
-               bot-check / format-restriction error specifically (not on
-               unrelated errors - is_permanent_error already short-circuits
-               those inside extract_info_with_retry before we'd ever
-               consider a proxy retry). This is the paid fallback, not the
-               default, so normal traffic doesn't burn proxy bandwidth for
-               no reason.
+      Tier 2 - PROXY + cookies, tried ONLY if tier 1 failed with an
+               IP-block error - covers BOTH the webpage-level bot-check
+               page AND a 403 at the media-download step (googlevideo.com
+               CDN rejecting the IP after extraction/PO-token/JS-challenge
+               already succeeded - see is_ip_block_error). Unrelated
+               errors (permanent errors, genuine transient blips) never
+               touch the proxy, since is_permanent_error already
+               short-circuits those inside extract_info_with_retry before
+               we'd ever consider a proxy retry. This is the paid
+               fallback, not the default, so normal traffic doesn't burn
+               proxy bandwidth for no reason.
 
     If tier 2 itself fails with what looks like a proxy billing/quota
     error, trip the circuit breaker (see _trip_proxy_circuit_breaker) so
@@ -379,24 +416,24 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     except Exception as e:
         first_error = str(e)
 
-        if not is_bot_check_error(first_error):
-            # Not a bot-check/format issue (e.g. permanent error, network
+        if not is_ip_block_error(first_error):
+            # Not an IP-reputation issue (e.g. permanent error, network
             # blip) - a proxy wouldn't fix this, don't spend money on it.
             raise
 
         if not proxy_url:
-            logger.warning("[PROXY] Direct attempt hit bot-check and no proxy is configured - failing as-is.")
+            logger.warning("[PROXY] Direct attempt hit IP-block/bot-check and no proxy is configured - failing as-is.")
             raise
 
         if not proxy_available():
             logger.warning(
-                "[PROXY] Direct attempt hit bot-check, but proxy circuit breaker is "
+                "[PROXY] Direct attempt hit IP-block/bot-check, but proxy circuit breaker is "
                 "currently OPEN (likely out of credit) - failing as-is instead of "
                 "retrying a proxy known to be down."
             )
             raise
 
-        logger.warning("[PROXY] Direct attempt hit bot-check - retrying via proxy...")
+        logger.warning("[PROXY] Direct attempt hit IP-block/bot-check - retrying via proxy...")
         proxied_opts = {**base_ydl_opts, 'proxy': proxy_url}
         try:
             result = extract_info_with_retry(proxied_opts, url)
@@ -410,5 +447,6 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 logger.warning(f"[PROXY] Proxy retry also failed (non-quota error): {proxy_error_text}")
             # Whatever the proxy attempt raised is the most informative
             # error to surface - propagate it (routes.py still applies its
-            # own is_bot_check_error() classification on top of this).
+            # own is_bot_check_error() classification on top of this for
+            # the user-facing message).
             raise
