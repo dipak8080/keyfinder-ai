@@ -10,7 +10,7 @@ import base64
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 
-from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, YT_COOKIES_PATH_DEFAULT, ADMIN_STATUS_KEY
+from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, ADMIN_STATUS_KEY
 from utils import (
     cleanup_file,
     release_memory_to_os,
@@ -29,6 +29,7 @@ from youtube import (
     VideoTooLongError,
     proxy_available,
     reset_proxy_circuit_breaker,
+    get_cookie_accounts,
     ytdlp_alert_logger,
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
@@ -98,23 +99,15 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'logger': ytdlp_alert_logger,
     }
 
-    # Cookies status is logged on EVERY request as one unambiguous,
-    # greppable line - search "[COOKIES]" in Railway's Deploy Logs to
-    # instantly see whether this specific download actually had cookies
-    # available, without needing shell access into the container. The
-    # actual file is reconstructed once at startup from YT_COOKIES_B64 (see
-    # utils.ensure_cookies_file()) - this block just checks it's really
-    # there and wires it into yt-dlp's options for this request. Cookies
-    # apply to BOTH tiers (direct and proxy) since they solve a different
-    # problem (session trust) than the proxy does (IP reputation).
-    cookies_path = os.environ.get('YT_COOKIES_PATH', YT_COOKIES_PATH_DEFAULT)
-    cookies_active = bool(cookies_path and os.path.exists(cookies_path))
-    if cookies_active:
-        ydl_opts['cookiefile'] = cookies_path
-
+    # Cookie account selection now happens INSIDE download_with_fallback
+    # (see youtube.get_cookie_accounts / download_with_fallback) - it
+    # rotates through up to 3 accounts on LOGIN_REQUIRED failures, so we
+    # deliberately do NOT preset 'cookiefile' here anymore; whichever
+    # account is tried first is chosen dynamically per-attempt.
     proxy_url = os.environ.get('YT_PROXY_URL')
+    available_accounts = get_cookie_accounts()
     logger.info(
-        f"[COOKIES] status={'ACTIVE' if cookies_active else 'MISSING'} path={cookies_path} "
+        f"[COOKIES] accounts_available={len(available_accounts)} "
         f"[PROXY] configured={bool(proxy_url)} circuit_breaker={'OPEN' if not proxy_available() else 'CLOSED'} "
         f"url={url}"
     )
@@ -298,7 +291,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v12.9 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING",
+        "status": "Audio Analysis API v13.0 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -325,7 +318,8 @@ async def root():
             "Per-request [COOKIES]/[PROXY] status log line for instant visibility in Railway Deploy Logs",
             "Tiered download strategy: direct+cookies first (free), proxy retry only on bot-check errors (paid fallback, not default)",
             "Proxy circuit breaker: billing/quota-style proxy failures disable the proxy for a cooldown window instead of retrying a dead proxy on every request, with an immediate webhook alert",
-            "Cookie-expiry Discord alert: fires a throttled webhook alert the moment yt-dlp reports dead/rotated cookies, instead of that warning passing by silently in logs",
+            "Cookie-expiry Discord alert: fires a throttled webhook alert only after sustained (not one-off) dead-cookie warnings, instead of alerting on a single flaky yt-dlp heuristic check",
+            "Multi-account cookie rotation: up to 3 cookie sessions, auto-rotates to the next account on a confirmed LOGIN_REQUIRED failure (per-account cooldown), before falling back to the proxy tier",
             "CORS locked to ALLOWED_ORIGINS (defaults to '*' until explicitly configured)",
             "Per-IP rate limiting on /download and /analyze",
             "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",
@@ -353,6 +347,9 @@ async def admin_status(key: str = Query(...)):
     snapshot = get_status_snapshot()
     snapshot["proxy"] = {
         "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",
+    }
+    snapshot["cookies"] = {
+        "accounts_available": len(get_cookie_accounts()),
     }
     return snapshot
 

@@ -4,8 +4,10 @@ retry-with-backoff wrapper, YouTube bot-check / IP-block detection, the
 direct-then-proxy fallback strategy (with a circuit breaker for when the
 proxy runs out of credit), and a cookie-expiry Discord alert.
 """
+import os
 import re
 import time
+import base64
 import threading
 from typing import Optional
 
@@ -23,6 +25,12 @@ from config import (
     COOKIE_EXPIRY_ALERT_THRESHOLD,
     COOKIE_EXPIRY_ALERT_WINDOW_SECONDS,
     COOKIE_ALERT_COOLDOWN_SECONDS,
+    YT_COOKIES_PATH_DEFAULT,
+    COOKIE_ACCOUNT_2_B64_ENV,
+    COOKIE_ACCOUNT_3_B64_ENV,
+    COOKIE_ACCOUNT_2_PATH,
+    COOKIE_ACCOUNT_3_PATH,
+    COOKIE_ACCOUNT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
 
@@ -291,6 +299,32 @@ def _is_cookie_expiry_warning(message: str) -> bool:
     return any(marker in normalized for marker in COOKIE_EXPIRY_MARKERS)
 
 
+# Per-attempt signal: was a "cookies are no longer valid" warning seen
+# during THIS specific yt-dlp call? Thread-local because extract_info_with
+# _retry runs inside a worker thread from the pool (one thread per
+# concurrent request), so this correctly scopes to the request currently
+# running on that thread without concurrent downloads stepping on each
+# other's flag. This is what tells download_with_fallback "this failure
+# is a cookie-IDENTITY problem, rotate accounts" versus "this is an
+# IP-reputation problem, escalate to proxy instead" - both failure modes
+# can produce the identical outer error text ("Sign in to confirm you're
+# not a bot"), so the flag (set the moment the cookie-specific warning
+# line appears) is the only reliable way to tell them apart.
+_thread_local = threading.local()
+
+
+def _reset_cookie_flag():
+    _thread_local.cookie_flagged_dead = False
+
+
+def _mark_cookie_flagged():
+    _thread_local.cookie_flagged_dead = True
+
+
+def _was_cookie_flagged() -> bool:
+    return getattr(_thread_local, "cookie_flagged_dead", False)
+
+
 def _maybe_alert_cookie_expiry(message: str):
     """
     Records this occurrence, prunes anything outside the rolling window,
@@ -352,11 +386,13 @@ class _YtdlpAlertLogger:
     def debug(self, msg):
         print(msg)
         if _is_cookie_expiry_warning(msg):
+            _mark_cookie_flagged()
             _maybe_alert_cookie_expiry(msg)
 
     def warning(self, msg):
         print(msg)
         if _is_cookie_expiry_warning(msg):
+            _mark_cookie_flagged()
             _maybe_alert_cookie_expiry(msg)
 
     def error(self, msg):
@@ -368,6 +404,70 @@ class _YtdlpAlertLogger:
 # passed into every ydl_opts dict is correct and avoids extra allocation
 # per request.
 ytdlp_alert_logger = _YtdlpAlertLogger()
+
+
+# ---------- MULTI-ACCOUNT COOKIE ROTATION ----------
+# Account 1 continues to use the EXISTING single-cookie mechanism
+# (YT_COOKIES_PATH / utils.ensure_cookies_file(), untouched). Accounts 2
+# and 3 are additional, OPTIONAL cookie sessions materialized here lazily
+# on first use, independent of main.py's startup lifecycle - if
+# YT_COOKIES_B64_2/_3 aren't set, those slots just don't exist and
+# rotation works with whatever subset IS configured.
+_cookie_accounts_lock = threading.Lock()
+_cookie_accounts_materialized = False
+_cookie_account_disabled_until: dict = {}  # path -> timestamp
+
+
+def _materialize_extra_cookie_accounts():
+    global _cookie_accounts_materialized
+    if _cookie_accounts_materialized:
+        return
+    with _cookie_accounts_lock:
+        if _cookie_accounts_materialized:
+            return
+        for env_name, path in (
+            (COOKIE_ACCOUNT_2_B64_ENV, COOKIE_ACCOUNT_2_PATH),
+            (COOKIE_ACCOUNT_3_B64_ENV, COOKIE_ACCOUNT_3_PATH),
+        ):
+            b64_value = os.environ.get(env_name)
+            if b64_value and not os.path.exists(path):
+                try:
+                    with open(path, "wb") as f:
+                        f.write(base64.b64decode(b64_value))
+                    logger.info(f"[COOKIES] Materialized additional cookie account at {path}")
+                except Exception as e:
+                    logger.warning(f"[COOKIES] Failed to materialize account at {path} (non-fatal): {e}")
+        _cookie_accounts_materialized = True
+
+
+def get_cookie_accounts() -> list:
+    """
+    Returns paths of all CURRENTLY AVAILABLE cookie accounts (file exists
+    on disk AND not on cooldown from a recent LOGIN_REQUIRED), primary
+    account first. May return an empty list if every configured account
+    is currently disabled - callers should treat that the same as "no
+    cookies configured" and proceed cookie-less rather than erroring.
+    """
+    _materialize_extra_cookie_accounts()
+    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
+    candidate_paths = [
+        p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH)
+        if p and os.path.exists(p)
+    ]
+    now = time.time()
+    with _cookie_accounts_lock:
+        available = [p for p in candidate_paths if _cookie_account_disabled_until.get(p, 0) < now]
+    return available
+
+
+def _disable_cookie_account(path: str):
+    with _cookie_accounts_lock:
+        _cookie_account_disabled_until[path] = time.time() + COOKIE_ACCOUNT_COOLDOWN_SECONDS
+    logger.warning(
+        f"[COOKIES] Account '{path}' flagged LOGIN_REQUIRED - disabling it for "
+        f"{COOKIE_ACCOUNT_COOLDOWN_SECONDS // 60} min, rotating to the next "
+        f"available account (if any)."
+    )
 
 
 def check_video_duration(ydl_opts: dict, url: str):
@@ -471,73 +571,126 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
 
 def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[str]):
     """
-    Tiered download strategy, cheapest option first:
+    Multi-layer download strategy, cheapest/most-specific fix first:
 
-      Tier 1 - DIRECT (no proxy), cookies still attached if available.
-               Free. Retries up to YT_DLP_MAX_ATTEMPTS with backoff first
-               (see extract_info_with_retry) - genuine transient blips get
-               a chance to self-resolve here before any money is spent.
+      Layer 1 - COOKIE ACCOUNT ROTATION (free). Tries each currently
+                available cookie account in turn (up to 3: primary + 2
+                optional extras). If an attempt fails AND the thread-local
+                flag confirms yt-dlp specifically flagged THIS cookie
+                session as dead ("cookies are no longer valid" /
+                LOGIN_REQUIRED), that account is disabled for a cooldown
+                and the NEXT account is tried immediately - no point
+                retrying the same dead session. If an attempt fails for
+                ANY OTHER reason (IP-block, permanent, unknown), rotation
+                stops immediately - swapping cookie accounts won't fix an
+                IP-reputation or availability problem, so we fall through
+                to Layer 2 instead of wasting the remaining accounts on a
+                failure they can't fix either.
 
-      Tier 2 - PROXY + cookies, tried for ANY Tier 1 failure EXCEPT a
-               confirmed permanent error (video deleted/private/copyright -
-               see is_permanent_error). This is intentionally an
-               EXCLUDE-list, not an allow-list: known IP-block errors
-               (bot-check page, media-fetch 403s, geo-restriction) escalate,
-               same as before, but so does ANY error text we haven't seen
-               or catalogued yet. A hardcoded marker list can only ever
-               recognize failure patterns we already know about - as new
-               yt-dlp/YouTube error wording shows up over time, this way
-               it still gets a proxy attempt instead of silently failing
-               the same way every time until someone notices in the logs
-               and adds a new marker string. Permanent errors are the one
-               deliberate carve-out, since no IP change fixes a deleted
-               video - that would just be pure wasted proxy spend.
+      Layer 2 - PROXY, tried for any Layer 1 failure EXCEPT a confirmed
+                permanent error (video deleted/private/copyright - see
+                is_permanent_error). Uses whichever cookie account is
+                STILL available (not yet disabled) at this point, if any -
+                proxy fixes IP reputation, cookies fix session identity,
+                the two are independent problems that can combine (e.g. an
+                IP-blocked request might still benefit from a valid
+                cookie session once retried through a clean IP).
 
-    If tier 2 itself fails with what looks like a proxy billing/quota
-    error, trip the circuit breaker (see _trip_proxy_circuit_breaker) so
-    subsequent requests skip proxy entirely during the cooldown instead of
-    each one separately re-discovering the proxy is dead. The request
-    still fails in that moment (nothing left to fall back to), but every
-    request AFTER it degrades gracefully to direct-only instead of paying
-    the proxy's connection-failure latency every single time.
+    If Layer 2 itself fails with what looks like a proxy billing/quota
+    error, trip the circuit breaker as before. If it fails because the
+    cookie account used there ALSO turns out to be dead, that account gets
+    disabled too - same accounting either way, just discovered a layer
+    later.
     """
-    try:
-        return extract_info_with_retry(base_ydl_opts, url)
-    except Exception as e:
-        first_error = str(e)
+    accounts = get_cookie_accounts()
+    if not accounts:
+        # Every configured account is currently disabled (or none are
+        # configured at all) - proceed cookie-less, same as the
+        # historical no-cookies behavior. A single None entry means "one
+        # attempt, no cookiefile".
+        accounts = [None]
 
-        if is_permanent_error(first_error):
-            # The one deliberate carve-out - no IP in the world fixes a
-            # deleted/private/copyright-blocked video, so don't spend
-            # proxy money finding that out a second time.
-            raise
+    last_error = None
+    for account_path in accounts:
+        opts = dict(base_ydl_opts)
+        if account_path:
+            opts["cookiefile"] = account_path
+        else:
+            opts.pop("cookiefile", None)
 
-        if not proxy_url:
-            logger.warning("[PROXY] Direct attempt failed and no proxy is configured - failing as-is.")
-            raise
-
-        if not proxy_available():
-            logger.warning(
-                "[PROXY] Direct attempt failed, but proxy circuit breaker is "
-                "currently OPEN (likely out of credit) - failing as-is instead of "
-                "retrying a proxy known to be down."
-            )
-            raise
-
-        logger.warning(f"[PROXY] Direct attempt failed ({first_error[:200]}) - retrying via proxy...")
-        proxied_opts = {**base_ydl_opts, 'proxy': proxy_url}
+        _reset_cookie_flag()
         try:
-            result = extract_info_with_retry(proxied_opts, url)
-            logger.info("[PROXY] Proxy retry succeeded.")
+            result = extract_info_with_retry(opts, url)
+            if account_path:
+                logger.info(f"[COOKIES] Download succeeded using account: {account_path}")
             return result
-        except Exception as proxy_error:
-            proxy_error_text = str(proxy_error)
-            if is_proxy_quota_error(proxy_error_text):
-                _trip_proxy_circuit_breaker()
-            else:
-                logger.warning(f"[PROXY] Proxy retry also failed (non-quota error): {proxy_error_text}")
-            # Whatever the proxy attempt raised is the most informative
-            # error to surface - propagate it (routes.py still applies its
-            # own is_bot_check_error() classification on top of this for
-            # the user-facing message).
-            raise
+        except Exception as e:
+            last_error = e
+            error_text = str(e)
+
+            if is_permanent_error(error_text):
+                # No cookie swap or proxy fixes a deleted/private video -
+                # stop everywhere, immediately.
+                raise
+
+            if account_path and _was_cookie_flagged():
+                _disable_cookie_account(account_path)
+                continue  # try the next account, if any remain
+
+            # Failure wasn't confirmed as THIS account's identity being
+            # rejected (could be IP-block, transient, or cookie-less) -
+            # rotating accounts further won't help. Stop here and let the
+            # proxy tier below handle it instead.
+            break
+
+    first_error = str(last_error)
+
+    if is_permanent_error(first_error):
+        raise last_error
+
+    if not proxy_url:
+        logger.warning("[PROXY] Direct attempt(s) failed and no proxy is configured - failing as-is.")
+        raise last_error
+
+    if not proxy_available():
+        logger.warning(
+            "[PROXY] Direct attempt(s) failed, but proxy circuit breaker is "
+            "currently OPEN (likely out of credit) - failing as-is instead of "
+            "retrying a proxy known to be down."
+        )
+        raise last_error
+
+    logger.warning(f"[PROXY] Direct attempt(s) failed ({first_error[:200]}) - retrying via proxy...")
+
+    # Use whichever account is STILL available (not yet disabled by the
+    # Layer 1 loop above) for the proxy attempt - if the direct failure
+    # was an IP-block rather than a cookie problem, the same cookie
+    # session is very likely still fine, just needs a cleaner IP.
+    remaining_accounts = get_cookie_accounts()
+    proxied_opts = dict(base_ydl_opts)
+    proxied_opts["proxy"] = proxy_url
+    proxy_account = remaining_accounts[0] if remaining_accounts else None
+    if proxy_account:
+        proxied_opts["cookiefile"] = proxy_account
+    else:
+        proxied_opts.pop("cookiefile", None)
+
+    _reset_cookie_flag()
+    try:
+        result = extract_info_with_retry(proxied_opts, url)
+        logger.info("[PROXY] Proxy retry succeeded.")
+        return result
+    except Exception as proxy_error:
+        proxy_error_text = str(proxy_error)
+        if is_proxy_quota_error(proxy_error_text):
+            _trip_proxy_circuit_breaker()
+        elif proxy_account and _was_cookie_flagged():
+            _disable_cookie_account(proxy_account)
+            logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
+        else:
+            logger.warning(f"[PROXY] Proxy retry also failed (non-quota error): {proxy_error_text}")
+        # Whatever the proxy attempt raised is the most informative
+        # error to surface - propagate it (routes.py still applies its
+        # own is_bot_check_error()/is_geo_restricted_error() classification
+        # on top of this for the user-facing message).
+        raise

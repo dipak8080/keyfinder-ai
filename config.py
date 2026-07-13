@@ -144,6 +144,29 @@ COOKIE_EXPIRY_ALERT_THRESHOLD = int(os.environ.get("COOKIE_EXPIRY_ALERT_THRESHOL
 COOKIE_EXPIRY_ALERT_WINDOW_SECONDS = int(os.environ.get("COOKIE_EXPIRY_ALERT_WINDOW_SECONDS", str(10 * 60)))  # 10 min
 COOKIE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ALERT_COOLDOWN_SECONDS", str(60 * 60)))  # 1 hour
 
+# ---------- MULTI-ACCOUNT COOKIE ROTATION ----------
+# Account 1 keeps using the EXISTING YT_COOKIES_B64 / YT_COOKIES_PATH
+# mechanism (reconstructed at startup by utils.ensure_cookies_file() -
+# completely unchanged). Accounts 2 and 3 are OPTIONAL additional cookie
+# sessions from separate logged-in YouTube browser sessions, so a single
+# dead/rotated cookie session doesn't take down cookie-based access
+# entirely - if account 1 gets flagged LOGIN_REQUIRED, we rotate to
+# account 2, then 3, before falling back to the (cookie-less) proxy tier.
+# If YT_COOKIES_B64_2/_3 aren't set in Railway, those slots simply don't
+# exist - rotation degrades gracefully to however many accounts ARE
+# configured (1, 2, or 3), no breakage either way. See
+# youtube.get_cookie_accounts() / _materialize_extra_cookie_accounts().
+COOKIE_ACCOUNT_2_B64_ENV = "YT_COOKIES_B64_2"
+COOKIE_ACCOUNT_3_B64_ENV = "YT_COOKIES_B64_3"
+COOKIE_ACCOUNT_2_PATH = "/app/cookies_2.txt"
+COOKIE_ACCOUNT_3_PATH = "/app/cookies_3.txt"
+
+# How long to skip a cookie account after it's flagged LOGIN_REQUIRED /
+# "no longer valid" for a real download - same circuit-breaker idea as
+# the proxy one, just per-account, so we don't keep re-trying a
+# known-dead account on every request during the cooldown.
+COOKIE_ACCOUNT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ACCOUNT_COOLDOWN_SECONDS", str(15 * 60)))  # 15 min
+
 # ---------- PROXY FALLBACK / CIRCUIT BREAKER ----------
 # Strategy: try every download WITHOUT the proxy first (free - cookies
 # alone clear most bot-checks for normal, spread-out traffic). Only retry
