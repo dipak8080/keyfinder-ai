@@ -10,7 +10,7 @@ import base64
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse
 
-from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, ADMIN_STATUS_KEY
+from config import logger, UPLOAD_DIR, MAX_UPLOAD_BYTES, ANALYSIS_MAX_SECONDS, ADMIN_STATUS_KEY, CACHE_ENABLED, R2_BUCKET_NAME
 from utils import (
     cleanup_file,
     release_memory_to_os,
@@ -25,7 +25,7 @@ from youtube import (
     is_bot_check_error,
     is_geo_restricted_error,
     is_valid_youtube_url,
-    check_video_duration,
+    extract_video_id,
     VideoTooLongError,
     proxy_available,
     reset_proxy_circuit_breaker,
@@ -34,6 +34,7 @@ from youtube import (
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
+from cache import get_cached_audio, put_cached_audio
 from monitoring import record_result, get_status_snapshot
 
 router = APIRouter()
@@ -53,6 +54,27 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     if not is_valid_youtube_url(url):
         logger.warning(f"Rejected download - not a recognizable YouTube URL: {url}")
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    # Cache check happens BEFORE the download semaphore is touched - a
+    # cache hit is a fast R2 read (roughly 1-3s), not the heavy CPU/network
+    # work the semaphore is meant to bound, so cache hits deliberately
+    # don't compete with real yt-dlp downloads for a concurrency slot.
+    # video_id may be None for a URL shape extract_video_id() doesn't
+    # recognize (rare, given is_valid_youtube_url already passed) - in
+    # that case caching is just skipped, not an error.
+    video_id = extract_video_id(url)
+    if video_id:
+        try:
+            cached_audio, cached_title = await run_blocking(get_cached_audio, video_id, format)
+        except Exception as cache_err:
+            logger.warning(f"[CACHE] Lookup failed (non-fatal, proceeding with fresh download): {cache_err}")
+            cached_audio, cached_title = None, None
+
+        if cached_audio:
+            cached_b64 = base64.b64encode(cached_audio).decode('utf-8')
+            logger.info(f"[CACHE] Serving '{cached_title}' from cache instead of downloading ({len(cached_b64)} base64 chars)")
+            record_result("/download", True)
+            return JSONResponse({"title": cached_title or "Unknown", "audio": cached_b64, "format": format})
 
     temp_id = str(uuid.uuid4())
     temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.%(ext)s")
@@ -121,25 +143,21 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     audio_data = None
     succeeded = False
     try:
-        # Cheap metadata-only check BEFORE the real download - rejects
-        # videos over MAX_VIDEO_DURATION_SECONDS instantly (400) instead of
-        # burning proxy bandwidth + Railway compute on a long download the
-        # frontend's fetch timeout will likely abort anyway (visible as a
-        # 499 in HTTP logs, work continuing uselessly in the background).
-        try:
-            await run_blocking(check_video_duration, ydl_opts, url)
-        except VideoTooLongError as e:
-            logger.warning(f"Rejected download - video too long: {e}")
-            raise HTTPException(400, str(e))
-
         try:
             # Offloaded to the thread pool - yt_dlp + ffmpeg postprocessing
             # are fully blocking and would otherwise freeze the event loop.
-            # download_with_fallback tries direct first, proxy second (only
-            # on bot-check errors), and trips the proxy circuit breaker on
-            # billing/quota-style proxy failures - see youtube.py.
+            # download_with_fallback now does duration-checking AND the
+            # real download in a single extraction pass per attempt (see
+            # youtube.extract_info_with_retry) - no more separate
+            # duration-only pre-check burning a second full YouTube
+            # handshake. It rotates cookie accounts first, then proxy
+            # (only on non-permanent, non-duration errors), and trips the
+            # proxy circuit breaker on billing/quota-style proxy failures.
             info = await run_blocking(download_with_fallback, ydl_opts, url, proxy_url)
             title = info.get('title', 'Unknown')
+        except VideoTooLongError as e:
+            logger.warning(f"Rejected download - video too long: {e}")
+            raise HTTPException(400, str(e))
         except Exception as e:
             error_text = str(e)
 
@@ -177,6 +195,17 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         with open(output_file, "rb") as f:
             audio_bytes = f.read()
         audio_data = base64.b64encode(audio_bytes).decode('utf-8')
+
+        if video_id:
+            try:
+                await run_blocking(put_cached_audio, video_id, format, audio_bytes, title)
+            except Exception as cache_err:
+                # A cache-save failure must never fail a download that
+                # already succeeded - log and move on, user still gets
+                # their file this request, it just won't be cached for
+                # NEXT time.
+                logger.warning(f"[CACHE] Failed to save to cache (non-fatal): {cache_err}")
+
         del audio_bytes
 
         logger.info(f"Download complete: '{title}' ({format}) → {len(audio_data)} base64 chars")
@@ -291,7 +320,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v13.0 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION",
+        "status": "Audio Analysis API v13.2 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -300,7 +329,7 @@ async def root():
             "Robust fallback with enhanced Librosa",
             "Retry with exponential backoff on yt_dlp failures",
             "Permanent-error detection (video unavailable/private/removed) skips retries to save proxy bandwidth and fail fast",
-            "Video duration cap rejects overly long videos before download starts, avoiding wasted proxy bandwidth on requests the frontend will time out on anyway",
+            "Video duration cap now checked as part of a SINGLE extraction pass (extract once, check duration, reuse that same result to download via process_ie_result) instead of a separate duration-only pre-check followed by a second full independent extraction - removes an entire duplicate webpage/player-API/PO-token/JS-challenge round trip from every request",
             "Clean 503 on YouTube bot verification / format restriction instead of raw error",
             "Clean 451 on geo-restricted videos, with same-IP fail-fast (no wasted retries) but still escalates to proxy since a different exit region CAN fix it",
             "Guaranteed temp file cleanup via finally blocks",
@@ -323,6 +352,7 @@ async def root():
             "CORS locked to ALLOWED_ORIGINS (defaults to '*' until explicitly configured)",
             "Per-IP rate limiting on /download and /analyze",
             "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",
+            "R2 caching: repeat requests for the same video+format are served straight from cache (~1-3s) instead of re-running the full yt-dlp pipeline (~20-50s) - fails safe to a normal fresh download if R2 is unreachable or not configured",
         ]
     }
 
@@ -350,6 +380,10 @@ async def admin_status(key: str = Query(...)):
     }
     snapshot["cookies"] = {
         "accounts_available": len(get_cookie_accounts()),
+    }
+    snapshot["cache"] = {
+        "enabled": CACHE_ENABLED,
+        "configured": bool(R2_BUCKET_NAME),
     }
     return snapshot
 

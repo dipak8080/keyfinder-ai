@@ -248,3 +248,29 @@ ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))
 # CHANGE THIS in Railway to a long random string - if left as the
 # default below, the endpoint still works but with a guessable key.
 ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")
+
+# ---------- CACHING (Cloudflare R2) ----------
+# Caches successfully downloaded audio files in R2 (S3-compatible),
+# keyed by video_id + format. Repeat requests for the same video+format
+# are served straight from R2 (roughly 1-3s) instead of re-running the
+# full yt-dlp pipeline (roughly 20-50s). This ONLY helps REPEAT videos -
+# it cannot speed up a video nobody has requested before, since there's
+# nothing to serve from cache yet.
+#
+# Fails safe everywhere: if R2 credentials aren't set, or any R2 call
+# errors for any reason, cache.py's functions return None/False and the
+# app proceeds with a completely normal fresh download - caching is a
+# pure optimization, never a hard dependency. Set CACHE_ENABLED=false to
+# disable outright without touching credentials.
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
+R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else ""
+
+# How long a cached entry is trusted before being treated as stale and
+# re-downloaded fresh (the old object then gets overwritten on the next
+# successful download). Bounds how long we'd ever serve a genuinely
+# outdated file, and indirectly bounds storage growth over time.
+CACHE_MAX_AGE_SECONDS = int(os.environ.get("CACHE_MAX_AGE_SECONDS", str(30 * 24 * 60 * 60)))  # 30 days

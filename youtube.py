@@ -166,6 +166,26 @@ def is_valid_youtube_url(url: str) -> bool:
     return bool(_YOUTUBE_URL_PATTERN.match(url.strip()))
 
 
+# Extracts just the 11-character video ID, used as the cache key in
+# cache.py. Deliberately permissive about WHERE the ID appears (query
+# param ?v=, or the path segment for youtu.be/shorts/live URLs) since
+# is_valid_youtube_url() above already confirmed this is a real YouTube
+# URL shape before this is ever called.
+_YOUTUBE_ID_PATTERN = re.compile(
+    r"(?:v=|youtu\.be/|shorts/|live/)([a-zA-Z0-9_-]{11})"
+)
+
+
+def extract_video_id(url: str) -> Optional[str]:
+    """Returns the 11-character YouTube video ID, or None if it can't be
+    found (caller should treat that as "not cacheable", not an error -
+    the download itself doesn't depend on this)."""
+    if not url:
+        return None
+    match = _YOUTUBE_ID_PATTERN.search(url)
+    return match.group(1) if match else None
+
+
 def is_bot_check_error(error_text: str) -> bool:
     """
     Narrow check for the webpage-level bot-check UI page specifically.
@@ -470,42 +490,6 @@ def _disable_cookie_account(path: str):
     )
 
 
-def check_video_duration(ydl_opts: dict, url: str):
-    """
-    Fetches ONLY metadata (download=False) - no video/audio data is
-    transferred, so this is cheap on proxy bandwidth compared to a full
-    download - and raises VideoTooLongError before the real download starts
-    if the video exceeds MAX_VIDEO_DURATION_SECONDS. Called once, no retry
-    loop: if this metadata fetch itself fails (bot-check, unavailable,
-    etc.), we let extract_info_with_retry's normal retry/error handling
-    deal with it moments later on the real attempt instead of duplicating
-    that logic here.
-
-    NOTE: same threading rule as extract_info_with_retry - must be called
-    via utils.run_blocking(), never directly from `async def` code.
-    """
-    if MAX_VIDEO_DURATION_SECONDS is None:
-        return
-
-    try:
-        with yt_dlp.YoutubeDL({**ydl_opts, 'quiet': True, 'verbose': False}) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        # Don't fail the request here on a metadata-check error - just skip
-        # the duration check and let the real download attempt (with its
-        # proper retry/error handling) be the source of truth.
-        logger.warning(f"Duration pre-check failed (non-fatal, proceeding to real download): {e}")
-        return
-
-    duration = info.get('duration') if info else None
-    if duration and duration > MAX_VIDEO_DURATION_SECONDS:
-        logger.warning(
-            f"Rejecting download: video duration {duration}s exceeds "
-            f"MAX_VIDEO_DURATION_SECONDS={MAX_VIDEO_DURATION_SECONDS}s for URL: {url}"
-        )
-        raise VideoTooLongError(duration, MAX_VIDEO_DURATION_SECONDS)
-
-
 def extract_info_with_retry(ydl_opts: dict, url: str):
     """
     NOTE: this function is fully synchronous/blocking (yt_dlp + time.sleep
@@ -513,6 +497,19 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
     async endpoint - never awaited or called directly from `async def` code
     - or it will freeze the event loop for the whole server during the
     retry backoff sleeps and the download itself.
+
+    Each attempt does ONE extraction pass (download=False - webpage, all
+    player-client API calls, PO token generation, JS-challenge solving -
+    the expensive part), checks the video's duration on that already-
+    extracted result, and ONLY THEN reuses that same result to actually
+    download + postprocess via process_ie_result(download=True). This
+    replaces the old two-call pattern (a separate check_video_duration()
+    extraction, immediately followed by a second, fully independent
+    extraction inside the real download) which paid for the entire
+    webpage/player-API/PO-token/JS-challenge sequence TWICE on every
+    single request - the single biggest avoidable chunk of per-request
+    latency. process_ie_result is yt-dlp's own supported API for exactly
+    this "extract once, decide, then download" pattern.
     """
     last_exception = None
 
@@ -520,9 +517,26 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
         try:
             logger.info(f"yt_dlp extract_info attempt {attempt}/{YT_DLP_MAX_ATTEMPTS} for URL: {url}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=False)
+
+                duration = info.get('duration') if info else None
+                if MAX_VIDEO_DURATION_SECONDS is not None and duration and duration > MAX_VIDEO_DURATION_SECONDS:
+                    logger.warning(
+                        f"Rejecting download: video duration {duration}s exceeds "
+                        f"MAX_VIDEO_DURATION_SECONDS={MAX_VIDEO_DURATION_SECONDS}s for URL: {url}"
+                    )
+                    raise VideoTooLongError(duration, MAX_VIDEO_DURATION_SECONDS)
+
+                info = ydl.process_ie_result(info, download=True)
             logger.info(f"yt_dlp extract_info succeeded on attempt {attempt}")
             return info
+        except VideoTooLongError:
+            # Not a network/bot-check/cookie/IP problem - no amount of
+            # retrying, account rotation, or proxy switching changes a
+            # video's actual duration. Propagate immediately, don't
+            # consume a retry attempt or fall into the generic error
+            # classification below.
+            raise
         except Exception as e:
             last_exception = e
             error_text = str(e)
@@ -628,9 +642,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             last_error = e
             error_text = str(e)
 
-            if is_permanent_error(error_text):
-                # No cookie swap or proxy fixes a deleted/private video -
-                # stop everywhere, immediately.
+            if isinstance(e, VideoTooLongError) or is_permanent_error(error_text):
+                # No cookie swap, no proxy, no retry fixes a video that's
+                # too long or genuinely unavailable - stop everywhere,
+                # immediately.
                 raise
 
             if account_path and _was_cookie_flagged():
