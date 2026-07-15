@@ -54,7 +54,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 # starting the real download, with a clear message, instead of wasting
 # resources on something that was never going to finish in time for the
 # user. Set to None to disable the check entirely (no duration limit).
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1200"))  # 20 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "600"))  # 10 min
 
 # ---------- ANALYSIS TUNING ----------
 # Bumped from 120s -> 180s. Key/BPM detection doesn't need the whole track,
