@@ -24,6 +24,7 @@ from youtube import (
     download_with_fallback,
     is_bot_check_error,
     is_geo_restricted_error,
+    is_permanent_error,
     is_valid_youtube_url,
     extract_video_id,
     VideoTooLongError,
@@ -160,6 +161,24 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             raise HTTPException(400, str(e))
         except Exception as e:
             error_text = str(e)
+
+            if is_permanent_error(error_text):
+                # The video itself is the problem - deleted, private,
+                # copyright-blocked, or otherwise permanently unavailable.
+                # No amount of retrying, cookie rotation, or proxy
+                # switching would ever fix this (see youtube.py's
+                # PERMANENT_ERROR_MARKERS). Distinct from a 500: this
+                # isn't a server bug, it's a resource that genuinely
+                # doesn't exist - 404 is the semantically correct status,
+                # and unlike a 500 (which the frontend deliberately masks
+                # with a generic message) the user gets an accurate,
+                # actionable reason instead of "something went wrong."
+                logger.warning(f"Permanent error for URL {url}: {error_text}")
+                raise HTTPException(
+                    404,
+                    "This video is unavailable - it may have been deleted, made private, "
+                    "or removed for copyright reasons. Please try a different video."
+                )
 
             if is_geo_restricted_error(error_text):
                 # Distinct from the generic bot-check message below - this
@@ -320,7 +339,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v13.2 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING",
+        "status": "Audio Analysis API v13.3 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING + PERMANENT-ERROR 404",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013",
         "fixes": [
@@ -353,6 +372,7 @@ async def root():
             "Per-IP rate limiting on /download and /analyze",
             "Failure-spike monitoring with optional webhook alerting (Discord/Slack compatible)",
             "R2 caching: repeat requests for the same video+format are served straight from cache (~1-3s) instead of re-running the full yt-dlp pipeline (~20-50s) - fails safe to a normal fresh download if R2 is unreachable or not configured",
+            "Clean 404 on permanently unavailable videos (deleted/private/copyright) instead of falling through to a generic masked 500 - user gets an accurate, actionable reason",
         ]
     }
 
