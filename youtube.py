@@ -2,7 +2,7 @@
 youtube.py - Everything the /download route needs for talking to yt_dlp:
 retry-with-backoff wrapper, YouTube bot-check / IP-block detection, the
 direct-then-proxy fallback strategy (with a circuit breaker for when the
-proxy runs out of credit), and a cookie-expiry Discord alert.
+proxy runs out of credit), and a per-account cookie-expiry Discord alert.
 """
 import os
 import re
@@ -291,7 +291,7 @@ def reset_proxy_circuit_breaker():
     logger.info("[PROXY] Circuit breaker manually reset - proxy re-enabled.")
 
 
-# ---------- COOKIE EXPIRY ALERTING ----------
+# ---------- COOKIE EXPIRY ALERTING (attributed to a specific account) ----------
 # yt-dlp reports dead cookies as a WARNING, not an exception - downloads
 # keep succeeding anyway via the direct/proxy fallback, so this would
 # otherwise pass by completely silently: nothing in the existing
@@ -303,15 +303,23 @@ def reset_proxy_circuit_breaker():
 # while the SAME cookies authenticate other downloads successfully
 # moments later (observed in production logs). Alerting on the first
 # occurrence produced false-alarm pings for cookies that were actually
-# fine. Instead: track occurrences in a rolling window and only alert once
-# COOKIE_EXPIRY_ALERT_THRESHOLD occurrences happen within
-# COOKIE_EXPIRY_ALERT_WINDOW_SECONDS - a single flaky check on an odd
-# video won't cross that bar, but genuinely dead/rotated cookies will,
-# since every subsequent authenticated download keeps hitting the same
-# warning in quick succession.
+# fine. Instead: track occurrences PER ACCOUNT in a rolling window and
+# only alert once COOKIE_EXPIRY_ALERT_THRESHOLD occurrences happen for
+# THAT SPECIFIC ACCOUNT within COOKIE_EXPIRY_ALERT_WINDOW_SECONDS - a
+# single flaky check on an odd video won't cross that bar, but genuinely
+# dead/rotated cookies will, since every subsequent authenticated download
+# using that same account keeps hitting the same warning in quick
+# succession.
+#
+# Tracking is PER ACCOUNT (a dict keyed by account path) rather than one
+# shared global counter - with 3 cookie accounts in rotation, a global
+# counter couldn't tell you WHICH account was actually the problem, only
+# that "some cookie somewhere" looked dead. See _set_active_account /
+# _get_active_account below for how the currently-in-use account gets
+# attached to each warning as it's observed.
 _cookie_alert_lock = threading.Lock()
-_cookie_warning_events: list = []  # list of timestamps, pruned to the rolling window
-_cookie_alert_last_sent = 0.0
+_cookie_warning_events: dict = {}   # account_label -> list of timestamps (rolling window)
+_cookie_alert_last_sent: dict = {}  # account_label -> timestamp of last alert (per-account cooldown)
 
 
 def _is_cookie_expiry_warning(message: str) -> bool:
@@ -320,16 +328,29 @@ def _is_cookie_expiry_warning(message: str) -> bool:
 
 
 # Per-attempt signal: was a "cookies are no longer valid" warning seen
-# during THIS specific yt-dlp call? Thread-local because extract_info_with
-# _retry runs inside a worker thread from the pool (one thread per
-# concurrent request), so this correctly scopes to the request currently
-# running on that thread without concurrent downloads stepping on each
-# other's flag. This is what tells download_with_fallback "this failure
+# during THIS specific yt-dlp call, and which cookie account was active
+# while it happened? Both are thread-local because extract_info_with_retry
+# runs inside a worker thread from the pool (one thread per concurrent
+# request), so this correctly scopes to the request currently running on
+# that thread without concurrent downloads stepping on each other's state.
+#
+# _cookie_flagged_dead is what tells download_with_fallback "this failure
 # is a cookie-IDENTITY problem, rotate accounts" versus "this is an
 # IP-reputation problem, escalate to proxy instead" - both failure modes
 # can produce the identical outer error text ("Sign in to confirm you're
 # not a bot"), so the flag (set the moment the cookie-specific warning
-# line appears) is the only reliable way to tell them apart.
+# line appears) is the only reliable way to tell them apart. It's ALSO
+# now used inside extract_info_with_retry itself (see below) to skip
+# pointless same-account backoff retries the instant we already know this
+# specific cookie session is dead - a pure cost optimization, changes no
+# outcome, since retrying the identical dead cookiefile 2 more times
+# within the same account attempt was never going to succeed anyway.
+#
+# _active_account is what lets _YtdlpAlertLogger (which is a single shared
+# instance with no per-request state of its own) attribute a warning line
+# to the specific account file that was in use when yt-dlp produced it -
+# download_with_fallback sets this immediately before each attempt, for
+# both the cookie-rotation loop and the proxy retry.
 _thread_local = threading.local()
 
 
@@ -345,48 +366,81 @@ def _was_cookie_flagged() -> bool:
     return getattr(_thread_local, "cookie_flagged_dead", False)
 
 
+def _set_active_account(path: Optional[str]):
+    _thread_local.active_account = path
+
+
+def _get_active_account() -> Optional[str]:
+    return getattr(_thread_local, "active_account", None)
+
+
 def _maybe_alert_cookie_expiry(message: str):
     """
-    Records this occurrence, prunes anything outside the rolling window,
-    and only actually alerts once COOKIE_EXPIRY_ALERT_THRESHOLD occurrences
-    are present in that window - see the module-level comment above for
-    why a single occurrence is deliberately NOT enough. After an alert
-    fires, COOKIE_ALERT_COOLDOWN_SECONDS still suppresses repeats so a
-    sustained real outage doesn't spam Discord.
+    Records this occurrence UNDER THE CURRENTLY ACTIVE ACCOUNT (see
+    _get_active_account), prunes anything outside that account's rolling
+    window, and only actually alerts once COOKIE_EXPIRY_ALERT_THRESHOLD
+    occurrences are present for THAT ACCOUNT in that window - see the
+    module-level comment above for why a single occurrence is deliberately
+    not enough. After an alert fires for an account, that SAME account's
+    COOKIE_ALERT_COOLDOWN_SECONDS suppresses repeats - a different account
+    going bad later still alerts on its own schedule, it isn't silenced by
+    an unrelated account's recent alert.
     """
     global _cookie_alert_last_sent
+    account_path = _get_active_account()
+    account_label = account_path if account_path else "unknown/cookie-less attempt"
     now = time.time()
 
     with _cookie_alert_lock:
-        _cookie_warning_events.append(now)
+        events = _cookie_warning_events.setdefault(account_label, [])
+        events.append(now)
         cutoff = now - COOKIE_EXPIRY_ALERT_WINDOW_SECONDS
-        while _cookie_warning_events and _cookie_warning_events[0] < cutoff:
-            _cookie_warning_events.pop(0)
-        recent_count = len(_cookie_warning_events)
+        while events and events[0] < cutoff:
+            events.pop(0)
+        recent_count = len(events)
 
         if recent_count < COOKIE_EXPIRY_ALERT_THRESHOLD:
-            # Not enough occurrences yet to distinguish "genuinely dead
-            # cookies" from "yt-dlp's heuristic had one flaky moment" -
-            # stay quiet.
+            # Not enough occurrences yet FOR THIS ACCOUNT to distinguish
+            # "genuinely dead cookies" from "yt-dlp's heuristic had one
+            # flaky moment" - stay quiet.
             return
 
-        if now - _cookie_alert_last_sent < COOKIE_ALERT_COOLDOWN_SECONDS:
-            # Already alerted recently for this same ongoing issue - don't
-            # repeat-ping.
+        last_sent = _cookie_alert_last_sent.get(account_label, 0)
+        if now - last_sent < COOKIE_ALERT_COOLDOWN_SECONDS:
+            # Already alerted recently for THIS account's ongoing issue -
+            # don't repeat-ping. A different account is tracked separately
+            # and unaffected by this cooldown.
             return
 
-        _cookie_alert_last_sent = now
+        _cookie_alert_last_sent[account_label] = now
+
+    # Best-effort "what's still healthy" snapshot at alert time - this
+    # account may not be formally disabled yet (that happens a moment
+    # later in download_with_fallback once it sees _was_cookie_flagged()),
+    # so it can still appear in get_cookie_accounts() briefly; excluded
+    # here explicitly so the message doesn't call it "active" and "dead"
+    # in the same breath.
+    still_active = [p for p in get_cookie_accounts() if p != account_path]
+    still_active_text = ", ".join(still_active) if still_active else "none currently active"
+
+    env_hint = "YT_COOKIES_B64 (primary account)"
+    if account_path == COOKIE_ACCOUNT_2_PATH:
+        env_hint = f"{COOKIE_ACCOUNT_2_B64_ENV} (account 2)"
+    elif account_path == COOKIE_ACCOUNT_3_PATH:
+        env_hint = f"{COOKIE_ACCOUNT_3_B64_ENV} (account 3)"
 
     alert_message = (
-        f"[COOKIES] YouTube account cookies look genuinely expired/rotated - "
+        f"[COOKIES] '{account_label}' looks genuinely expired/rotated - "
         f"seen {recent_count} times in the last "
-        f"{COOKIE_EXPIRY_ALERT_WINDOW_SECONDS // 60} min (not just a one-off "
-        f"flaky check). Downloads are still working via the direct/proxy "
-        f"fallback, but re-export cookies.txt from a logged-in browser "
-        f"session, base64-encode it, and update YT_COOKIES_B64 in Railway "
-        f"when you get a chance - this alert won't repeat for "
-        f"{COOKIE_ALERT_COOLDOWN_SECONDS // 60} min regardless of how many "
-        f"more downloads hit the same stale cookies in the meantime."
+        f"{COOKIE_EXPIRY_ALERT_WINDOW_SECONDS // 60} min for THIS account "
+        f"specifically (not just a one-off flaky check). "
+        f"Still active: {still_active_text}. "
+        f"Downloads are still working via the remaining account(s)/proxy "
+        f"fallback, but re-export '{account_label}' from a logged-in browser "
+        f"session, base64-encode it, and update {env_hint} in Railway when "
+        f"you get a chance - this alert won't repeat for "
+        f"{COOKIE_ALERT_COOLDOWN_SECONDS // 60} min for THIS account "
+        f"regardless of how many more downloads hit it in the meantime."
     )
     logger.critical(alert_message)
     alert_now(alert_message)
@@ -419,10 +473,10 @@ class _YtdlpAlertLogger:
         print(msg)
 
 
-# Single shared instance - it holds no per-request state (the cooldown
-# gate is already its own module-level lock/timestamp), so one instance
-# passed into every ydl_opts dict is correct and avoids extra allocation
-# per request.
+# Single shared instance - it holds no per-request state of its own (the
+# thread-local flags/labels above carry the per-request context instead),
+# so one instance passed into every ydl_opts dict is correct and avoids
+# extra allocation per request.
 ytdlp_alert_logger = _YtdlpAlertLogger()
 
 
@@ -551,6 +605,30 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            # COST OPTIMIZATION (no behavior/outcome change): if yt-dlp's
+            # own logger already told us THIS SPECIFIC cookie session is
+            # dead (_was_cookie_flagged(), set the instant the "cookies
+            # are no longer valid" warning line appears - see
+            # _YtdlpAlertLogger above), retrying with the IDENTICAL
+            # cookiefile 1-2 more times within this same account attempt
+            # cannot possibly succeed - nothing about the cookie changes
+            # between backoff sleeps. Every subprocess/API round trip
+            # (webpage + 4 player-client calls + Node PO-token + Deno
+            # JS-challenge) that a retry would otherwise repeat is pure
+            # wasted Railway compute in this case. Failing fast here does
+            # NOT change which account gets tried next, whether rotation
+            # or proxy fallback happens, or what the user ultimately sees -
+            # download_with_fallback's rotation/alerting logic (which
+            # reads this same flag) is completely unchanged; this only
+            # removes pointless retries BEFORE that logic ever runs.
+            if _was_cookie_flagged():
+                logger.warning(
+                    f"Attempt {attempt}: this cookie account was confirmed dead "
+                    f"by yt-dlp's own check - not retrying with the same "
+                    f"cookiefile, handing off to account rotation/proxy instead: {error_text}"
+                )
+                raise
+
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
@@ -594,7 +672,11 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 session as dead ("cookies are no longer valid" /
                 LOGIN_REQUIRED), that account is disabled for a cooldown
                 and the NEXT account is tried immediately - no point
-                retrying the same dead session. If an attempt fails for
+                retrying the same dead session (this is now enforced
+                doubly: extract_info_with_retry already stops retrying
+                that account's own backoff loop the instant it's flagged,
+                and this loop then moves on to the next account rather
+                than trying the dead one again). If an attempt fails for
                 ANY OTHER reason (IP-block, permanent, unknown), rotation
                 stops immediately - swapping cookie accounts won't fix an
                 IP-reputation or availability problem, so we fall through
@@ -609,6 +691,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 the two are independent problems that can combine (e.g. an
                 IP-blocked request might still benefit from a valid
                 cookie session once retried through a clean IP).
+
+    Before EVERY attempt (both layers), _set_active_account() records
+    which cookie file (if any) is in use for THIS attempt - this is what
+    lets a "cookies are no longer valid" warning line get attributed to
+    the correct account file in the Discord alert (see
+    _maybe_alert_cookie_expiry), instead of a generic unattributed message.
 
     If Layer 2 itself fails with what looks like a proxy billing/quota
     error, trip the circuit breaker as before. If it fails because the
@@ -633,6 +721,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             opts.pop("cookiefile", None)
 
         _reset_cookie_flag()
+        _set_active_account(account_path)
         try:
             result = extract_info_with_retry(opts, url)
             if account_path:
@@ -691,6 +780,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         proxied_opts.pop("cookiefile", None)
 
     _reset_cookie_flag()
+    _set_active_account(proxy_account)
     try:
         result = extract_info_with_retry(proxied_opts, url)
         logger.info("[PROXY] Proxy retry succeeded.")
