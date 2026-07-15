@@ -224,7 +224,7 @@ LOVABLE_PREVIEW_ORIGIN_REGEX = r"https://.*\.lovable\.app|https://.*\.lovablepro
 # running up your bill; not a replacement for real infra-level protection
 # at large scale.
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true"
-RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "10"))
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "3"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 # ---------- MONITORING / ALERTING ----------
