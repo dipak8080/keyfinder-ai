@@ -306,7 +306,7 @@ def logs_dashboard(key: str = Query(...)):
     </div>
     <table>
       <thead>
-        <tr><th>Time (UTC)</th><th>Method</th><th>Path</th><th>Status</th><th>Duration (ms)</th><th>IP</th></tr>
+        <tr><th>Time (NPT)</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th></tr>
       </thead>
       <tbody id="http-rows"></tbody>
     </table>
@@ -335,6 +335,16 @@ function statusClass(code) {{
   if (code >= 500) return "status-5xx";
   if (code >= 400) return "status-4xx";
   return "status-2xx";
+}}
+
+// Shows milliseconds for fast requests (health checks etc), but switches
+// to seconds for anything slow (like a yt-dlp download taking 18+
+// seconds) - "18.73s" is far more readable at a glance than "18729.99".
+function formatDuration(ms) {{
+  if (ms >= 1000) {{
+    return (ms / 1000).toFixed(2) + "s";
+  }}
+  return ms.toFixed(0) + "ms";
 }}
 
 // Converts a UTC ISO timestamp (as stored in the DB / logging module) to
@@ -367,7 +377,7 @@ function renderHttpRow(log) {{
     <td>${{log.method}}</td>
     <td>${{log.path}}</td>
     <td class="${{statusClass(log.status_code)}}">${{log.status_code}}</td>
-    <td>${{log.duration_ms}}</td>
+    <td>${{formatDuration(log.duration_ms)}}</td>
     <td>${{log.client_ip}}</td>
   </tr>`;
 }}
