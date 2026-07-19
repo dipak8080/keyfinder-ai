@@ -16,6 +16,7 @@ from config import (
 from utils import ensure_cookies_file
 from routes import router
 from log_stream import RequestLoggerMiddleware, router as logs_router, attach_system_log_capture
+from cookie_upload import router as cookie_upload_router
 
 
 @asynccontextmanager
@@ -61,3 +62,4 @@ app.add_middleware(
 
 app.include_router(router)
 app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)
+app.include_router(cookie_upload_router)  # /admin/upload-cookies - upload cookies.txt directly, no base64

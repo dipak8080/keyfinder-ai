@@ -30,9 +30,25 @@ from config import (
 
 
 def ensure_cookies_file():
+    cookies_path = os.environ.get('YT_COOKIES_PATH', YT_COOKIES_PATH_DEFAULT)
+
+    # If cookies.txt already exists on disk (e.g. uploaded directly via
+    # /admin/upload-cookies onto the persistent volume), don't touch it.
+    # Without this check, every container restart/redeploy would silently
+    # overwrite a freshly-uploaded cookie file with whatever stale
+    # YT_COOKIES_B64 / YT_COOKIES_GZ_B64 value is still sitting in .env -
+    # which defeats the entire point of being able to upload cookies
+    # directly instead of re-encoding+redeploying every time they expire.
+    if os.path.exists(cookies_path):
+        logger.info(
+            f"[COOKIES] {cookies_path} already exists on disk (likely uploaded "
+            f"via /admin/upload-cookies) - skipping base64 reconstruction so it "
+            f"isn't overwritten by a stale env var value."
+        )
+        return
+
     cookies_gz_b64 = os.environ.get('YT_COOKIES_GZ_B64')
     cookies_b64 = os.environ.get('YT_COOKIES_B64')
-    cookies_path = os.environ.get('YT_COOKIES_PATH', YT_COOKIES_PATH_DEFAULT)
 
     if cookies_gz_b64:
         # Gzip-compressed variant - use this if the plain base64 value
@@ -55,9 +71,11 @@ def ensure_cookies_file():
 
     if not cookies_b64:
         logger.warning(
-            "[COOKIES] Neither YT_COOKIES_B64 nor YT_COOKIES_GZ_B64 is set at "
-            "startup - cookies.txt will NOT be reconstructed. Downloads "
-            "requiring authentication will fail."
+            "[COOKIES] No cookies.txt exists on disk yet, and neither "
+            "YT_COOKIES_B64 nor YT_COOKIES_GZ_B64 is set - cookies.txt will "
+            "NOT be created. Downloads requiring authentication will fail "
+            "until you upload cookies via /admin/upload-cookies or set an "
+            "env var."
         )
         return
 
