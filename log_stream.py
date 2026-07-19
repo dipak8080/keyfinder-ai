@@ -304,6 +304,18 @@ def logs_dashboard(key: str = Query(...)):
       <div class="stat-box"><div class="label">Success</div><div class="value success" id="success">-</div></div>
       <div class="stat-box"><div class="label">Failed</div><div class="value failed" id="failed">-</div></div>
     </div>
+    <div class="controls">
+      <select id="methodFilter" onchange="applyFilter()">
+        <option value="">All methods</option>
+        <option value="GET">GET</option>
+        <option value="POST">POST</option>
+        <option value="DELETE">DELETE</option>
+      </select>
+      <input type="text" id="pathFilter" placeholder="Filter by path (e.g. /download)" onkeyup="applyFilter()" style="background:#262a38;color:#e2e2e2;border:1px solid #333748;border-radius:6px;padding:7px 10px;font-size:13px;width:220px;">
+      <label style="font-size:13px;color:#888;margin-left:8px;">
+        <input type="checkbox" id="hideNoise" onchange="applyFilter()"> Hide bot/scanner noise
+      </label>
+    </div>
     <table>
       <thead>
         <tr><th>Time (NPT)</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th></tr>
@@ -361,14 +373,43 @@ function toNepalTime(isoString) {{
   }});
 }}
 
+// Known noise patterns from bots/scanners hitting random paths that
+// aren't real app endpoints - filtered out when "Hide bot/scanner noise"
+// is checked.
+const NOISE_PATTERNS = [
+  "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
+  "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php"
+];
+
+function isNoise(path) {{
+  return NOISE_PATTERNS.some(p => path.includes(p));
+}}
+
+let allHttpLogs = []; // keeps every log seen this session, filters render from this
+
+function applyFilter() {{
+  const methodVal = document.getElementById("methodFilter").value;
+  const pathVal = document.getElementById("pathFilter").value.toLowerCase();
+  const hideNoise = document.getElementById("hideNoise").checked;
+
+  const filtered = allHttpLogs.filter(log => {{
+    if (methodVal && log.method !== methodVal) return false;
+    if (pathVal && !log.path.toLowerCase().includes(pathVal)) return false;
+    if (hideNoise && isNoise(log.path)) return false;
+    return true;
+  }});
+
+  document.getElementById("http-rows").innerHTML = filtered.map(renderHttpRow).join("");
+}}
+
 async function loadInitialHttp() {{
   const res = await fetch(`/admin/logs/http/data?key=${{KEY}}&limit=100`);
   const data = await res.json();
   document.getElementById("total").innerText = data.total;
   document.getElementById("success").innerText = data.success;
   document.getElementById("failed").innerText = data.failed;
-  const rows = data.logs.reverse().map(renderHttpRow).join("");
-  document.getElementById("http-rows").innerHTML = rows;
+  allHttpLogs = data.logs.reverse();
+  applyFilter();
 }}
 
 function renderHttpRow(log) {{
