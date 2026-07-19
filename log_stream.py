@@ -40,6 +40,15 @@ FIXES APPLIED (2026-07-19):
      making "Today"/"Yesterday" look like they were showing the wrong
      data, when really they'd just silently failed to update at all.
      Fixed to catch per-row and exclude bad rows instead of aborting.
+  5. HTTP request table now renders oldest-first / newest-at-the-bottom
+     (like a terminal tail), auto-scrolling the table to the bottom when
+     new live rows arrive, instead of newest-at-top.
+  6. System logs were only ever kept in an in-memory deque, which is
+     wiped every time the container restarts/redeploys (deploy.yml does
+     stop+rm+run on every push) - so only logs since the last deploy were
+     ever visible, looking like "older system logs are missing." System
+     logs are now persisted to the same SQLite DB as HTTP logs, so they
+     survive restarts and redeploys exactly like HTTP logs already do.
 --------------------------------------------------------------------------
 """
 
@@ -49,7 +58,6 @@ import logging
 import os
 import sqlite3
 import time
-from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -59,7 +67,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 DB_PATH = os.environ.get("REQUEST_LOG_DB_PATH", "/app/data/logs.db")
 ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
-SYSTEM_LOG_BUFFER_SIZE = 2000
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -86,6 +93,21 @@ def _init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs(timestamp)")
+        # System logs now share this same SQLite file (and volume mount) as
+        # request_logs, so they survive container restarts/redeploys instead
+        # of vanishing every time deploy.yml recreates the container.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                level TEXT NOT NULL,
+                logger TEXT NOT NULL,
+                message TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_timestamp ON system_logs(timestamp)")
         conn.commit()
 
 
@@ -196,21 +218,24 @@ async def stream_http_logs(key: str = Query(...)):
 # ============================================================
 # 2. SYSTEM / APP LOGGING (hooks into Python's `logging` module)
 # ============================================================
-
-_system_log_buffer = deque(maxlen=SYSTEM_LOG_BUFFER_SIZE)
-
+# Persisted to the same SQLite DB/volume as request_logs, rather than an
+# in-memory deque - a deque gets wiped every time the container restarts
+# or redeploys, which made older system logs disappear after every push.
 
 class BufferLogHandler(logging.Handler):
     def emit(self, record):
         try:
-            _system_log_buffer.append(
-                {
-                    "timestamp": datetime.utcfromtimestamp(record.created).isoformat(),
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "message": record.getMessage(),
-                }
-            )
+            with get_db() as conn:
+                conn.execute(
+                    "INSERT INTO system_logs (timestamp, level, logger, message) VALUES (?, ?, ?, ?)",
+                    (
+                        datetime.utcfromtimestamp(record.created).isoformat(),
+                        record.levelname,
+                        record.name,
+                        record.getMessage(),
+                    ),
+                )
+                conn.commit()
         except Exception:
             pass
 
@@ -224,21 +249,29 @@ def attach_system_log_capture():
 @router.get("/admin/logs/system/data")
 def get_system_logs(key: str = Query(...), limit: int = Query(200, le=2000)):
     _check_admin(key)
-    logs = list(_system_log_buffer)[-limit:]
-    return JSONResponse({"total": len(_system_log_buffer), "logs": logs})
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) as c FROM system_logs").fetchone()["c"]
+    logs = [dict(r) for r in rows][::-1]  # oldest -> newest, for chronological display
+    return JSONResponse({"total": total, "logs": logs})
 
 
 async def _system_log_event_generator():
-    last_len = len(_system_log_buffer)
+    with get_db() as conn:
+        row = conn.execute("SELECT MAX(id) as m FROM system_logs").fetchone()
+        last_id = row["m"] or 0
+
     while True:
         await asyncio.sleep(1)
-        current = list(_system_log_buffer)
-        if len(current) > last_len:
-            for entry in current[last_len:]:
-                yield f"data: {json.dumps(entry)}\n\n"
-            last_len = len(current)
-        elif len(current) < last_len:
-            last_len = len(current)
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM system_logs WHERE id > ? ORDER BY id ASC", (last_id,)
+            ).fetchall()
+        for r in rows:
+            last_id = r["id"]
+            yield f"data: {json.dumps(dict(r))}\n\n"
 
 
 @router.get("/admin/logs/system/stream")
@@ -258,15 +291,19 @@ def delete_logs(key: str = Query(...), older_than_days: int = Query(None)):
         if older_than_days is not None:
             cutoff = (datetime.utcnow() - timedelta(days=older_than_days)).isoformat()
             cur = conn.execute("DELETE FROM request_logs WHERE timestamp < ?", (cutoff,))
+            cur_sys = conn.execute("DELETE FROM system_logs WHERE timestamp < ?", (cutoff,))
         else:
             cur = conn.execute("DELETE FROM request_logs")
+            cur_sys = conn.execute("DELETE FROM system_logs")
         conn.commit()
         deleted_http = cur.rowcount
+        deleted_system = cur_sys.rowcount
 
-    if older_than_days is None:
-        _system_log_buffer.clear()
-
-    return {"deleted_http_logs": deleted_http, "system_buffer_cleared": older_than_days is None}
+    return {
+        "deleted_http_logs": deleted_http,
+        "deleted_system_logs": deleted_system,
+        "system_buffer_cleared": older_than_days is None,
+    }
 
 
 # ============================================================
@@ -312,6 +349,7 @@ def logs_dashboard(key: str = Query(...)):
   .reset-btn:hover { background: #4a232b; }
   .live-dot { display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  #http-table-wrap { max-height: 500px; overflow-y: auto; border-radius: 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #262a38; }
   th { color: #888; font-weight: 500; position: sticky; top: 0; background: #0f1117; }
@@ -385,12 +423,14 @@ def logs_dashboard(key: str = Query(...)):
       </div>
     </div>
 
-    <table>
-      <thead>
-        <tr><th>Time (NPT)</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th></tr>
-      </thead>
-      <tbody id="http-rows"></tbody>
-    </table>
+    <div id="http-table-wrap">
+      <table>
+        <thead>
+          <tr><th>Time (NPT)</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th></tr>
+        </thead>
+        <tbody id="http-rows"></tbody>
+      </table>
+    </div>
     <div id="http-empty" class="empty-state" style="display:none;">No requests match the current filters.</div>
     <div id="http-loading" class="empty-state" style="display:none;">Loading...</div>
     <div id="http-error" class="empty-state" style="display:none; color:#f87171;"></div>
@@ -566,11 +606,17 @@ function applyFilter() {
     return true;
   });
 
-  // Newest first - matches how most log viewers (including Railway) show
-  // activity, so the most recent request is always visible at the top
-  // without needing to scroll down.
-  document.getElementById("http-rows").innerHTML = filtered.slice().reverse().map(renderHttpRow).join("");
+  // Oldest first, newest at the bottom - matches a typical terminal/tail
+  // view (and the System Logs panel, which already appends+autoscrolls).
+  const tableWrap = document.getElementById("http-table-wrap");
+  const wasNearBottom = tableWrap
+    ? tableWrap.scrollHeight - tableWrap.scrollTop - tableWrap.clientHeight < 60
+    : true;
+  document.getElementById("http-rows").innerHTML = filtered.map(renderHttpRow).join("");
   document.getElementById("http-empty").style.display = filtered.length === 0 ? "block" : "none";
+  if (tableWrap && wasNearBottom) {
+    tableWrap.scrollTop = tableWrap.scrollHeight;
+  }
 }
 
 function resetFilters() {
