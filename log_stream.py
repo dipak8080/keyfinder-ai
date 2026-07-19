@@ -337,6 +337,20 @@ function statusClass(code) {{
   return "status-2xx";
 }}
 
+// Converts a UTC ISO timestamp (as stored in the DB / logging module) to
+// Nepal time (NPT, UTC+5:45) for display. Storage stays UTC - only the
+// display is localized, which is the correct practice (avoids ambiguity
+// if you ever have users/servers in other timezones).
+function toNepalTime(isoString) {{
+  const date = new Date(isoString + "Z"); // "Z" marks it explicitly as UTC
+  return date.toLocaleString("en-US", {{
+    timeZone: "Asia/Kathmandu",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: true
+  }});
+}}
+
 async function loadInitialHttp() {{
   const res = await fetch(`/admin/logs/http/data?key=${{KEY}}&limit=100`);
   const data = await res.json();
@@ -349,7 +363,7 @@ async function loadInitialHttp() {{
 
 function renderHttpRow(log) {{
   return `<tr>
-    <td>${{log.timestamp.replace("T", " ").split(".")[0]}}</td>
+    <td>${{toNepalTime(log.timestamp)}}</td>
     <td>${{log.method}}</td>
     <td>${{log.path}}</td>
     <td class="${{statusClass(log.status_code)}}">${{log.status_code}}</td>
@@ -381,7 +395,7 @@ async function loadInitialSystem() {{
 }}
 
 function renderSystemLine(entry) {{
-  return `<div><span class="level-${{entry.level}}">[${{entry.level}}]</span> ${{entry.timestamp.replace("T"," ").split(".")[0]}} ${{entry.logger}} — ${{entry.message}}</div>`;
+  return `<div><span class="level-${{entry.level}}">[${{entry.level}}]</span> ${{toNepalTime(entry.timestamp)}} ${{entry.logger}} — ${{entry.message}}</div>`;
 }}
 
 const systemSource = new EventSource(`/admin/logs/system/stream?key=${{KEY}}`);
