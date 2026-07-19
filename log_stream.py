@@ -18,6 +18,22 @@ IMPORTANT: for the /stream (SSE) endpoints to actually be live rather than
 buffered, nginx needs `proxy_buffering off;` on those specific routes - see
 the nginx config block documented in project notes. Without it, nginx
 buffers the whole response before forwarding, defeating the purpose of SSE.
+
+--------------------------------------------------------------------------
+FIXES APPLIED (2026-07-19):
+  1. getNepalYMD() crashed on already-Z-suffixed ISO strings (it blindly
+     appended a second "Z"), which threw an uncaught RangeError on page
+     load and halted the whole script before loadInitialHttp() /
+     loadInitialSystem() ever ran. This is why the dashboard looked "empty
+     after refresh" even though the backend/DB had all the data the whole
+     time. Fixed to detect an existing timezone suffix before appending.
+  2. Total/Success/Failed counters could permanently become "NaN" if an
+     SSE event arrived before the initial fetch populated real numbers
+     (parseInt("-") -> NaN, and NaN + 1 stays NaN forever). Fixed by
+     tracking counts as real JS numbers instead of re-parsing DOM text.
+  3. Page-init sequence wrapped in try/catch so one bad date/edge case
+     can no longer block the rest of the dashboard from loading.
+--------------------------------------------------------------------------
 """
 
 import asyncio
@@ -121,7 +137,7 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                     )
                     conn.commit()
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("Failed to write request log")
 
         return response
 
@@ -401,6 +417,18 @@ const MAX_LOGS_IN_MEMORY = 1000; // caps client-side memory growth for long-runn
 let isPaused = false;
 let pendingCount = 0;
 
+// FIX #2: track counters as real numbers, never re-parse DOM text (which
+// starts as "-" and turns any increment into NaN forever).
+let totalCount = 0;
+let successCount = 0;
+let failedCount = 0;
+
+function renderCounters() {
+  document.getElementById("total").innerText = totalCount;
+  document.getElementById("success").innerText = successCount;
+  document.getElementById("failed").innerText = failedCount;
+}
+
 const NOISE_PATTERNS = [
   "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
   "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php"
@@ -421,7 +449,8 @@ function formatDuration(ms) {
 }
 
 function toNepalTime(isoString) {
-  const date = new Date(isoString + "Z");
+  const hasZone = /Z$|[+-]\d{2}:\d{2}$/.test(isoString);
+  const date = new Date(hasZone ? isoString : isoString + "Z");
   return date.toLocaleString("en-US", {
     timeZone: "Asia/Kathmandu",
     year: "numeric", month: "2-digit", day: "2-digit",
@@ -430,8 +459,16 @@ function toNepalTime(isoString) {
   });
 }
 
+// FIX #1: isoString may already end in "Z" (e.g. new Date().toISOString()
+// from nepalTodayYMD()) or may be a bare SQLite timestamp with no zone
+// (e.g. "2026-07-19T15:15:16.963554" from the DB). Blindly appending "Z"
+// broke the first case ("...000ZZ" -> Invalid Date -> uncaught RangeError
+// in formatToParts -> whole init script halted, which is why the page
+// looked empty after every refresh even though the backend had all the
+// data). Only append "Z" when there's no zone suffix already.
 function getNepalYMD(isoString) {
-  const date = new Date(isoString + "Z");
+  const hasZone = /Z$|[+-]\d{2}:\d{2}$/.test(isoString);
+  const date = new Date(hasZone ? isoString : isoString + "Z");
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Kathmandu", year: "numeric", month: "2-digit", day: "2-digit"
   }).formatToParts(date);
@@ -577,9 +614,10 @@ async function loadInitialHttp() {
       throw new Error(`Server returned ${res.status}: ${res.statusText}`);
     }
     const data = await res.json();
-    document.getElementById("total").innerText = data.total;
-    document.getElementById("success").innerText = data.success;
-    document.getElementById("failed").innerText = data.failed;
+    totalCount = data.total;
+    successCount = data.success;
+    failedCount = data.failed;
+    renderCounters();
     allHttpLogs = data.logs.reverse();
     applyFilter();
   } catch (err) {
@@ -598,12 +636,14 @@ httpSource.onmessage = (event) => {
   if (allHttpLogs.length > MAX_LOGS_IN_MEMORY) {
     allHttpLogs.shift(); // cap memory growth for long-running tabs
   }
-  document.getElementById("total").innerText = parseInt(document.getElementById("total").innerText || 0) + 1;
+
+  totalCount++;
   if (log.status_code < 400) {
-    document.getElementById("success").innerText = parseInt(document.getElementById("success").innerText || 0) + 1;
+    successCount++;
   } else {
-    document.getElementById("failed").innerText = parseInt(document.getElementById("failed").innerText || 0) + 1;
+    failedCount++;
   }
+  renderCounters();
 
   if (isPaused) {
     pendingCount++;
@@ -660,8 +700,23 @@ async function deleteLogs(days) {
   loadInitialSystem();
 }
 
-document.getElementById("customDate").max = ymdToKey(nepalTodayYMD());
-loadFilterPrefs();
+// FIX #3: wrap the init sequence so one bad edge case (e.g. a date helper
+// throwing) can never again block loadInitialHttp()/loadInitialSystem()
+// from running, which was the actual root cause of the "empty after
+// refresh" bug — the uncaught RangeError from getNepalYMD (fixed above)
+// was thrown on this very line, halting the script before either load
+// call below ever executed.
+try {
+  document.getElementById("customDate").max = ymdToKey(nepalTodayYMD());
+} catch (e) {
+  console.error("Failed to set date picker max:", e);
+}
+
+try {
+  loadFilterPrefs();
+} catch (e) {
+  console.error("Failed to load filter prefs:", e);
+}
 
 loadInitialHttp();
 loadInitialSystem();
