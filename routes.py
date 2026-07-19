@@ -37,6 +37,7 @@ from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, tr
 from rate_limit import check_rate_limit
 from cache import get_cached_audio, put_cached_audio
 from monitoring import record_result, get_status_snapshot
+from download_progress import make_progress_hook
 
 router = APIRouter()
 
@@ -120,6 +121,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         # builds the proxy attempt via {**base_ydl_opts, 'proxy': ...} -
         # the logger key carries over unchanged either way.
         'logger': ytdlp_alert_logger,
+        'progress_hooks': [make_progress_hook(video_id or url)],
     }
 
     # Cookie account selection now happens INSIDE download_with_fallback
