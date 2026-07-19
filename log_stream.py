@@ -33,6 +33,13 @@ FIXES APPLIED (2026-07-19):
      tracking counts as real JS numbers instead of re-parsing DOM text.
   3. Page-init sequence wrapped in try/catch so one bad date/edge case
      can no longer block the rest of the dashboard from loading.
+  4. passesDateFilter() threw on any row with an unparseable timestamp
+     (e.g. a stray manual-test row), which aborted the whole Array.filter
+     mid-pass in applyFilter(). Because the DOM update line runs after the
+     filter, the table just kept showing whatever was on screen before -
+     making "Today"/"Yesterday" look like they were showing the wrong
+     data, when really they'd just silently failed to update at all.
+     Fixed to catch per-row and exclude bad rows instead of aborting.
 --------------------------------------------------------------------------
 """
 
@@ -526,7 +533,12 @@ function setDateFilter(which) {
 
 function passesDateFilter(log) {
   if (currentDateFilter === "all") return true;
-  const logKey = ymdToKey(getNepalYMD(log.timestamp));
+  let logKey;
+  try {
+    logKey = ymdToKey(getNepalYMD(log.timestamp));
+  } catch (e) {
+    return false; // unparseable timestamp - exclude from date-filtered views rather than silently breaking the whole filter
+  }
   if (currentDateFilter === "today") {
     return logKey === ymdToKey(nepalTodayYMD());
   }
