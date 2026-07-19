@@ -54,7 +54,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 # starting the real download, with a clear message, instead of wasting
 # resources on something that was never going to finish in time for the
 # user. Set to None to disable the check entirely (no duration limit).
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "600"))  # 10 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "900"))  # 15 min
 
 # ---------- ANALYSIS TUNING ----------
 # Bumped from 120s -> 180s. Key/BPM detection doesn't need the whole track,
@@ -84,7 +84,7 @@ BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
 # Size this to roughly your CPU core count. Too high just means more
 # threads fighting over the same CPU with no real throughput gain - it does
 # NOT increase how much work the machine can actually do at once.
-THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "4"))
+THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "8"))
 
 # Hard caps on how many /analyze and /download jobs run AT THE SAME TIME.
 # This is the actual thing standing between you and an OOM crash when a lot
@@ -95,13 +95,13 @@ THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "4"))
 # Tune these to your instance's RAM. Essentia/Librosa audio buffers for a
 # ~3 min trimmed track are roughly tens of MB each, so on a small Railway
 # instance (512MB-1GB), keep these low (2-3) rather than generous.
-MAX_CONCURRENT_ANALYSIS = int(os.environ.get("MAX_CONCURRENT_ANALYSIS", "3"))
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
+MAX_CONCURRENT_ANALYSIS = int(os.environ.get("MAX_CONCURRENT_ANALYSIS", "4"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "6"))
 
 # How long an incoming request is willing to sit in the queue waiting for a
 # free analysis/download slot before we give up and return 503 instead of
 # holding the connection open forever.
-QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "30"))
+QUEUE_WAIT_TIMEOUT_SECONDS = int(os.environ.get("QUEUE_WAIT_TIMEOUT_SECONDS", "60"))
 
 # ---------- COOKIES ----------
 # cookies.txt is intentionally excluded from git (it contains a real
