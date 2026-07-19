@@ -306,6 +306,10 @@ def logs_dashboard(key: str = Query(...)):
   .empty-state { color: #555; text-align: center; padding: 30px; font-size: 13px; }
   .new-row { animation: highlight 1.5s ease-out; }
   @keyframes highlight { 0% { background: rgba(74, 222, 128, 0.25); } 100% { background: transparent; } }
+  .manage-section { margin-bottom: 14px; border: 1px solid #262a38; border-radius: 8px; overflow: hidden; }
+  .manage-toggle { padding: 8px 12px; font-size: 13px; color: #888; cursor: pointer; background: #14161f; user-select: none; }
+  .manage-toggle:hover { color: #e2e2e2; }
+  .manage-body { padding: 10px 12px; display: flex; gap: 8px; background: #0f1117; }
 </style>
 </head>
 <body>
@@ -335,7 +339,7 @@ def logs_dashboard(key: str = Query(...)):
       <label style="font-size:13px;color:#888;">
         <input type="checkbox" id="hideNoise" onchange="applyFilter()"> Hide bot/scanner noise
       </label>
-      <button class="reset-btn" onclick="resetFilters()">Reset filters</button>
+      <button class="reset-btn" onclick="resetFilters()">Reset</button>
     </div>
 
     <div class="controls">
@@ -343,19 +347,19 @@ def logs_dashboard(key: str = Query(...)):
       <button class="date-btn active" id="dateBtnAll" onclick="setDateFilter('all')">All time</button>
       <button class="date-btn" id="dateBtnToday" onclick="setDateFilter('today')">Today</button>
       <button class="date-btn" id="dateBtnYesterday" onclick="setDateFilter('yesterday')">Yesterday</button>
-      <span class="controls-label">or pick a date:</span>
       <input type="date" id="customDate" onchange="setDateFilter('custom')">
-    </div>
-
-    <div class="controls">
-      <button onclick="deleteLogs(1)">Delete logs older than 1 day</button>
-      <button onclick="deleteLogs(7)">Delete logs older than 7 days</button>
-      <button onclick="deleteLogs(null)">Delete ALL logs</button>
-    </div>
-
-    <div class="controls">
-      <button id="pauseBtn" onclick="togglePause()">⏸ Pause live updates</button>
+      <span style="flex-grow:1;"></span>
+      <button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
       <span id="pendingBadge" style="display:none; color:#fbbf24; font-size:13px;"></span>
+    </div>
+
+    <div class="manage-section">
+      <div class="manage-toggle" onclick="toggleManage()">⚙ Manage logs (delete) <span id="manageArrow">▸</span></div>
+      <div class="manage-body" id="manageBody" style="display:none;">
+        <button onclick="deleteLogs(1)">Delete logs older than 1 day</button>
+        <button onclick="deleteLogs(7)">Delete logs older than 7 days</button>
+        <button class="reset-btn" onclick="deleteLogs(null)">Delete ALL logs</button>
+      </div>
     </div>
 
     <table>
@@ -365,7 +369,8 @@ def logs_dashboard(key: str = Query(...)):
       <tbody id="http-rows"></tbody>
     </table>
     <div id="http-empty" class="empty-state" style="display:none;">No requests match the current filters.</div>
-    <div id="http-loading" class="empty-state">Loading...</div>
+    <div id="http-loading" class="empty-state" style="display:none;">Loading...</div>
+    <div id="http-error" class="empty-state" style="display:none; color:#f87171;"></div>
   </div>
 
   <div id="system-panel-wrap" class="panel">
@@ -553,18 +558,36 @@ function togglePause() {
   }
 }
 
+function toggleManage() {
+  const body = document.getElementById("manageBody");
+  const arrow = document.getElementById("manageArrow");
+  const isOpen = body.style.display !== "none";
+  body.style.display = isOpen ? "none" : "flex";
+  arrow.textContent = isOpen ? "▸" : "▾";
+}
+
 async function loadInitialHttp() {
-  document.getElementById("http-loading").style.display = "block";
+  const loadingEl = document.getElementById("http-loading");
+  const errorEl = document.getElementById("http-error");
+  loadingEl.style.display = "block";
+  errorEl.style.display = "none";
   try {
     const res = await fetch(`/admin/logs/http/data?key=${KEY}&limit=${MAX_LOGS_IN_MEMORY}`);
+    if (!res.ok) {
+      throw new Error(`Server returned ${res.status}: ${res.statusText}`);
+    }
     const data = await res.json();
     document.getElementById("total").innerText = data.total;
     document.getElementById("success").innerText = data.success;
     document.getElementById("failed").innerText = data.failed;
-    allHttpLogs = data.logs.reverse(); // stored oldest->newest internally; display order handled in applyFilter
+    allHttpLogs = data.logs.reverse();
     applyFilter();
+  } catch (err) {
+    errorEl.textContent = `Failed to load logs: ${err.message}. Try reloading the page.`;
+    errorEl.style.display = "block";
+    console.error("loadInitialHttp failed:", err);
   } finally {
-    document.getElementById("http-loading").style.display = "none";
+    loadingEl.style.display = "none";
   }
 }
 
@@ -592,17 +615,27 @@ httpSource.onmessage = (event) => {
 
   applyFilter();
 };
+httpSource.onerror = () => {
+  console.warn("HTTP log stream disconnected - browser will auto-retry.");
+};
 
 function renderSystemLine(entry) {
   return `<div><span class="level-${entry.level}">[${entry.level}]</span> ${toNepalTime(entry.timestamp)} ${entry.logger} — ${entry.message}</div>`;
 }
 
 async function loadInitialSystem() {
-  const res = await fetch(`/admin/logs/system/data?key=${KEY}&limit=200`);
-  const data = await res.json();
-  const panel = document.getElementById("system-panel");
-  panel.innerHTML = data.logs.map(renderSystemLine).join("");
-  panel.scrollTop = panel.scrollHeight;
+  try {
+    const res = await fetch(`/admin/logs/system/data?key=${KEY}&limit=200`);
+    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+    const data = await res.json();
+    const panel = document.getElementById("system-panel");
+    panel.innerHTML = data.logs.map(renderSystemLine).join("");
+    panel.scrollTop = panel.scrollHeight;
+  } catch (err) {
+    document.getElementById("system-panel").innerHTML =
+      `<div style="color:#f87171;">Failed to load system logs: ${err.message}</div>`;
+    console.error("loadInitialSystem failed:", err);
+  }
 }
 
 const systemSource = new EventSource(`/admin/logs/system/stream?key=${KEY}`);
@@ -611,6 +644,9 @@ systemSource.onmessage = (event) => {
   const panel = document.getElementById("system-panel");
   panel.insertAdjacentHTML("beforeend", renderSystemLine(entry));
   panel.scrollTop = panel.scrollHeight;
+};
+systemSource.onerror = () => {
+  console.warn("System log stream disconnected - browser will auto-retry.");
 };
 
 async function deleteLogs(days) {
