@@ -15,11 +15,13 @@ from config import (
 )
 from utils import ensure_cookies_file
 from routes import router
+from log_stream import RequestLoggerMiddleware, router as logs_router, attach_system_log_capture
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    attach_system_log_capture()  # starts capturing all logger.info()/error() calls app-wide
     ensure_cookies_file()
     if ALLOWED_ORIGINS == ["*"]:
         logger.warning(
@@ -41,6 +43,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.6.0", lifespan=lifespan)
 
+# Logs every HTTP request (timestamp, method, path, status, duration, IP) to SQLite
+app.add_middleware(RequestLoggerMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -55,3 +60,4 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)
