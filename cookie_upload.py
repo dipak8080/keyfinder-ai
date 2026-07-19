@@ -141,7 +141,7 @@ def upload_form(key: str = Query(...)):
   </div>
 
 <script>
-const KEY = "PLACEHOLDER_ADMIN_KEY";
+const KEY = encodeURIComponent("PLACEHOLDER_ADMIN_KEY");
 
 async function loadStatus() {
   const res = await fetch("/admin/cookies/status?key=" + KEY);

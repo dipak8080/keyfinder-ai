@@ -317,7 +317,7 @@ def logs_dashboard(key: str = Query(...)):
   </div>
 
 <script>
-const KEY = "{ADMIN_KEY}";
+const KEY = encodeURIComponent("{ADMIN_KEY}");
 
 function switchTab(tab) {{
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
