@@ -87,7 +87,22 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
 
         if not request.url.path.startswith("/admin/logs"):
             try:
-                client_ip = request.client.host if request.client else "-"
+                # request.client.host is the IP of whoever connects DIRECTLY
+                # to this app - since nginx sits in front as a reverse proxy,
+                # that's always nginx itself (127.0.0.1 or the Docker bridge
+                # IP), not the real visitor. nginx forwards the real visitor
+                # IP in X-Forwarded-For (set via proxy_set_header in the
+                # nginx config) - read that first, falling back to
+                # request.client.host only if it's somehow missing (e.g.
+                # hitting the app directly on :8000, bypassing nginx).
+                forwarded_for = request.headers.get("x-forwarded-for")
+                if forwarded_for:
+                    # X-Forwarded-For can be a comma-separated chain if there
+                    # are multiple proxies - the FIRST entry is the original
+                    # client, the rest are intermediate proxies.
+                    client_ip = forwarded_for.split(",")[0].strip()
+                else:
+                    client_ip = request.client.host if request.client else "-"
                 with get_db() as conn:
                     conn.execute(
                         "INSERT INTO request_logs (timestamp, method, path, status_code, duration_ms, client_ip) "
@@ -263,7 +278,16 @@ def logs_dashboard(key: str = Query(...)):
   .stat-box .value {{ font-size: 20px; font-weight: 600; }}
   .success {{ color: #4ade80; }}
   .failed {{ color: #f87171; }}
-  .controls {{ margin-bottom: 12px; }}
+  .controls {{ margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+  select, input[type=text], input[type=date] {{
+    background: #262a38; color: #e2e2e2; border: 1px solid #333748;
+    border-radius: 6px; padding: 7px 10px; font-size: 13px;
+    font-family: -apple-system, system-ui, sans-serif;
+  }}
+  select:focus, input[type=text]:focus, input[type=date]:focus {{ outline: 1px solid #4ade80; border-color: #4ade80; }}
+  .date-btn {{ background: #262a38; color: #e2e2e2; border: 1px solid #333748; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }}
+  .date-btn:hover {{ background: #333748; }}
+  .date-btn.active {{ background: #4ade80; color: #0f1117; border-color: #4ade80; font-weight: 600; }}
   button {{ background: #262a38; color: #e2e2e2; border: none; padding: 7px 14px; border-radius: 6px; cursor: pointer; margin-right: 8px; font-size: 13px; }}
   button:hover {{ background: #333748; }}
   .live-dot {{ display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }}
@@ -311,10 +335,16 @@ def logs_dashboard(key: str = Query(...)):
         <option value="POST">POST</option>
         <option value="DELETE">DELETE</option>
       </select>
-      <input type="text" id="pathFilter" placeholder="Filter by path (e.g. /download)" onkeyup="applyFilter()" style="background:#262a38;color:#e2e2e2;border:1px solid #333748;border-radius:6px;padding:7px 10px;font-size:13px;width:220px;">
-      <label style="font-size:13px;color:#888;margin-left:8px;">
+      <input type="text" id="pathFilter" placeholder="Filter by path (e.g. /download)" oninput="applyFilter()" style="width:220px;">
+      <label style="font-size:13px;color:#888;">
         <input type="checkbox" id="hideNoise" onchange="applyFilter()"> Hide bot/scanner noise
       </label>
+    </div>
+    <div class="controls">
+      <button class="date-btn active" id="dateBtnAll" onclick="setDateFilter('all')">All time</button>
+      <button class="date-btn" id="dateBtnToday" onclick="setDateFilter('today')">Today</button>
+      <button class="date-btn" id="dateBtnYesterday" onclick="setDateFilter('yesterday')">Yesterday</button>
+      <input type="date" id="customDate" onchange="setDateFilter('custom')">
     </div>
     <table>
       <thead>
@@ -386,6 +416,54 @@ function isNoise(path) {{
 }}
 
 let allHttpLogs = []; // keeps every log seen this session, filters render from this
+let currentDateFilter = "all"; // "all" | "today" | "yesterday" | "custom"
+
+// Returns YYYY-MM-DD for a given ISO UTC timestamp, AS SEEN IN NEPAL TIME -
+// this matters at day boundaries: a request at 11:30pm UTC is already the
+// next day in Nepal (UTC+5:45), so comparing raw UTC dates would put it in
+// the wrong day bucket for "Today"/"Yesterday".
+function nepalDateOnly(isoString) {{
+  const date = new Date(isoString + "Z");
+  const parts = new Intl.DateTimeFormat("en-CA", {{
+    timeZone: "Asia/Kathmandu", year: "numeric", month: "2-digit", day: "2-digit"
+  }}).formatToParts(date);
+  const y = parts.find(p => p.type === "year").value;
+  const m = parts.find(p => p.type === "month").value;
+  const d = parts.find(p => p.type === "day").value;
+  return `${{y}}-${{m}}-${{d}}`;
+}}
+
+function nepalTodayString() {{
+  return nepalDateOnly(new Date().toISOString());
+}}
+
+function setDateFilter(which) {{
+  currentDateFilter = which;
+  document.querySelectorAll(".date-btn").forEach(b => b.classList.remove("active"));
+  if (which === "all") document.getElementById("dateBtnAll").classList.add("active");
+  if (which === "today") document.getElementById("dateBtnToday").classList.add("active");
+  if (which === "yesterday") document.getElementById("dateBtnYesterday").classList.add("active");
+  applyFilter();
+}}
+
+function passesDateFilter(log) {{
+  if (currentDateFilter === "all") return true;
+  const logDate = nepalDateOnly(log.timestamp);
+  if (currentDateFilter === "today") {{
+    return logDate === nepalTodayString();
+  }}
+  if (currentDateFilter === "yesterday") {{
+    const today = new Date(nepalTodayString());
+    today.setDate(today.getDate() - 1);
+    const yStr = today.toISOString().split("T")[0];
+    return logDate === yStr;
+  }}
+  if (currentDateFilter === "custom") {{
+    const picked = document.getElementById("customDate").value;
+    return picked && logDate === picked;
+  }}
+  return true;
+}}
 
 function applyFilter() {{
   const methodVal = document.getElementById("methodFilter").value;
@@ -396,6 +474,7 @@ function applyFilter() {{
     if (methodVal && log.method !== methodVal) return false;
     if (pathVal && !log.path.toLowerCase().includes(pathVal)) return false;
     if (hideNoise && isNoise(log.path)) return false;
+    if (!passesDateFilter(log)) return false;
     return true;
   }});
 
@@ -426,15 +505,14 @@ function renderHttpRow(log) {{
 const httpSource = new EventSource(`/admin/logs/http/stream?key=${{KEY}}`);
 httpSource.onmessage = (event) => {{
   const log = JSON.parse(event.data);
-  const tbody = document.getElementById("http-rows");
-  tbody.insertAdjacentHTML("beforeend", renderHttpRow(log));
-  tbody.scrollTop = tbody.scrollHeight;
+  allHttpLogs.push(log);
   document.getElementById("total").innerText = parseInt(document.getElementById("total").innerText || 0) + 1;
   if (log.status_code < 400) {{
     document.getElementById("success").innerText = parseInt(document.getElementById("success").innerText || 0) + 1;
   }} else {{
     document.getElementById("failed").innerText = parseInt(document.getElementById("failed").innerText || 0) + 1;
   }}
+  applyFilter(); // re-render respecting current filter settings
 }};
 
 async function loadInitialSystem() {{
