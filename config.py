@@ -89,14 +89,15 @@ PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(
 )
 
 # ---------- CORS ----------
-_allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS", "*")
+_allowed_origins_raw = os.environ.get(
+    "ALLOWED_ORIGINS", "https://www.audioforges.com,https://audioforges.com"
+)
 if _allowed_origins_raw.strip() == "*":
     ALLOWED_ORIGINS = ["*"]
 else:
     ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
 
-ALLOW_LOVABLE_PREVIEW_ORIGINS = os.environ.get("ALLOW_LOVABLE_PREVIEW_ORIGINS", "true").lower() == "true"
-LOVABLE_PREVIEW_ORIGIN_REGEX = r"https://.*\.lovable\.app|https://.*\.lovableproject\.com"
+ALLOW_LOVABLE_PREVIEW_ORIGINS = os.environ.get("ALLOW_LOVABLE_PREVIEW_ORIGINS", "false").lower() == "true"
 
 # ---------- RATE LIMITING ----------
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true"
