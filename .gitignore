@@ -7,4 +7,6 @@ uploads/*
 *.mp4
 # YouTube cookies (DO NOT COMMIT)
 cookies.txt
+cookies_2.txt
+cookies_3.txt
 cookies*.txt

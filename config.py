@@ -121,3 +121,45 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
 R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else ""
 
 CACHE_MAX_AGE_SECONDS = int(os.environ.get("CACHE_MAX_AGE_SECONDS", str(30 * 24 * 60 * 60)))  # 30 days
+
+# ---------- SEPARATION (Demucs vocal/instrumental remover) ----------
+# Local VPS disk, not R2 - stems are large (up to ~4x original file size
+# across vocals+instrumental), rarely re-requested (unlike the download
+# cache), and only need to live for a couple hours (preview + download
+# window), so a TTL-cleaned local directory is simpler and cheaper than
+# routing through R2 for something this ephemeral.
+SEPARATION_DIR = "separated"
+os.makedirs(SEPARATION_DIR, exist_ok=True)
+
+# Demucs model name - htdemucs is the standard pretrained model, good
+# quality/speed balance for two-stem (vocals/instrumental) separation.
+SEPARATION_MODEL = os.environ.get("SEPARATION_MODEL", "htdemucs")
+
+# Hard ceiling on how long the Demucs subprocess is allowed to run before
+# it's killed - protects against a hung/stuck process eating a worker
+# slot forever. 600s = 10 min, generous for CPU separation of a normal
+# song length.
+DEMUCS_TIMEOUT_SECONDS = int(os.environ.get("DEMUCS_TIMEOUT_SECONDS", "600"))
+
+# Tracks longer than this are rejected before Demucs even starts (checked
+# via ffprobe) - separation time scales with track length, and CPU
+# separation of very long files could eat the whole DEMUCS_TIMEOUT_SECONDS
+# budget on its own. 600s = 10 min track cap.
+MAX_SEPARATION_DURATION_SECONDS = int(os.environ.get("MAX_SEPARATION_DURATION_SECONDS", "600"))
+
+# How long a completed/failed job (and its stem files, if complete) stays
+# around before cleanup_expired_jobs() deletes it. 2 hours is generous
+# for a preview-then-download flow without accumulating stale files.
+SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", str(2 * 60 * 60)))
+
+# Separation is by far the most expensive endpoint (CPU + RAM heavy,
+# minutes not seconds) so it gets its own, much stricter rate limit than
+# /download and /analyze's shared 3-per-60s rule.
+SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "1"))
+SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+
+# Caps how many Demucs subprocesses can run at once across ALL users -
+# separate from MAX_CONCURRENT_ANALYSIS/DOWNLOADS since Demucs is far more
+# RAM-hungry per job than either of those. Keep at 1 unless you've
+# confirmed your VPS has RAM to spare for more.
+MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "1"))

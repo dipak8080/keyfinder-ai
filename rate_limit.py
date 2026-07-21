@@ -1,13 +1,15 @@
 """
 rate_limit.py - Simple per-IP rate limiting for the heavy endpoints
-(/download, /analyze).
+(/download, /analyze, /separate).
 
-In-memory sliding window, no external dependency (Redis etc.) needed. Good
-enough to stop a single IP from hammering the API and running up your
-Railway bill; resets on restart and is PER INSTANCE (doesn't share state
-across multiple Railway replicas if you ever scale horizontally) - a real
-limitation, but a solid first line of defense for a single-instance
-deployment.
+In-memory sliding window, no external dependency (Redis etc.) needed.
+Resets on restart and is PER INSTANCE - fine for a single VPS.
+
+check_rate_limit() now accepts OPTIONAL max_requests/window_seconds
+overrides so different routes can have different limits (e.g. /separate's
+much stricter 1-per-hour vs. /download and /analyze's shared default) -
+existing usage via plain Depends(check_rate_limit) is unaffected, since
+both params default to the original global config values.
 """
 import time
 import threading
@@ -26,38 +28,61 @@ _lock = threading.Lock()
 _requests = {}
 
 
-def check_rate_limit(request: Request):
+def _get_client_ip(request: Request) -> str:
+    # Behind a reverse proxy (Nginx/Caddy on the VPS, same as it was
+    # behind Railway's proxy before) - the real client IP is in
+    # X-Forwarded-For, not request.client.host (which would just be the
+    # proxy's internal address, identical for every request).
+    forwarded = request.headers.get("x-forwarded-for")
+    return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+
+
+def check_rate_limit(
+    request: Request,
+    max_requests: int = None,
+    window_seconds: int = None,
+):
     """
     Use as a FastAPI dependency on rate-limited routes:
+        # Default (shared) limit:
         @router.post("/download", dependencies=[Depends(check_rate_limit)])
-    Raises a clean 429 if the caller's IP has exceeded
-    RATE_LIMIT_MAX_REQUESTS within RATE_LIMIT_WINDOW_SECONDS on this path.
+
+        # Custom per-route limit:
+        from functools import partial
+        @router.post("/separate", dependencies=[
+            Depends(partial(check_rate_limit, max_requests=1, window_seconds=3600))
+        ])
+
+    Raises a clean 429 if the caller's IP has exceeded max_requests
+    within window_seconds on this specific path. max_requests/
+    window_seconds default to the global RATE_LIMIT_* config values if
+    not explicitly overridden, so existing call sites are unaffected.
     """
     if not RATE_LIMIT_ENABLED:
         return
 
-    path = request.url.path
+    effective_max = max_requests if max_requests is not None else RATE_LIMIT_MAX_REQUESTS
+    effective_window = window_seconds if window_seconds is not None else RATE_LIMIT_WINDOW_SECONDS
 
-    # Railway sits behind a proxy - the real client IP is in
-    # X-Forwarded-For, not request.client.host (which would just be
-    # Railway's internal proxy address, the same for every request).
-    forwarded = request.headers.get("x-forwarded-for")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    path = request.url.path
+    ip = _get_client_ip(request)
 
     now = time.time()
     key = (ip, path)
 
     with _lock:
         timestamps = _requests.get(key, [])
-        cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+        cutoff = now - effective_window
         timestamps = [t for t in timestamps if t >= cutoff]
 
-        if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        if len(timestamps) >= effective_max:
             logger.warning(f"[RATE LIMIT] Blocked {ip} on {path} - {len(timestamps)} requests in window")
+            retry_after = int(effective_window - (now - timestamps[0])) if timestamps else effective_window
             raise HTTPException(
                 429,
                 f"Too many requests. Please wait a moment before trying again "
-                f"(limit: {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds)."
+                f"(limit: {effective_max} request(s) per {effective_window} seconds).",
+                headers={"Retry-After": str(max(retry_after, 1))},
             )
 
         timestamps.append(now)
