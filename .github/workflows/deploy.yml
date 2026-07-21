@@ -8,6 +8,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -16,11 +17,22 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            set -e
+
             cd ~/app
-            git pull origin main
+
+            # Always make VPS match GitHub exactly
+            git fetch origin
+            git reset --hard origin/main
+
+            # Build latest image
             docker build -t audioforges-api .
+
+            # Replace existing container
             docker stop audioforges-api || true
             docker rm audioforges-api || true
+
+            # Start new container
             docker run -d \
               --name audioforges-api \
               --restart unless-stopped \
@@ -29,4 +41,6 @@ jobs:
               -v /home/deploy/app/data:/app/data \
               -p 8000:8000 \
               audioforges-api
+
+            # Clean old images
             docker image prune -f
