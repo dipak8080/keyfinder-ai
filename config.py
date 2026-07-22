@@ -35,7 +35,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 )
 
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "900"))  # 15 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))  # 15 min
 
 # ---------- ANALYSIS TUNING ----------
 ANALYSIS_MAX_SECONDS: Optional[int] = 180
@@ -156,7 +156,7 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # Separation is by far the most expensive endpoint (CPU + RAM heavy,
 # minutes not seconds) so it gets its own, much stricter rate limit than
 # /download and /analyze's shared 3-per-60s rule.
-SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "1"))
+SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "2"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
 
 # Caps how many Demucs subprocesses can run at once across ALL users -
