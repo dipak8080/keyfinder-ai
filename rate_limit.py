@@ -37,6 +37,36 @@ def _get_client_ip(request: Request) -> str:
     return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
 
 
+def _format_duration(seconds: int) -> str:
+    """
+    Turns a raw seconds value into a human-readable string for
+    user-facing rate limit messages, e.g. 3600 -> "1 hour",
+    90 -> "1 min 30 sec", 45 -> "45 seconds".
+
+    Since the 429 error message is built dynamically from
+    effective_window at request time, this keeps the user-facing text
+    automatically in sync with whatever RATE_LIMIT_WINDOW_SECONDS /
+    SEPARATION_RATE_LIMIT_WINDOW_SECONDS (or any future per-route
+    override) is set to - no separate frontend copy to maintain.
+    """
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} min")
+    if secs and not hours:  # skip seconds once we're talking in hours
+        parts.append(f"{secs} sec")
+
+    return " ".join(parts)
+
+
 def check_rate_limit(
     request: Request,
     max_requests: int = None,
@@ -81,7 +111,7 @@ def check_rate_limit(
             raise HTTPException(
                 429,
                 f"Too many requests. Please wait a moment before trying again "
-                f"(limit: {effective_max} request(s) per {effective_window} seconds).",
+                f"(limit: {effective_max} request(s) per {_format_duration(effective_window)}).",
                 headers={"Retry-After": str(max(retry_after, 1))},
             )
 
