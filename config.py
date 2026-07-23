@@ -207,24 +207,23 @@ AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("AUDIO_TOOL_SUBPROCES
 MAX_AUDIO_TOOL_DURATION_SECONDS = int(os.environ.get("MAX_AUDIO_TOOL_DURATION_SECONDS", "1200"))  # 20 min
 
 # ---------- AUDIO TOOLS: FORMAT VALIDATION ----------
-# Explicit whitelist of source -> {allowed targets}. Anything not listed
-# here is rejected at the route level, regardless of what ffmpeg itself
-# could technically do - this is a security boundary (arbitrary format
-# strings shouldn't reach a subprocess command line unvetted) as much as
-# a UX one.
+# Full any-to-any conversion matrix - every supported format can convert
+# to every other supported format. Generated programmatically (not
+# hand-listed like the original restricted-pairs version) so adding a
+# new format to _SUPPORTED_AUDIO_FORMATS below automatically wires it
+# into every existing format's target list too, with no risk of an
+# entry being forgotten on one side of a pair.
+_SUPPORTED_AUDIO_FORMATS = ("mp3", "wav", "flac", "m4a", "aac", "ogg", "aiff")
+
 AUDIO_CONVERSION_MATRIX = {
-    "mp3":  {"wav"},
-    "wav":  {"mp3", "flac", "aac", "aiff"},
-    "flac": {"wav"},
-    "m4a":  {"mp3"},
-    "aac":  {"wav"},
-    "ogg":  {"mp3"},
-    "aiff": {"wav"},
+    fmt: set(_SUPPORTED_AUDIO_FORMATS) - {fmt}
+    for fmt in _SUPPORTED_AUDIO_FORMATS
 }
 
 # Every extension valid as an INPUT to any audio-tool endpoint (convert,
-# trim, pitch, tempo, volume, reverse) - used for upload validation
-# before the file is even opened.
+# trim, pitch, tempo, volume, reverse, noise-remove, voice-clean,
+# echo-remove, silence-remove, speech-to-text) - used for upload
+# validation before the file is even opened.
 ALLOWED_AUDIO_INPUT_FORMATS = frozenset(AUDIO_CONVERSION_MATRIX.keys()) | {
     fmt for targets in AUDIO_CONVERSION_MATRIX.values() for fmt in targets
 }
