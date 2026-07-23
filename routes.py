@@ -1,8 +1,23 @@
 """
 routes.py - The two APIs (download, analyze) plus root/health/admin,
-plus the new /separate (vocal remover) endpoints.
+plus the /separate (vocal remover) endpoints, the audio-tools group:
+/convert (format conversion), /trim (cut), /volume (gain boost/
+reduction), /pitch (pitch shift), /tempo (tempo/speed change), /reverse
+(reverse playback), /noise-remove (background noise reduction),
+/voice-clean (speech-optimized cleanup preset), /echo-remove
+(echo/reverb tail suppression), and /silence-remove (strip silent gaps)
+- and /speech-to-text (Whisper transcription), which sits apart from the
+audio-tools group on its own semaphore and returns transcript JSON
+rather than an audio file.
+Each audio-tool exposes matching POST (submit), GET .../status, GET
+.../preview (inline playback), and GET .../download routes;
+/speech-to-text instead exposes POST, GET .../status, and
+GET .../result.
 All business logic lives in youtube.py / audio_analysis.py / utils.py /
-separation.py - this file just wires HTTP in and out.
+separation.py / audio_converter.py / audio_cutter.py / volume_booster.py /
+pitch_changer.py / tempo_changer.py / reverse_audio.py / noise_remover.py /
+voice_cleaner.py / echo_remover.py / silence_remover.py / speech_to_text.py
+- this file just wires HTTP in and out.
 """
 import os
 import uuid
@@ -25,6 +40,45 @@ from config import (
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     MAX_CONCURRENT_SEPARATIONS,
+    MAX_CONCURRENT_AUDIO_TOOLS,
+    AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_CONVERT_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_CONVERSION_MATRIX,
+    AUDIO_TRIM_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_TRIM_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_VOLUME_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_VOLUME_RATE_LIMIT_WINDOW_SECONDS,
+    VOLUME_GAIN_MIN_DB,
+    VOLUME_GAIN_MAX_DB,
+    AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_PITCH_RATE_LIMIT_WINDOW_SECONDS,
+    PITCH_SHIFT_MIN_SEMITONES,
+    PITCH_SHIFT_MAX_SEMITONES,
+    AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_TEMPO_RATE_LIMIT_WINDOW_SECONDS,
+    TEMPO_MIN_FACTOR,
+    TEMPO_MAX_FACTOR,
+    AUDIO_REVERSE_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_REVERSE_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_NOISE_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_NOISE_RATE_LIMIT_WINDOW_SECONDS,
+    NOISE_REDUCTION_MIN_STRENGTH,
+    NOISE_REDUCTION_MAX_STRENGTH,
+    AUDIO_VOICE_CLEAN_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_VOICE_CLEAN_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_ECHO_REMOVE_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_ECHO_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_SILENCE_REMOVE_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_SILENCE_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
+    SILENCE_THRESHOLD_MIN_DB,
+    SILENCE_THRESHOLD_MAX_DB,
+    SILENCE_MIN_DURATION_SECONDS,
+    SILENCE_MAX_DURATION_SECONDS,
+    MAX_CONCURRENT_TRANSCRIPTIONS,
+    TRANSCRIPTION_JOB_TTL_SECONDS,
+    MAX_TRANSCRIPTION_DURATION_SECONDS,
+    AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
 )
 from utils import (
     cleanup_file,
@@ -53,8 +107,36 @@ from rate_limit import check_rate_limit
 from cache import get_cached_audio, put_cached_audio
 from monitoring import record_result, get_status_snapshot
 from download_progress import make_progress_hook
-from jobs import create_job, mark_complete, mark_failed, get_job, cleanup_expired_jobs
+from jobs import (
+    create_job,
+    mark_complete,
+    mark_tool_complete,
+    mark_transcription_complete,
+    mark_failed,
+    get_job,
+    cleanup_expired_jobs,
+)
 from separation import run_separation, SeparationError
+from audio_common import (
+    validate_input_format,
+    validate_conversion_pair,
+    build_temp_input_path,
+    build_output_path,
+    AudioToolError,
+    validate_duration,
+    get_audio_mime_type,
+)
+from audio_converter import convert_audio
+from audio_cutter import trim_audio
+from volume_booster import apply_volume_gain
+from pitch_changer import shift_pitch
+from tempo_changer import change_tempo
+from reverse_audio import reverse_audio
+from noise_remover import remove_noise
+from voice_cleaner import clean_voice
+from echo_remover import remove_echo
+from silence_remover import remove_silence
+from speech_to_text import transcribe
 
 router = APIRouter()
 
@@ -63,6 +145,9 @@ router = APIRouter()
 # Demucs subprocesses can run at once (default 1, since it's the most
 # RAM-hungry endpoint in this app).
 _separation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEPARATIONS)
+
+# Dedicated semaphore for the /convert (ffmpeg) audio-tools job flow.
+_audio_tools_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO_TOOLS)
 
 
 @router.post("/download", dependencies=[Depends(check_rate_limit)])
@@ -287,11 +372,13 @@ async def _run_separation_background(job_id: str, file_path: str, original_filen
     returning), since the whole point is the HTTP response doesn't wait
     for this to finish.
     """
+    succeeded = False
     async with _separation_semaphore:
         try:
             vocals_path, instrumental_path = await run_blocking(run_separation, file_path, job_id)
             mark_complete(job_id, original_filename, vocals_path, instrumental_path)
             logger.info(f"[SEPARATION] Job {job_id} finished successfully")
+            succeeded = True
         except SeparationError as e:
             mark_failed(job_id, str(e))
             logger.warning(f"[SEPARATION] Job {job_id} failed: {e}")
@@ -301,6 +388,7 @@ async def _run_separation_background(job_id: str, file_path: str, original_filen
         finally:
             cleanup_file(file_path)
             release_memory_to_os()
+            record_result("/separate", succeeded)
 
 
 @router.post(
@@ -383,12 +471,1209 @@ async def separation_download(job_id: str, stem: str = Query(...)):
     return FileResponse(path, media_type="audio/wav", filename=filename)
 
 
+# ============================================================
+# Shared helper for every audio-tool's preview/download routes below
+# (convert, trim, volume, pitch, tempo, reverse, noise-remove). Each
+# tool's preview route sits inline with its own status/download routes
+# rather than being grouped in one block at the end of the file.
+# ============================================================
+
+def _resolve_tool_output_path(job_id: str, expected_type: str) -> tuple[str, str]:
+    """Shared lookup for every tool's preview/download routes. Returns
+    (path, output_format). Raises HTTPException on any failure state,
+    same error semantics already used by each tool's individual
+    download route."""
+    job = get_job(job_id)
+    if job is None or job["job_type"] != expected_type:
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    return path, (job.get("output_format") or "bin")
+
+
+# ============================================================
+# /convert - Audio format conversion (async job flow)
+# ============================================================
+
+async def _run_convert_background(job_id: str, input_path: str, output_path: str,
+                                    source_format: str, target_format: str, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(convert_audio, input_path, output_path, source_format, target_format)
+            mark_tool_complete(job_id, original_filename, output_path, target_format)
+            logger.info(f"[CONVERT] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[CONVERT] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Conversion failed unexpectedly.")
+            logger.error(f"[CONVERT] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/convert", succeeded)
+
+
+@router.post(
+    "/convert",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_CONVERT_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def convert_audio_route(file: UploadFile = File(...), target_format: str = Form(...)):
+    """
+    Accepts an audio file + target_format, returns a job_id immediately,
+    runs the actual ffmpeg conversion in the background. Poll
+    GET /convert/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    target_format = target_format.strip().lower()
+    source_format = validate_input_format(file.filename)
+    validate_conversion_pair(source_format, target_format, AUDIO_CONVERSION_MATRIX)
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="convert")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, target_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    asyncio.create_task(_run_convert_background(job_id, input_path, output_path, source_format, target_format, file.filename))
+
+    logger.info(f"[CONVERT] Job {job_id} queued: '{file.filename}' ({source_format} -> {target_format})")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/convert/status/{job_id}")
+async def convert_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "convert":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/convert/preview/{job_id}")
+async def convert_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "convert")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/convert/download/{job_id}")
+async def convert_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "convert":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"converted.{ext}")
+
+
+# ============================================================
+# /trim - Audio cut/trim to a start-end range (async job flow)
+# ============================================================
+
+async def _run_trim_background(job_id: str, input_path: str, output_path: str,
+                                  start_seconds: float, end_seconds: float, duration: float,
+                                  original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(trim_audio, input_path, output_path, start_seconds, end_seconds, duration)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[TRIM] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[TRIM] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Trim failed unexpectedly.")
+            logger.error(f"[TRIM] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/trim", succeeded)
+
+
+@router.post(
+    "/trim",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_TRIM_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_TRIM_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def trim_audio_route(
+    file: UploadFile = File(...),
+    start_seconds: float = Form(...),
+    end_seconds: float = Form(...),
+):
+    """
+    Accepts an audio file + start/end range, returns a job_id
+    immediately, runs the ffmpeg trim in the background. Poll
+    GET /trim/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if start_seconds < 0 or end_seconds <= start_seconds:
+        raise HTTPException(400, "Invalid range: end_seconds must be greater than start_seconds, and both must be non-negative.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="trim")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    # Duration validated here (post-write, since ffprobe needs the file
+    # on disk) rather than in the background task - lets us reject an
+    # out-of-range end_seconds with a synchronous 400 instead of a job
+    # that immediately fails, giving the frontend a faster/cleaner error.
+    try:
+        duration = validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    if end_seconds > duration:
+        cleanup_file(input_path)
+        raise HTTPException(400, f"end_seconds ({end_seconds}s) exceeds the audio's actual duration ({duration:.1f}s).")
+
+    asyncio.create_task(_run_trim_background(job_id, input_path, output_path, start_seconds, end_seconds, duration, file.filename, source_format))
+
+    logger.info(f"[TRIM] Job {job_id} queued: '{file.filename}' [{start_seconds}s -> {end_seconds}s]")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/trim/status/{job_id}")
+async def trim_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "trim":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/trim/preview/{job_id}")
+async def trim_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "trim")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/trim/download/{job_id}")
+async def trim_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "trim":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"trimmed.{ext}")
+
+
+# ============================================================
+# /volume - Audio gain boost/reduction (async job flow)
+# ============================================================
+
+async def _run_volume_background(job_id: str, input_path: str, output_path: str,
+                                    gain_db: float, original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(apply_volume_gain, input_path, output_path, gain_db)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[VOLUME] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[VOLUME] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Volume adjustment failed unexpectedly.")
+            logger.error(f"[VOLUME] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/volume", succeeded)
+
+
+@router.post(
+    "/volume",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_VOLUME_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_VOLUME_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def volume_route(file: UploadFile = File(...), gain_db: float = Form(...)):
+    """
+    Accepts an audio file + gain_db, returns a job_id immediately, runs
+    the ffmpeg volume adjustment in the background. Poll
+    GET /volume/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if gain_db < VOLUME_GAIN_MIN_DB or gain_db > VOLUME_GAIN_MAX_DB:
+        raise HTTPException(400, f"gain_db must be between {VOLUME_GAIN_MIN_DB} and {VOLUME_GAIN_MAX_DB}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="volume")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_volume_background(job_id, input_path, output_path, gain_db, file.filename, source_format))
+
+    logger.info(f"[VOLUME] Job {job_id} queued: '{file.filename}' ({gain_db:+.1f}dB)")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/volume/status/{job_id}")
+async def volume_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "volume":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/volume/preview/{job_id}")
+async def volume_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "volume")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/volume/download/{job_id}")
+async def volume_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "volume":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"volume_adjusted.{ext}")
+
+
+# ============================================================
+# /pitch - Pitch shift, independent of tempo (async job flow)
+# ============================================================
+
+async def _run_pitch_background(job_id: str, input_path: str, output_path: str,
+                                    semitones: float, original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(shift_pitch, input_path, output_path, semitones)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[PITCH] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[PITCH] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Pitch shift failed unexpectedly.")
+            logger.error(f"[PITCH] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/pitch", succeeded)
+
+
+@router.post(
+    "/pitch",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_PITCH_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def pitch_route(file: UploadFile = File(...), semitones: float = Form(...)):
+    """
+    Accepts an audio file + semitones, returns a job_id immediately,
+    runs the rubberband pitch shift in the background. Poll
+    GET /pitch/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if semitones < PITCH_SHIFT_MIN_SEMITONES or semitones > PITCH_SHIFT_MAX_SEMITONES:
+        raise HTTPException(400, f"semitones must be between {PITCH_SHIFT_MIN_SEMITONES} and {PITCH_SHIFT_MAX_SEMITONES}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="pitch")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_pitch_background(job_id, input_path, output_path, semitones, file.filename, source_format))
+
+    logger.info(f"[PITCH] Job {job_id} queued: '{file.filename}' ({semitones:+.1f} semitones)")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/pitch/status/{job_id}")
+async def pitch_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "pitch":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/pitch/preview/{job_id}")
+async def pitch_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "pitch")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/pitch/download/{job_id}")
+async def pitch_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "pitch":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"pitch_shifted.{ext}")
+
+
+# ============================================================
+# /tempo - Tempo/speed change, independent of pitch (async job flow)
+# ============================================================
+
+async def _run_tempo_background(job_id: str, input_path: str, output_path: str,
+                                    tempo_factor: float, original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(change_tempo, input_path, output_path, tempo_factor)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[TEMPO] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[TEMPO] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Tempo change failed unexpectedly.")
+            logger.error(f"[TEMPO] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/tempo", succeeded)
+
+
+@router.post(
+    "/tempo",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_TEMPO_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def tempo_route(file: UploadFile = File(...), tempo_factor: float = Form(...)):
+    """
+    Accepts an audio file + tempo_factor, returns a job_id immediately,
+    runs the rubberband tempo change in the background. Poll
+    GET /tempo/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if tempo_factor < TEMPO_MIN_FACTOR or tempo_factor > TEMPO_MAX_FACTOR:
+        raise HTTPException(400, f"tempo_factor must be between {TEMPO_MIN_FACTOR} and {TEMPO_MAX_FACTOR}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="tempo")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_tempo_background(job_id, input_path, output_path, tempo_factor, file.filename, source_format))
+
+    logger.info(f"[TEMPO] Job {job_id} queued: '{file.filename}' (x{tempo_factor:.2f})")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/tempo/status/{job_id}")
+async def tempo_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "tempo":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/tempo/preview/{job_id}")
+async def tempo_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "tempo")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/tempo/download/{job_id}")
+async def tempo_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "tempo":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"tempo_changed.{ext}")
+
+
+# ============================================================
+# /reverse - Reverse audio playback (async job flow)
+#
+# This is the last of the audio-tools group sharing
+# _audio_tools_semaphore (convert, trim, volume, pitch, tempo, reverse).
+# ============================================================
+
+async def _run_reverse_background(job_id: str, input_path: str, output_path: str,
+                                     original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(reverse_audio, input_path, output_path)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[REVERSE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[REVERSE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Reverse failed unexpectedly.")
+            logger.error(f"[REVERSE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/reverse", succeeded)
+
+
+@router.post(
+    "/reverse",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_REVERSE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_REVERSE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def reverse_route(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, returns a job_id immediately, runs the
+    ffmpeg reverse in the background. Poll GET /reverse/status/{job_id}
+    to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="reverse")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_reverse_background(job_id, input_path, output_path, file.filename, source_format))
+
+    logger.info(f"[REVERSE] Job {job_id} queued: '{file.filename}'")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/reverse/status/{job_id}")
+async def reverse_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "reverse":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/reverse/preview/{job_id}")
+async def reverse_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "reverse")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/reverse/download/{job_id}")
+async def reverse_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "reverse":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"reversed.{ext}")
+
+
+# ============================================================
+# /noise-remove - Background noise reduction (async job flow)
+# ============================================================
+
+async def _run_noise_background(job_id: str, input_path: str, output_path: str,
+                                    strength: float, original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(remove_noise, input_path, output_path, strength)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[NOISE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[NOISE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Noise removal failed unexpectedly.")
+            logger.error(f"[NOISE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/noise-remove", succeeded)
+
+
+@router.post(
+    "/noise-remove",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_NOISE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_NOISE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def noise_remove_route(file: UploadFile = File(...), strength: float = Form(12.0)):
+    """
+    Accepts an audio file + optional strength, returns a job_id
+    immediately, runs the ffmpeg denoiser in the background. Poll
+    GET /noise-remove/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if strength < NOISE_REDUCTION_MIN_STRENGTH or strength > NOISE_REDUCTION_MAX_STRENGTH:
+        raise HTTPException(400, f"strength must be between {NOISE_REDUCTION_MIN_STRENGTH} and {NOISE_REDUCTION_MAX_STRENGTH}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="noise_remove")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_noise_background(job_id, input_path, output_path, strength, file.filename, source_format))
+
+    logger.info(f"[NOISE] Job {job_id} queued: '{file.filename}' (strength={strength})")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/noise-remove/status/{job_id}")
+async def noise_remove_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "noise_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/noise-remove/preview/{job_id}")
+async def noise_remove_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "noise_remove")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/noise-remove/download/{job_id}")
+async def noise_remove_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "noise_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"denoised.{ext}")
+
+
+# ============================================================
+# /voice-clean - Speech-optimized cleanup preset (async job flow)
+# ============================================================
+
+async def _run_voice_clean_background(job_id: str, input_path: str, output_path: str,
+                                         original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(clean_voice, input_path, output_path)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[VOICE_CLEAN] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[VOICE_CLEAN] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Voice cleanup failed unexpectedly.")
+            logger.error(f"[VOICE_CLEAN] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/voice-clean", succeeded)
+
+
+@router.post(
+    "/voice-clean",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_VOICE_CLEAN_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_VOICE_CLEAN_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def voice_clean_route(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, returns a job_id immediately, runs the
+    speech-cleanup filter chain in the background. Poll
+    GET /voice-clean/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="voice_clean")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_voice_clean_background(job_id, input_path, output_path, file.filename, source_format))
+
+    logger.info(f"[VOICE_CLEAN] Job {job_id} queued: '{file.filename}'")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/voice-clean/status/{job_id}")
+async def voice_clean_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "voice_clean":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/voice-clean/preview/{job_id}")
+async def voice_clean_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "voice_clean")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/voice-clean/download/{job_id}")
+async def voice_clean_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "voice_clean":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"voice_cleaned.{ext}")
+
+
+# ============================================================
+# /echo-remove - Echo/reverb tail suppression (async job flow)
+# ============================================================
+
+async def _run_echo_remove_background(job_id: str, input_path: str, output_path: str,
+                                         original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(remove_echo, input_path, output_path)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[ECHO_REMOVE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[ECHO_REMOVE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Echo removal failed unexpectedly.")
+            logger.error(f"[ECHO_REMOVE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/echo-remove", succeeded)
+
+
+@router.post(
+    "/echo-remove",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_ECHO_REMOVE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_ECHO_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def echo_remove_route(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, returns a job_id immediately, runs the
+    echo-suppression filter chain in the background. Poll
+    GET /echo-remove/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="echo_remove")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_echo_remove_background(job_id, input_path, output_path, file.filename, source_format))
+
+    logger.info(f"[ECHO_REMOVE] Job {job_id} queued: '{file.filename}'")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/echo-remove/status/{job_id}")
+async def echo_remove_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "echo_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/echo-remove/preview/{job_id}")
+async def echo_remove_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "echo_remove")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/echo-remove/download/{job_id}")
+async def echo_remove_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "echo_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"echo_removed.{ext}")
+
+
+# ============================================================
+# /silence-remove - Strip silent gaps throughout audio (async job flow)
+# ============================================================
+
+async def _run_silence_remove_background(job_id: str, input_path: str, output_path: str,
+                                            threshold_db: float, min_duration_seconds: float,
+                                            original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(remove_silence, input_path, output_path, threshold_db, min_duration_seconds)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[SILENCE_REMOVE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[SILENCE_REMOVE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Silence removal failed unexpectedly.")
+            logger.error(f"[SILENCE_REMOVE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/silence-remove", succeeded)
+
+
+@router.post(
+    "/silence-remove",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_SILENCE_REMOVE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_SILENCE_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def silence_remove_route(
+    file: UploadFile = File(...),
+    threshold_db: float = Form(-30.0),
+    min_duration_seconds: float = Form(0.5),
+):
+    """
+    Accepts an audio file + optional threshold/min-duration, returns a
+    job_id immediately, runs the ffmpeg silence-strip in the
+    background. Poll GET /silence-remove/status/{job_id} to track
+    progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
+        raise HTTPException(400, f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}.")
+    if min_duration_seconds < SILENCE_MIN_DURATION_SECONDS or min_duration_seconds > SILENCE_MAX_DURATION_SECONDS:
+        raise HTTPException(400, f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} and {SILENCE_MAX_DURATION_SECONDS}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="silence_remove")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_silence_remove_background(
+        job_id, input_path, output_path, threshold_db, min_duration_seconds, file.filename, source_format
+    ))
+
+    logger.info(f"[SILENCE_REMOVE] Job {job_id} queued: '{file.filename}' (threshold={threshold_db}dB, min_dur={min_duration_seconds}s)")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/silence-remove/status/{job_id}")
+async def silence_remove_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "silence_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/silence-remove/preview/{job_id}")
+async def silence_remove_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "silence_remove")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/silence-remove/download/{job_id}")
+async def silence_remove_download(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "silence_remove":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["output_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Output file not found (it may have expired).")
+    ext = job.get("output_format") or "bin"
+    return FileResponse(path, media_type="application/octet-stream", filename=f"silence_removed.{ext}")
+
+
+# ============================================================
+# /speech-to-text - Audio transcription via faster-whisper (async job flow)
+#
+# Deliberately gated by its OWN semaphore, not _audio_tools_semaphore -
+# Whisper inference is a heavy, sustained CPU+RAM operation fundamentally
+# unlike a stateless ffmpeg subprocess (see speech_to_text.py's module
+# docstring). Sharing the ffmpeg pool would let a slow transcription job
+# starve fast, cheap operations like /volume or /trim of their slots.
+#
+# Also structurally different from every other tool above: no /preview
+# route (there's no audio output to play back) and its GET result route
+# is named /result, not /download, since it returns transcript JSON
+# directly rather than an audio file.
+# ============================================================
+
+_transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
+
+async def _run_transcription_background(job_id: str, input_path: str, original_filename: str):
+    succeeded = False
+    async with _transcription_semaphore:
+        try:
+            result = await run_blocking(transcribe, input_path)
+            mark_transcription_complete(job_id, original_filename, result)
+            logger.info(f"[SPEECH_TO_TEXT] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[SPEECH_TO_TEXT] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Transcription failed unexpectedly.")
+            logger.error(f"[SPEECH_TO_TEXT] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/speech-to-text", succeeded)
+
+
+@router.post(
+    "/speech-to-text",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def speech_to_text_route(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, returns a job_id immediately, runs Whisper
+    transcription in the background. Poll
+    GET /speech-to-text/status/{job_id}, then
+    GET /speech-to-text/result/{job_id} once complete.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="transcribe", ttl_seconds=TRANSCRIPTION_JOB_TTL_SECONDS)
+    input_path = build_temp_input_path(job_id, file.filename)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path, max_seconds=MAX_TRANSCRIPTION_DURATION_SECONDS)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_transcription_background(job_id, input_path, file.filename))
+
+    logger.info(f"[SPEECH_TO_TEXT] Job {job_id} queued: '{file.filename}'")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/speech-to-text/status/{job_id}")
+async def speech_to_text_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "transcribe":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/speech-to-text/result/{job_id}")
+async def speech_to_text_result(job_id: str):
+    """
+    Returns the transcript JSON directly - no file involved, unlike
+    every other tool's /download route. This is the one endpoint in
+    the whole audio-tools family that returns structured data instead
+    of an audio blob.
+    """
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "transcribe":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    result = job.get("result_data")
+    if not result:
+        raise HTTPException(404, "Transcript not found (it may have expired).")
+    return JSONResponse(result)
+
+
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v13.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING + PERMANENT-ERROR 404 + VOCAL SEPARATION",
+        "status": "Audio Analysis API v13.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING + PERMANENT-ERROR 404 + VOCAL SEPARATION + AUDIO CONVERSION + AUDIO TRIM + VOLUME ADJUSTMENT + PITCH SHIFT + TEMPO CHANGE + AUDIO REVERSE + NOISE REDUCTION + VOICE CLEANUP + ECHO REMOVAL + SILENCE REMOVAL + SPEECH-TO-TEXT TRANSCRIPTION",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
-        "engine": "Essentia KeyExtractor + RhythmExtractor2013 + Demucs (separation)",
+        "engine": "Essentia KeyExtractor + RhythmExtractor2013 + Demucs (separation) + ffmpeg (conversion, trim, volume, reverse, noise reduction, voice cleanup, echo removal, silence removal) + rubberband (pitch, tempo) + faster-whisper (transcription)",
         "fixes": [
             "Removed invalid BPMHistogramDescriptors",
             "Proper BPM via RhythmExtractor2013 (confidence included)",
@@ -416,11 +1701,23 @@ async def root():
             "Cookie-expiry Discord alert (throttled)",
             "Multi-account cookie rotation (up to 3 sessions)",
             "CORS locked to ALLOWED_ORIGINS",
-            "Per-IP rate limiting on /download, /analyze, and /separate",
+            "Per-IP rate limiting on /download, /analyze, /separate, /convert, /trim, /volume, /pitch, /tempo, /reverse, /noise-remove, /voice-clean, /echo-remove, /silence-remove, and /speech-to-text",
             "Failure-spike monitoring with optional webhook alerting",
             "R2 caching for repeat download requests",
             "Clean 404 on permanently unavailable videos",
             "Async Demucs vocal/instrumental separation with job polling, local-disk stem storage, and TTL cleanup",
+            "Async ffmpeg audio format conversion with job polling and TTL cleanup",
+            "Async ffmpeg audio trim/cut with pre-flight duration validation and TTL cleanup",
+            "Async ffmpeg volume gain boost/reduction with bounds-checked gain_db and TTL cleanup",
+            "Async rubberband pitch shift (independent of tempo) with bounds-checked semitones and TTL cleanup",
+            "Async rubberband tempo/speed change (independent of pitch) with bounds-checked tempo_factor and TTL cleanup",
+            "Async ffmpeg audio reverse with pre-flight duration validation and TTL cleanup",
+            "Async ffmpeg background noise reduction with bounds-checked strength and TTL cleanup",
+            "Async speech-optimized cleanup preset (voice-clean) with pre-flight duration validation and TTL cleanup",
+            "Async echo/reverb tail suppression (echo-remove) with pre-flight duration validation and TTL cleanup",
+            "Async ffmpeg silence-gap stripping with bounds-checked threshold_db/min_duration_seconds and TTL cleanup",
+            "Inline <audio> preview endpoints (correct MIME per format) alongside every audio-tool's own status/download routes, matching the /separate/preview pattern",
+            "Async faster-whisper speech-to-text transcription on its own dedicated semaphore (isolated from the ffmpeg/rubberband pool) with a longer job TTL and JSON result endpoint",
         ]
     }
 

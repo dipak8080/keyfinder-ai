@@ -25,8 +25,20 @@ jobs:
             git fetch origin
             git reset --hard origin/main
 
+            # Tag the CURRENTLY RUNNING image as a rollback point, before
+            # building the new one - only if a previous container actually
+            # exists (first-ever deploy won't have one). This is what makes
+            # rollback possible below: without this tag, once we `docker rm`
+            # the old container there's no way back to it.
+            if docker inspect audioforges-api > /dev/null 2>&1; then
+              docker commit audioforges-api audioforges-api:rollback
+              echo "Tagged current container as rollback point."
+            else
+              echo "No existing container found - skipping rollback tag (first deploy)."
+            fi
+
             # Build latest image
-            docker build -t audioforges-api .
+            docker build -t audioforges-api:latest .
 
             # Replace existing container
             docker stop audioforges-api || true
@@ -40,7 +52,48 @@ jobs:
               -e PORT=8000 \
               -v /home/deploy/app/data:/app/data \
               -p 8000:8000 \
-              audioforges-api
+              audioforges-api:latest
 
-            # Clean old images
-            docker image prune -f
+            # Give it time to start - model loading (Whisper + Demucs
+            # imports) takes noticeably longer than a plain FastAPI boot,
+            # so a short sleep avoids a false-negative health check on a
+            # container that's simply still starting up.
+            echo "Waiting for new container to become healthy..."
+            sleep 15
+
+            # Verify the new container is actually healthy before
+            # declaring success. If it's not, roll back to the previously
+            # tagged image (if one exists) instead of leaving a dead site.
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "Health check passed - deploy successful."
+              docker image prune -f
+            else
+              echo "Health check FAILED. Logs from the failed container:"
+              docker logs audioforges-api --tail 100
+
+              if docker inspect audioforges-api:rollback > /dev/null 2>&1; then
+                echo "Rolling back to previous image..."
+                docker stop audioforges-api || true
+                docker rm audioforges-api || true
+
+                docker run -d \
+                  --name audioforges-api \
+                  --restart unless-stopped \
+                  --env-file .env \
+                  -e PORT=8000 \
+                  -v /home/deploy/app/data:/app/data \
+                  -p 8000:8000 \
+                  audioforges-api:rollback
+
+                sleep 10
+                if curl -sf http://localhost:8000/health > /dev/null; then
+                  echo "Rollback successful - previous version is running again."
+                else
+                  echo "ROLLBACK ALSO FAILED - site is likely down. Manual intervention needed."
+                fi
+              else
+                echo "No rollback image available (this was the first deploy) - site is likely down. Manual intervention needed."
+              fi
+
+              exit 1
+            fi

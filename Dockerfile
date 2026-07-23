@@ -1,17 +1,26 @@
 # Official Python slim image - lightweight and fast
 FROM python:3.11-slim
 
-# Install ffmpeg (includes ffprobe), git (needed for pip to install yt-dlp from git),
-# curl/gnupg (needed to add the NodeSource repo for Node.js below), and unzip
-# (needed by Deno's install script, which downloads and unzips a release archive)
-RUN apt-get update && apt-get install -y ffmpeg git curl gnupg unzip && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg (includes ffprobe), rubberband-cli (audio time-stretch/pitch-shift),
+# git (needed for pip to install yt-dlp from git), curl/gnupg (needed to add the
+# NodeSource repo for Node.js below), and unzip (needed by Deno's install script,
+# which downloads and unzips a release archive). --no-install-recommends keeps
+# the image lean by skipping optional recommended packages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    rubberband-cli \
+    git \
+    curl \
+    gnupg \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 20.x - required by the bgutil-ytdlp-pot-provider plugin to
 # generate YouTube PO Tokens (Proof-of-Origin). Without a JS runtime, yt-dlp
 # has no PO Token provider available and YouTube blocks web-client requests
 # with "Sign in to confirm you're not a bot", regardless of cookies.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno - this is a SEPARATE requirement from Node.js above. Node runs
@@ -41,9 +50,10 @@ RUN git clone --single-branch --branch 1.3.1 \
 # Create app directory
 WORKDIR /app
 
-# Copy requirements and install Python packages
+# Copy requirements and install Python packages + pre-download faster-whisper model
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 
 # Copy all your code
 COPY . .
