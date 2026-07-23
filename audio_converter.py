@@ -36,7 +36,9 @@ def convert_audio(input_path: str, output_path: str, source_format: str, target_
         pass
     # Lossy-target formats: pin a reasonable default bitrate for
     # consistent, predictable output size/quality across requests.
-    elif target_format in ("mp3", "aac", "ogg"):
+    # m4a shares this branch with aac since it's just AAC audio in an
+    # MP4 container - same encoder, same bitrate flag applies.
+    elif target_format in ("mp3", "aac", "ogg", "m4a"):
         cmd += ["-b:a", "192k"]
     else:
         # Should be unreachable given validate_conversion_pair() above,
