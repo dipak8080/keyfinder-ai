@@ -49,15 +49,33 @@ FIXES APPLIED (2026-07-19):
      ever visible, looking like "older system logs are missing." System
      logs are now persisted to the same SQLite DB as HTTP logs, so they
      survive restarts and redeploys exactly like HTTP logs already do.
+
+FIXES APPLIED (2026-07-24):
+  7. System log lines had no way to tell which HTTP request produced
+     them, so a busy period of overlapping requests just looked like one
+     undifferentiated wall of log lines - impossible to tell where one
+     request's logs ended and the next one's began. Added a per-request
+     ID (via contextvars, set once in RequestLoggerMiddleware) that gets
+     attached to every log line emitted while that request is in flight,
+     including lines emitted from a background task spawned by that
+     request (asyncio.create_task() captures a snapshot of the current
+     context automatically, so a long-running job like /separate or
+     /speech-to-text still tags its log lines with the request that
+     started it, even after the original HTTP response has already been
+     sent). The frontend uses this to draw a divider only when the
+     request ID actually changes between consecutive log lines, instead
+     of between every single line.
 --------------------------------------------------------------------------
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -71,6 +89,15 @@ ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 router = APIRouter()
+
+# Per-request ID, readable from anywhere in the call stack (including a
+# background task spawned via asyncio.create_task() from inside a request,
+# since asyncio automatically copies the current contextvars context into
+# new tasks). Used to group system log lines by the request that produced
+# them - see BufferLogHandler.emit() below.
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-"
+)
 
 
 # ============================================================
@@ -103,11 +130,25 @@ def _init_db():
                 timestamp TEXT NOT NULL,
                 level TEXT NOT NULL,
                 logger TEXT NOT NULL,
-                message TEXT NOT NULL
+                message TEXT NOT NULL,
+                request_id TEXT
             )
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_timestamp ON system_logs(timestamp)")
+
+        # Migration for databases created before request_id existed -
+        # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table,
+        # so an older deployment's system_logs table won't have this column
+        # yet. ALTER TABLE ADD COLUMN is safe to attempt unconditionally;
+        # SQLite errors only if the column is already there, which we
+        # swallow since that just means this is a fresh table that already
+        # has it from the CREATE TABLE above.
+        try:
+            conn.execute("ALTER TABLE system_logs ADD COLUMN request_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
         conn.commit()
 
 
@@ -141,11 +182,24 @@ def _get_real_client_ip(request: Request) -> str:
 
 
 class RequestLoggerMiddleware(BaseHTTPMiddleware):
-    """Logs every HTTP request to SQLite. Add via app.add_middleware(RequestLoggerMiddleware)."""
+    """Logs every HTTP request to SQLite. Add via app.add_middleware(RequestLoggerMiddleware).
+
+    Also assigns each request a short request_id and sets it on
+    _request_id_ctx for the duration of the request, so any log line
+    emitted anywhere in the call stack while handling this request -
+    including from a background task the request spawns - can be tagged
+    with which request it came from (see BufferLogHandler.emit()).
+    """
 
     async def dispatch(self, request: Request, call_next):
+        request_id = uuid.uuid4().hex[:8]
+        token = _request_id_ctx.set(request_id)
+
         start = time.time()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_id_ctx.reset(token)
         duration_ms = (time.time() - start) * 1000
 
         if not request.url.path.startswith("/admin/logs"):
@@ -227,12 +281,13 @@ class BufferLogHandler(logging.Handler):
         try:
             with get_db() as conn:
                 conn.execute(
-                    "INSERT INTO system_logs (timestamp, level, logger, message) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO system_logs (timestamp, level, logger, message, request_id) VALUES (?, ?, ?, ?, ?)",
                     (
                         datetime.utcfromtimestamp(record.created).isoformat(),
                         record.levelname,
                         record.name,
                         record.getMessage(),
+                        _request_id_ctx.get(),
                     ),
                 )
                 conn.commit()
