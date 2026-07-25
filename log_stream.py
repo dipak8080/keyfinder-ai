@@ -193,13 +193,18 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         request_id = uuid.uuid4().hex[:8]
-        token = _request_id_ctx.set(request_id)
+        # Deliberately never reset this contextvar. Each request runs in
+        # its own asyncio task, so the value can safely linger for the
+        # task's remaining lifetime - and that lingering is exactly what
+        # we want: cleanup/completion lines logged AFTER the response has
+        # been returned (temp-file deletion, "Download complete", cache
+        # writes, etc.) still carry this request's ID and stay grouped
+        # with the request that caused them, instead of falling back to
+        # "-" and splitting into a separate orphan group in the dashboard.
+        _request_id_ctx.set(request_id)
 
         start = time.time()
-        try:
-            response = await call_next(request)
-        finally:
-            _request_id_ctx.reset(token)
+        response = await call_next(request)
         duration_ms = (time.time() - start) * 1000
 
         if not request.url.path.startswith("/admin/logs"):
