@@ -236,12 +236,25 @@ def _check_admin(key: str):
 
 
 @router.get("/admin/logs/http/data")
-def get_http_logs(key: str = Query(...), limit: int = Query(200, le=2000)):
+def get_http_logs(
+    key: str = Query(...),
+    limit: int = Query(200, le=2000),
+    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
+):
     _check_admin(key)
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM request_logs ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if after_id is not None:
+            # Delta mode: used by the dashboard's poll loop. Returns only
+            # genuinely new rows since the client's last known id - on a
+            # quiet server this is an empty list instead of re-sending the
+            # whole window every 3 seconds.
+            rows = conn.execute(
+                "SELECT * FROM request_logs WHERE id > ? ORDER BY id ASC", (after_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM request_logs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
         total = conn.execute("SELECT COUNT(*) as c FROM request_logs").fetchone()["c"]
         success = conn.execute(
             "SELECT COUNT(*) as c FROM request_logs WHERE status_code < 400"
@@ -307,14 +320,26 @@ def attach_system_log_capture():
 
 
 @router.get("/admin/logs/system/data")
-def get_system_logs(key: str = Query(...), limit: int = Query(200, le=2000)):
+def get_system_logs(
+    key: str = Query(...),
+    limit: int = Query(200, le=2000),
+    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
+):
     _check_admin(key)
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if after_id is not None:
+            # Delta mode - see get_http_logs() for the reasoning. Already
+            # ASC (oldest -> newest), so no reversal needed here.
+            rows = conn.execute(
+                "SELECT * FROM system_logs WHERE id > ? ORDER BY id ASC", (after_id,)
+            ).fetchall()
+            logs = [dict(r) for r in rows]
+        else:
+            rows = conn.execute(
+                "SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            logs = [dict(r) for r in rows][::-1]  # oldest -> newest, for chronological display
         total = conn.execute("SELECT COUNT(*) as c FROM system_logs").fetchone()["c"]
-    logs = [dict(r) for r in rows][::-1]  # oldest -> newest, for chronological display
     return JSONResponse({"total": total, "logs": logs})
 
 
