@@ -21,6 +21,18 @@ from config import (
     KEY_DISAGREEMENT_CONFIDENCE_PENALTY,
     BPM_DISAGREEMENT_CONFIDENCE_PENALTY,
 )
+
+# Essentia's KeyExtractor ships several profileType options tuned for
+# different musical content ('temperley', 'krumhansl', 'edma', 'edmm',
+# etc.) - the previous code used the constructor's default profile, which
+# is tuned more toward general/classical tonal material. 'edma' was built
+# and validated by the same UPF Music Technology Group research (the lab
+# behind Essentia itself, and the one Tunebat's own marketing credits) on
+# electronic dance music specifically - directly matching this site's
+# actual traffic (melodic house, DJ tracks). This is the single highest-
+# leverage lever to try first; if accuracy doesn't improve on your own
+# test tracks, 'edmm' (a close variant) is worth trying next.
+KEY_PROFILE_TYPE = "edma"
 from utils import (
     release_memory_to_os,
     cleanup_file,
@@ -34,20 +46,7 @@ from utils import (
 # ========== KEY / BPM CORRECTION HELPERS ==========
 
 def correct_relative_major_minor(audio: np.ndarray, sr: int, key: str, scale: str) -> Tuple[str, str, bool]:
-    """
-    Major/relative-minor pairs (e.g. C major / A minor) share identical note
-    content, so profile-correlation key detectors frequently pick the wrong
-    one of the pair. This checks which of the two candidate tonics has more
-    energy in the BASS register specifically - the bass note is a much more
-    reliable indicator of the true tonal center than the full-spectrum note
-    histogram, because basslines/root motion tend to emphasize the actual
-    tonic far more than incidental melody or harmony notes do.
-
-    Returns (key, scale, was_corrected).
-    """
     try:
-        # Restrict to roughly C1-B3 (~33-247 Hz) - the bass register - using
-        # a CQT chroma with a low fmin and a small number of octaves.
         chroma_bass = librosa.feature.chroma_cqt(
             y=audio, sr=sr,
             fmin=librosa.note_to_hz('C1'),
@@ -71,9 +70,6 @@ def correct_relative_major_minor(audio: np.ndarray, sr: int, key: str, scale: st
         major_bass = bass_energy[major_idx]
         minor_bass = bass_energy[minor_idx]
 
-        # Require the alternate candidate's bass energy to clearly beat the
-        # current pick (not just edge it out) before flipping - this is a
-        # correction for confident mistakes, not a coin-flip tiebreaker.
         MARGIN = 1.15
 
         if scale == 'major' and minor_bass > major_bass * MARGIN:
@@ -94,14 +90,6 @@ def correct_relative_major_minor(audio: np.ndarray, sr: int, key: str, scale: st
 
 
 def correct_bpm_octave_error(bpm: int) -> Tuple[int, bool]:
-    """
-    Tempo detectors commonly report exactly half or double the tempo a
-    listener would actually tap along to. If the raw BPM falls outside the
-    typical [TYPICAL_BPM_MIN, TYPICAL_BPM_MAX] window but doubling or halving
-    it lands inside that window, prefer the in-range value.
-
-    Returns (bpm, was_corrected).
-    """
     if TYPICAL_BPM_MIN <= bpm <= TYPICAL_BPM_MAX:
         return bpm, False
 
@@ -116,8 +104,6 @@ def correct_bpm_octave_error(bpm: int) -> Tuple[int, bool]:
         logger.info(f"BPM octave correction: {bpm} -> {halved} (was above typical range)")
         return int(round(halved)), True
 
-    # Outside typical range but no in-range octave multiple - leave as-is,
-    # this is likely a genuinely very slow or very fast track.
     return bpm, False
 
 
@@ -126,32 +112,28 @@ def correct_bpm_octave_error(bpm: int) -> Tuple[int, bool]:
 def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str, float, int, int]:
     audio = None
     try:
-        # Load audio
         audio = MonoLoader(filename=audio_path, sampleRate=sr)()
 
-        # Key detection - research-grade accuracy
-        key_extractor = KeyExtractor()
+        try:
+            key_extractor = KeyExtractor(profileType=KEY_PROFILE_TYPE)
+        except Exception as profile_err:
+            logger.warning(f"KeyExtractor profileType='{KEY_PROFILE_TYPE}' unavailable ({profile_err}), using default profile")
+            key_extractor = KeyExtractor()
         key, scale, strength = key_extractor(audio)
         key = normalize_key(key)
 
-        # BPM detection - very accurate, handles halves/doubles well
         rhythm_extractor = RhythmExtractor2013()
         bpm, _, confidence, _, _ = rhythm_extractor(audio)
         bpm = int(round(bpm))
 
-        # Confidence mapping
         key_conf = min(99, int(strength * 100 + 15))
         bpm_conf = min(99, int(confidence * 100 + 20))
 
         logger.info(f"Essentia (raw) → Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
 
-        # --- Corrections ---
         key, scale, key_corrected = correct_relative_major_minor(audio, sr, key, scale)
         bpm, bpm_corrected = correct_bpm_octave_error(bpm)
 
-        # A correction means the raw detector's first guess was likely
-        # wrong; report confidence for the *corrected* value slightly more
-        # conservatively than a clean, uncorrected detection would be.
         if key_corrected:
             key_conf = max(50, int(key_conf * 0.9))
         if bpm_corrected:
@@ -183,9 +165,6 @@ def fallback_librosa_key_bpm(audio_path: str) -> Tuple[str, str, float, int, int
 
 
 def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int) -> Tuple[str, str, float, int, int]:
-    """Core Librosa key/BPM estimation, factored out so it can be reused
-    both as the Essentia fallback AND as a lightweight cross-check."""
-    # Enhanced chroma for key (CQT + tuning correction)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
     chroma_mean = np.sum(chroma, axis=1)
     chroma_mean /= chroma_mean.sum() + 1e-9
@@ -224,21 +203,39 @@ def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int) -> Tuple[str, str, float
     return normalize_key(best_key), best_scale, key_conf / 100, bpm, bpm_conf
 
 
+# How much higher the second detector's own confidence needs to be,
+# relative to the primary's, before we actually switch the reported
+# answer to its result on disagreement. >1.0 means Essentia is favored
+# as a tiebreaker when the two are close (reflecting that it's generally
+# the more accurate detector) - this only overrides Essentia when Librosa
+# is clearly, not marginally, more confident on this specific track.
+CROSS_CHECK_OVERRIDE_MARGIN = 1.10
+
+
 def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: float,
                               bpm: int, bpm_conf: int) -> Tuple[str, str, float, int, int, dict]:
     """
     Runs the Librosa estimator as an independent second opinion against the
-    Essentia (primary) result. Essentia's result is always kept as the
-    reported answer - Librosa here is only used to raise or lower confidence
-    based on agreement, and to surface disagreement to the caller/logs for
-    visibility. This never overrides Essentia's key/BPM value, it only
-    adjusts how confident we say we are in it.
+    Essentia (primary) result.
+
+    Previously, Essentia's result was ALWAYS kept as the reported answer
+    regardless of disagreement - Librosa's opinion only nudged a confidence
+    number, so a track where Librosa was actually correct and Essentia
+    wasn't still had Essentia's wrong answer returned to the user. This is
+    a genuine two-detector ensemble now: on disagreement, whichever
+    detector reports meaningfully higher confidence FOR THIS SPECIFIC TRACK
+    wins, rather than one detector unconditionally winning every time. The
+    margin above prevents flip-flopping on marginal confidence differences
+    that don't really indicate one is more trustworthy than the other.
     """
-    agreement = {"key_agrees": None, "bpm_agrees": None}
+    agreement = {
+        "key_agrees": None, "bpm_agrees": None,
+        "key_switched_to_librosa": False, "bpm_switched_to_librosa": False,
+    }
     y = None
     try:
         y, sr = librosa.load(audio_path, sr=44100, mono=True)
-        lb_key, lb_scale, _, lb_bpm, _ = _librosa_key_bpm_from_audio(y, sr)
+        lb_key, lb_scale, lb_key_conf, lb_bpm, lb_bpm_conf = _librosa_key_bpm_from_audio(y, sr)
 
         key_agrees = (lb_key == key and lb_scale == scale)
         # Allow a small tolerance for BPM (detectors can legitimately differ
@@ -249,14 +246,28 @@ def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: fl
         agreement["bpm_agrees"] = bpm_agrees
 
         if not key_agrees:
-            logger.info(f"Cross-check disagreement on key: Essentia={key} {scale} vs Librosa={lb_key} {lb_scale}")
-            key_conf = key_conf * KEY_DISAGREEMENT_CONFIDENCE_PENALTY
+            logger.info(f"Cross-check disagreement on key: Essentia={key} {scale} ({key_conf:.2f}) "
+                        f"vs Librosa={lb_key} {lb_scale} ({lb_key_conf:.2f})")
+            if lb_key_conf > key_conf * CROSS_CHECK_OVERRIDE_MARGIN:
+                logger.info(f"Cross-check override: switching key to Librosa's answer ({lb_key} {lb_scale})")
+                key, scale = lb_key, lb_scale
+                key_conf = lb_key_conf * KEY_DISAGREEMENT_CONFIDENCE_PENALTY
+                agreement["key_switched_to_librosa"] = True
+            else:
+                key_conf = key_conf * KEY_DISAGREEMENT_CONFIDENCE_PENALTY
         else:
             key_conf = min(0.99, key_conf * 1.05)
 
         if not bpm_agrees:
-            logger.info(f"Cross-check disagreement on BPM: Essentia={bpm} vs Librosa={lb_bpm}")
-            bpm_conf = int(bpm_conf * BPM_DISAGREEMENT_CONFIDENCE_PENALTY)
+            logger.info(f"Cross-check disagreement on BPM: Essentia={bpm} ({bpm_conf}) "
+                        f"vs Librosa={lb_bpm} ({lb_bpm_conf})")
+            if lb_bpm_conf > bpm_conf * CROSS_CHECK_OVERRIDE_MARGIN:
+                logger.info(f"Cross-check override: switching BPM to Librosa's answer ({lb_bpm})")
+                bpm = lb_bpm
+                bpm_conf = int(lb_bpm_conf * BPM_DISAGREEMENT_CONFIDENCE_PENALTY)
+                agreement["bpm_switched_to_librosa"] = True
+            else:
+                bpm_conf = int(bpm_conf * BPM_DISAGREEMENT_CONFIDENCE_PENALTY)
         else:
             bpm_conf = min(99, int(bpm_conf * 1.05))
 
