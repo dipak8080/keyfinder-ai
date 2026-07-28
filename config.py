@@ -113,14 +113,7 @@ ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))
 
 ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")
 
-# ---------- CACHING (Cloudflare R2) ----------
-CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "true").lower() == "true"
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
-R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else ""
-
+# ---------- CACHING ----------
 CACHE_MAX_AGE_SECONDS = int(os.environ.get("CACHE_MAX_AGE_SECONDS", str(30 * 24 * 60 * 60)))  # 30 days
 
 # ---------- SEPARATION (Demucs vocal/instrumental remover) ----------

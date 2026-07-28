@@ -109,7 +109,14 @@ def correct_bpm_octave_error(bpm: int) -> Tuple[int, bool]:
 
 # ========== DETECTORS ==========
 
-def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str, float, int, int]:
+def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str, float, int, int, np.ndarray, int]:
+    """
+    Returns (key, scale, key_conf, bpm, bpm_conf, audio, sr) - the loaded
+    audio array is now part of the return value instead of being freed
+    here, so cross_check_with_librosa() can reuse it rather than reloading
+    and resampling the same file from disk a second time. The caller
+    (routes.py) is responsible for freeing it once the cross-check is done.
+    """
     audio = None
     try:
         audio = MonoLoader(filename=audio_path, sampleRate=sr)()
@@ -141,15 +148,19 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
 
         logger.info(f"Essentia (final) → Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
 
-        return key, scale, key_conf / 100, bpm, bpm_conf
+        return key, scale, key_conf / 100, bpm, bpm_conf, audio, sr
 
     except Exception as e:
         logger.warning(f"Essentia failed: {e} → Falling back to improved Librosa")
-        return fallback_librosa_key_bpm(audio_path)
-    finally:
         if audio is not None:
             del audio
         release_memory_to_os()
+        key, scale, key_conf, bpm, bpm_conf = fallback_librosa_key_bpm(audio_path)
+        # Fallback path re-loads independently since Essentia never produced
+        # a usable array on this branch - reload once here so the return
+        # shape stays consistent for the caller regardless of which path ran.
+        y, fb_sr = librosa.load(audio_path, sr=44100, mono=True)
+        return key, scale, key_conf, bpm, bpm_conf, y, fb_sr
 
 
 def fallback_librosa_key_bpm(audio_path: str) -> Tuple[str, str, float, int, int]:
@@ -212,7 +223,7 @@ def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int) -> Tuple[str, str, float
 CROSS_CHECK_OVERRIDE_MARGIN = 1.10
 
 
-def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: float,
+def cross_check_with_librosa(audio: np.ndarray, sr: int, key: str, scale: str, key_conf: float,
                               bpm: int, bpm_conf: int) -> Tuple[str, str, float, int, int, dict]:
     """
     Runs the Librosa estimator as an independent second opinion against the
@@ -227,14 +238,20 @@ def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: fl
     wins, rather than one detector unconditionally winning every time. The
     margin above prevents flip-flopping on marginal confidence differences
     that don't really indicate one is more trustworthy than the other.
+
+    Takes the ALREADY-LOADED audio array (from detect_key_bpm_essentia)
+    instead of a file path - previously this independently reloaded and
+    resampled the same file from disk a second time per request, pure
+    wasted work since Essentia's MonoLoader output (mono, same sample
+    rate) is already numerically equivalent to what librosa.load here
+    would have produced anyway.
     """
     agreement = {
         "key_agrees": None, "bpm_agrees": None,
         "key_switched_to_librosa": False, "bpm_switched_to_librosa": False,
     }
-    y = None
     try:
-        y, sr = librosa.load(audio_path, sr=44100, mono=True)
+        y = audio
         lb_key, lb_scale, lb_key_conf, lb_bpm, lb_bpm_conf = _librosa_key_bpm_from_audio(y, sr)
 
         key_agrees = (lb_key == key and lb_scale == scale)
@@ -277,8 +294,9 @@ def cross_check_with_librosa(audio_path: str, key: str, scale: str, key_conf: fl
         logger.warning(f"Librosa cross-check skipped (non-fatal): {e}")
         return key, scale, key_conf, bpm, bpm_conf, agreement
     finally:
-        if y is not None:
-            del y
+        # No longer frees `audio` here - it's owned by the caller (routes.py
+        # loaded it via detect_key_bpm_essentia), which is responsible for
+        # freeing it exactly once after both detectors are done with it.
         release_memory_to_os()
 
 

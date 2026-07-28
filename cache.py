@@ -1,173 +1,278 @@
 """
-cache.py - Optional R2 (Cloudflare, S3-compatible) caching layer for
-downloaded audio files, keyed by video_id + format.
+cache.py - Local VPS-disk audio cache, replacing the R2 (Cloudflare)
+cache entirely. No more per-GB cloud storage cost.
 
-Fully optional and fails safe: if R2 credentials aren't configured, or
-any R2 call errors for any reason, every function here returns None
-(or does nothing on write) and logs a warning - the caller (routes.py)
-always falls through to a normal fresh download in that case. Caching
-is a pure latency/cost optimization for REPEAT video requests, never a
-hard dependency - the app must keep working exactly as before even if
-R2 is fully unreachable or never configured at all.
+Same public interface and behavior guarantees as the R2 version this
+replaces:
+- get_cached_audio(video_id, fmt) -> (data, title) or (None, None),
+  NEVER raises. Not-configured/error/missing/stale are all treated
+  identically as "not cached" so the caller always falls through to a
+  normal download.
+- put_cached_audio(video_id, fmt, data, title) saves for future
+  requests. NEVER raises - a caching write failure must not fail the
+  download that already succeeded and is about to be returned.
+- Same CACHE_MAX_AGE_SECONDS staleness check as before (an entry older
+  than this is treated as a miss, same as R2 version's LastModified
+  check), PLUS a new total-size cap with LRU eviction, since local disk
+  is finite in a way R2 effectively wasn't.
+
+Storage: actual audio bytes as plain files under CACHE_DIR. A small
+SQLite table (same pattern already used for logs.db elsewhere in this
+project) tracks metadata (video_id, format, title, size, timestamps) -
+consistent with the rest of the codebase rather than a new paradigm.
+Reuses the same persistent bind-mounted directory (/app/data on the VPS)
+that already holds logs.db and survives container redeploys - no new
+deploy.yml/volume change needed.
 """
+import os
+import sqlite3
 import time
-import json
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
+from config import logger, CACHE_MAX_AGE_SECONDS
 
-from config import (
-    logger,
-    CACHE_ENABLED,
-    R2_ACCOUNT_ID,
-    R2_ACCESS_KEY_ID,
-    R2_SECRET_ACCESS_KEY,
-    R2_BUCKET_NAME,
-    R2_ENDPOINT_URL,
-    CACHE_MAX_AGE_SECONDS,
-)
+CACHE_DIR = os.environ.get("CACHE_DIR", "/app/data/cache")
+CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "/app/data/cache_meta.db")
 
-_client = None
+# 25GB default. Prefer setting CACHE_MAX_GB (a plain number like 25) in
+# your .env - easier than computing raw bytes by hand. CACHE_MAX_BYTES
+# still works too if set, and takes priority if both happen to be set.
+_DEFAULT_CACHE_MAX_GB = 25
+CACHE_MAX_BYTES = int(os.environ.get(
+    "CACHE_MAX_BYTES",
+    int(os.environ.get("CACHE_MAX_GB", _DEFAULT_CACHE_MAX_GB)) * 1024 * 1024 * 1024,
+))
 
-
-def _is_configured() -> bool:
-    return bool(
-        CACHE_ENABLED
-        and R2_ACCOUNT_ID
-        and R2_ACCESS_KEY_ID
-        and R2_SECRET_ACCESS_KEY
-        and R2_BUCKET_NAME
-    )
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-def _get_client():
-    """
-    Lazily creates ONE shared boto3 S3 client pointed at R2's
-    S3-compatible endpoint. boto3 clients are thread-safe for concurrent
-    use (this app calls into cache.py via run_blocking from multiple
-    worker threads), so a single shared instance built once is correct
-    and avoids reconnecting on every request.
-    """
-    global _client
-    if _client is not None:
-        return _client
-    if not _is_configured():
-        return None
-    try:
-        _client = boto3.client(
-            "s3",
-            endpoint_url=R2_ENDPOINT_URL,
-            aws_access_key_id=R2_ACCESS_KEY_ID,
-            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4"),
-            region_name="auto",  # R2 ignores region; "auto" is R2's documented value
+def _init_db():
+    with sqlite3.connect(CACHE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_entries (
+                video_id TEXT NOT NULL,
+                format TEXT NOT NULL,
+                title TEXT,
+                file_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                last_accessed_at REAL NOT NULL,
+                PRIMARY KEY (video_id, format)
+            )
+            """
         )
-        logger.info(f"[CACHE] R2 client initialized (bucket: {R2_BUCKET_NAME})")
-    except Exception as e:
-        logger.warning(f"[CACHE] Failed to initialize R2 client (non-fatal, caching disabled): {e}")
-        _client = None
-    return _client
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON cache_entries(last_accessed_at)")
+        conn.commit()
 
 
-def _audio_key(video_id: str, fmt: str) -> str:
-    return f"audio/{video_id}_{fmt}.bin"
+_init_db()
 
 
-def _meta_key(video_id: str, fmt: str) -> str:
-    # Title is stored as a small separate JSON object rather than an S3
-    # object-metadata header, since S3/R2 metadata headers must be
-    # ASCII/latin-1 - many real video titles contain unicode (emoji,
-    # non-Latin scripts) that would either break or get silently mangled
-    # in a metadata header. A JSON body has no such restriction.
-    return f"audio/{video_id}_{fmt}.json"
+@contextmanager
+def _get_db():
+    conn = sqlite3.connect(CACHE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _cache_file_path(video_id: str, fmt: str) -> str:
+    # video_id is a YouTube ID (URL-safe characters only), safe to use
+    # directly in a filename without sanitization.
+    return os.path.join(CACHE_DIR, f"{video_id}_{fmt}.bin")
 
 
 def get_cached_audio(video_id: str, fmt: str) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Returns (audio_bytes, title) if a fresh cache entry exists, else
-    (None, None). NEVER raises - not-configured, network errors, missing
-    object, or a stale entry are all treated identically as "not cached",
-    so the caller always has a clean, simple fallback path (just proceed
-    with a normal download).
+    (None, None). NEVER raises - not-found, missing file, or a stale
+    entry are all treated identically as "not cached", so the caller
+    always has a clean, simple fallback path (just proceed with a
+    normal download) - same guarantee the R2 version made.
     """
     if not video_id:
         return None, None
-    client = _get_client()
-    if client is None:
-        return None, None
 
-    audio_key = _audio_key(video_id, fmt)
     try:
-        response = client.get_object(Bucket=R2_BUCKET_NAME, Key=audio_key)
-        last_modified = response["LastModified"].timestamp()
-        age_seconds = time.time() - last_modified
-        if age_seconds > CACHE_MAX_AGE_SECONDS:
-            logger.info(f"[CACHE] MISS (stale, {int(age_seconds)}s old): {audio_key}")
-            return None, None
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT file_path, title, created_at FROM cache_entries WHERE video_id = ? AND format = ?",
+                (video_id, fmt),
+            ).fetchone()
 
-        data = response["Body"].read()
+            if row is None:
+                logger.info(f"[CACHE] MISS: {video_id}_{fmt}")
+                return None, None
 
-        title = "Unknown"
-        try:
-            meta_response = client.get_object(Bucket=R2_BUCKET_NAME, Key=_meta_key(video_id, fmt))
-            meta = json.loads(meta_response["Body"].read())
-            title = meta.get("title", "Unknown")
-        except Exception:
-            # Missing/corrupt metadata is NOT worth treating as a full
-            # cache miss - the audio itself is still perfectly valid and
-            # far more expensive to regenerate than a title string.
-            pass
+            age_seconds = time.time() - row["created_at"]
+            if age_seconds > CACHE_MAX_AGE_SECONDS:
+                logger.info(f"[CACHE] MISS (stale, {int(age_seconds)}s old): {video_id}_{fmt}")
+                # Clean up the stale entry now rather than leaving dead
+                # weight sitting in the cache until LRU eviction gets to it.
+                _delete_entry(conn, video_id, fmt, row["file_path"])
+                return None, None
 
-        logger.info(f"[CACHE] HIT: {audio_key} ({len(data)} bytes, age {int(age_seconds)}s, title='{title}')")
-        return data, title
+            file_path = row["file_path"]
+            if not os.path.exists(file_path):
+                logger.warning(f"[CACHE] Metadata found for {video_id}_{fmt} but file missing on disk, treating as a miss")
+                conn.execute("DELETE FROM cache_entries WHERE video_id = ? AND format = ?", (video_id, fmt))
+                conn.commit()
+                return None, None
 
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        if error_code in ("NoSuchKey", "404"):
-            logger.info(f"[CACHE] MISS: {audio_key}")
-        else:
-            logger.warning(f"[CACHE] Read error for {audio_key} (non-fatal, proceeding without cache): {e}")
-        return None, None
+            with open(file_path, "rb") as f:
+                data = f.read()
+
+            # Touch last_accessed_at - this is what makes size-cap
+            # eviction genuinely LRU (recently-served files survive
+            # longer) rather than just oldest-created-first.
+            conn.execute(
+                "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
+                (time.time(), video_id, fmt),
+            )
+            conn.commit()
+
+            title = row["title"] or "Unknown"
+            logger.info(f"[CACHE] HIT: {video_id}_{fmt} ({len(data)} bytes, age {int(age_seconds)}s, title='{title}')")
+            return data, title
+
     except Exception as e:
-        logger.warning(f"[CACHE] Unexpected read error for {audio_key} (non-fatal): {e}")
+        logger.warning(f"[CACHE] Unexpected read error for {video_id}_{fmt} (non-fatal): {e}")
         return None, None
 
 
 def put_cached_audio(video_id: str, fmt: str, data: bytes, title: str):
     """
-    Saves a successfully downloaded file (+ its title) to R2 for future
+    Saves a successfully downloaded file (+ its title) for future
     requests. Any failure here is logged and swallowed, NEVER raised -
     a caching write failure must not fail the download that already
-    succeeded and is about to be returned to the user.
+    succeeded and is about to be returned to the user. Triggers
+    size-cap eviction afterward if needed.
     """
     if not video_id or not data:
         return
-    client = _get_client()
-    if client is None:
-        return
 
-    audio_key = _audio_key(video_id, fmt)
+    file_path = _cache_file_path(video_id, fmt)
     try:
-        content_type = "audio/mpeg" if fmt == "mp3" else "audio/wav"
-        client.put_object(Bucket=R2_BUCKET_NAME, Key=audio_key, Body=data, ContentType=content_type)
+        with open(file_path, "wb") as f:
+            f.write(data)
 
-        try:
-            meta_body = json.dumps({"title": title or "Unknown"}).encode("utf-8")
-            client.put_object(
-                Bucket=R2_BUCKET_NAME,
-                Key=_meta_key(video_id, fmt),
-                Body=meta_body,
-                ContentType="application/json",
+        now = time.time()
+        with _get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cache_entries
+                    (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (video_id, fmt, title or "Unknown", file_path, len(data), now, now),
             )
-        except Exception as meta_err:
-            # Audio itself already saved successfully - a failed title
-            # save just means a future cache HIT shows "Unknown" instead
-            # of the real title. Not worth failing the whole cache save
-            # over.
-            logger.warning(f"[CACHE] Saved audio but failed to save title metadata for {audio_key} (non-fatal): {meta_err}")
+            conn.commit()
 
-        logger.info(f"[CACHE] SAVED: {audio_key} ({len(data)} bytes, title='{title}')")
+        logger.info(f"[CACHE] SAVED: {video_id}_{fmt} ({len(data)} bytes, title='{title}')")
+
+        _evict_if_over_limit()
+
     except Exception as e:
-        logger.warning(f"[CACHE] Failed to save {audio_key} (non-fatal, download still succeeded): {e}")
+        logger.warning(f"[CACHE] Failed to save {video_id}_{fmt} (non-fatal, download still succeeded): {e}")
+
+
+def _delete_entry(conn, video_id: str, fmt: str, file_path: str):
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as e:
+        logger.warning(f"[CACHE] Failed to remove stale file {file_path}: {e}")
+    conn.execute("DELETE FROM cache_entries WHERE video_id = ? AND format = ?", (video_id, fmt))
+    conn.commit()
+
+
+def _evict_if_over_limit() -> None:
+    """Deletes least-recently-accessed entries (DB row + file on disk)
+    until total cache size is back under CACHE_MAX_BYTES. Runs
+    automatically after every write - no manual step needed for normal
+    day-to-day operation. This is genuinely new behavior vs. the R2
+    version, since R2 storage wasn't size-constrained the same way local
+    disk is."""
+    try:
+        with _get_db() as conn:
+            total = conn.execute("SELECT COALESCE(SUM(size_bytes), 0) as total FROM cache_entries").fetchone()["total"]
+
+            if total <= CACHE_MAX_BYTES:
+                return
+
+            evicted_count = 0
+            evicted_bytes = 0
+
+            while total > CACHE_MAX_BYTES:
+                oldest = conn.execute(
+                    "SELECT video_id, format, file_path, size_bytes FROM cache_entries "
+                    "ORDER BY last_accessed_at ASC LIMIT 1"
+                ).fetchone()
+
+                if oldest is None:
+                    break
+
+                try:
+                    if os.path.exists(oldest["file_path"]):
+                        os.remove(oldest["file_path"])
+                except OSError as e:
+                    logger.warning(f"[CACHE] Failed to remove evicted file {oldest['file_path']}: {e}")
+
+                conn.execute(
+                    "DELETE FROM cache_entries WHERE video_id = ? AND format = ?",
+                    (oldest["video_id"], oldest["format"]),
+                )
+                conn.commit()
+
+                total -= oldest["size_bytes"]
+                evicted_count += 1
+                evicted_bytes += oldest["size_bytes"]
+
+            logger.info(
+                f"[CACHE] Evicted {evicted_count} least-recently-used entries "
+                f"({evicted_bytes / (1024*1024):.1f} MB) to stay under the "
+                f"{CACHE_MAX_BYTES / (1024*1024*1024):.1f} GB cap"
+            )
+    except Exception as e:
+        logger.warning(f"[CACHE] Eviction check failed (non-fatal): {e}")
+
+
+def get_cache_stats() -> dict:
+    """For the admin endpoint - current cache size, entry count, and the
+    configured limit, so you can check status without SSHing in."""
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as total_bytes FROM cache_entries"
+        ).fetchone()
+    return {
+        "entry_count": row["count"],
+        "total_bytes": row["total_bytes"],
+        "total_gb": round(row["total_bytes"] / (1024 * 1024 * 1024), 3),
+        "max_bytes": CACHE_MAX_BYTES,
+        "max_gb": round(CACHE_MAX_BYTES / (1024 * 1024 * 1024), 3),
+        "percent_full": round(100 * row["total_bytes"] / CACHE_MAX_BYTES, 1) if CACHE_MAX_BYTES > 0 else 0,
+    }
+
+
+def clear_cache() -> dict:
+    """For the admin endpoint - manually wipes the entire cache (all
+    files + all metadata), for whenever you want a clean slate without
+    waiting for automatic LRU eviction to get there gradually."""
+    with _get_db() as conn:
+        rows = conn.execute("SELECT file_path FROM cache_entries").fetchall()
+        removed = 0
+        for row in rows:
+            try:
+                if os.path.exists(row["file_path"]):
+                    os.remove(row["file_path"])
+                    removed += 1
+            except OSError as e:
+                logger.warning(f"[CACHE] Failed to remove {row['file_path']} during clear: {e}")
+        conn.execute("DELETE FROM cache_entries")
+        conn.commit()
+    logger.info(f"[CACHE] Manually cleared - removed {removed} files")
+    return {"files_removed": removed}
