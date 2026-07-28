@@ -319,11 +319,19 @@ async def analyze_audio(file: UploadFile = File(...)):
         if ANALYSIS_MAX_SECONDS is not None:
             analysis_path = await run_blocking(trim_audio_for_analysis, file_path, ANALYSIS_MAX_SECONDS)
 
-        key, scale, key_conf, bpm, bpm_conf = await run_blocking(detect_key_bpm_essentia, analysis_path)
+        audio_array = None
+        try:
+            key, scale, key_conf, bpm, bpm_conf, audio_array, essentia_sr = await run_blocking(
+                detect_key_bpm_essentia, analysis_path
+            )
 
-        key, scale, key_conf, bpm, bpm_conf, agreement = await run_blocking(
-            cross_check_with_librosa, analysis_path, key, scale, key_conf, bpm, bpm_conf
-        )
+            key, scale, key_conf, bpm, bpm_conf, agreement = await run_blocking(
+                cross_check_with_librosa, audio_array, essentia_sr, key, scale, key_conf, bpm, bpm_conf
+            )
+        finally:
+            if audio_array is not None:
+                del audio_array
+            release_memory_to_os()
 
         camelot = get_camelot(key, scale)
         key_name = f"{key} {scale}"
