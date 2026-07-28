@@ -35,8 +35,6 @@ from config import (
     MAX_UPLOAD_BYTES,
     ANALYSIS_MAX_SECONDS,
     ADMIN_STATUS_KEY,
-    CACHE_ENABLED,
-    R2_BUCKET_NAME,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     MAX_CONCURRENT_SEPARATIONS,
@@ -104,7 +102,7 @@ from youtube import (
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
-from cache import get_cached_audio, put_cached_audio
+from cache import get_cached_audio, put_cached_audio, get_cache_stats, clear_cache
 from monitoring import record_result, get_status_snapshot
 from download_progress import make_progress_hook
 from jobs import (
@@ -1667,11 +1665,19 @@ async def speech_to_text_result(job_id: str):
         raise HTTPException(404, "Transcript not found (it may have expired).")
     return JSONResponse(result)
 
+@router.post("/admin/clear-cache")
+async def admin_clear_cache(key: str = Query(...)):
+    if key != ADMIN_STATUS_KEY:
+        raise HTTPException(403, "Invalid admin key")
+    result = clear_cache()
+    logger.info(f"[CACHE] Admin manually cleared cache: {result}")
+    return {"status": "cache cleared", **result}
+
 
 @router.get("/")
 async def root():
     return {
-        "status": "Audio Analysis API v13.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + R2 CACHING + PERMANENT-ERROR 404 + VOCAL SEPARATION + AUDIO CONVERSION + AUDIO TRIM + VOLUME ADJUSTMENT + PITCH SHIFT + TEMPO CHANGE + AUDIO REVERSE + NOISE REDUCTION + VOICE CLEANUP + ECHO REMOVAL + SILENCE REMOVAL + SPEECH-TO-TEXT TRANSCRIPTION",
+        "status": "Audio Analysis API v13.4 - ESSENTIA FIXED + KEY/BPM CORRECTIONS + MONITORING + RATE LIMITING + DURATION CAP + PROXY FALLBACK + COOKIE ALERTS + GEO-RESTRICTION HANDLING + MULTI-ACCOUNT COOKIE ROTATION + SINGLE-PASS EXTRACTION + LOCAL-DISK CACHING + PERMANENT-ERROR 404 + VOCAL SEPARATION + AUDIO CONVERSION + AUDIO TRIM + VOLUME ADJUSTMENT + PITCH SHIFT + TEMPO CHANGE + AUDIO REVERSE + NOISE REDUCTION + VOICE CLEANUP + ECHO REMOVAL + SILENCE REMOVAL + SPEECH-TO-TEXT TRANSCRIPTION",
         "accuracy": "Essentia research-grade + relative major/minor correction + BPM octave correction + Librosa cross-check",
         "engine": "Essentia KeyExtractor + RhythmExtractor2013 + Demucs (separation) + ffmpeg (conversion, trim, volume, reverse, noise reduction, voice cleanup, echo removal, silence removal) + rubberband (pitch, tempo) + faster-whisper (transcription)",
         "fixes": [
@@ -1703,7 +1709,7 @@ async def root():
             "CORS locked to ALLOWED_ORIGINS",
             "Per-IP rate limiting on /download, /analyze, /separate, /convert, /trim, /volume, /pitch, /tempo, /reverse, /noise-remove, /voice-clean, /echo-remove, /silence-remove, and /speech-to-text",
             "Failure-spike monitoring with optional webhook alerting",
-            "R2 caching for repeat download requests",
+            "Local-disk caching for repeat download requests",
             "Clean 404 on permanently unavailable videos",
             "Async Demucs vocal/instrumental separation with job polling, local-disk stem storage, and TTL cleanup",
             "Async ffmpeg audio format conversion with job polling and TTL cleanup",
@@ -1739,8 +1745,9 @@ async def admin_status(key: str = Query(...)):
         "accounts_available": len(get_cookie_accounts()),
     }
     snapshot["cache"] = {
-        "enabled": CACHE_ENABLED,
-        "configured": bool(R2_BUCKET_NAME),
+        "enabled": True,
+        "backend": "local-disk",
+        **get_cache_stats(),
     }
     return snapshot
 
