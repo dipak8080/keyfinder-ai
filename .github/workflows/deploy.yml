@@ -67,6 +67,8 @@ jobs:
             if curl -sf http://localhost:8000/health > /dev/null; then
               echo "Health check passed - deploy successful."
               docker image prune -f
+              docker builder prune -af
+              echo "Cleaned up old images and build cache."
             else
               echo "Health check FAILED. Logs from the failed container:"
               docker logs audioforges-api --tail 100

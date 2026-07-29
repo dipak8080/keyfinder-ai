@@ -1,0 +1,10 @@
+data/
+uploads/
+separated/
+audio_tools_output/
+.git/
+.github/
+__pycache__/
+*.pyc
+.env
+*.log
