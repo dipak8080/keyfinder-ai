@@ -131,6 +131,7 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
 
         rhythm_extractor = RhythmExtractor2013()
         bpm, _, confidence, _, _ = rhythm_extractor(audio)
+        logger.info(f"Essentia raw (unrounded) BPM: {bpm:.4f}")
         bpm = int(round(bpm))
 
         key_conf = min(99, int(strength * 100 + 15))
