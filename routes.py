@@ -91,6 +91,9 @@ from youtube import (
     download_with_fallback,
     is_bot_check_error,
     is_geo_restricted_error,
+    is_age_restricted_error,
+    is_members_only_error,
+    is_not_yet_live_error,
     is_permanent_error,
     is_valid_youtube_url,
     extract_video_id,
@@ -234,6 +237,31 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     "This video is restricted by the uploader to specific countries and "
                     "isn't available from our server's location. This isn't something we "
                     "can fix on our end for this particular video - try a different one."
+                )
+
+            if is_age_restricted_error(error_text):
+                logger.warning(f"Age-restricted video blocked download for URL: {url}")
+                raise HTTPException(
+                    403,
+                    "This video is age-restricted by YouTube and requires a verified "
+                    "account to view. We're not able to download age-restricted content "
+                    "at this time - try a different video."
+                )
+
+            if is_members_only_error(error_text):
+                logger.warning(f"Members-only video blocked download for URL: {url}")
+                raise HTTPException(
+                    403,
+                    "This video is exclusive to that channel's paid members and isn't "
+                    "publicly downloadable - try a different video."
+                )
+
+            if is_not_yet_live_error(error_text):
+                logger.warning(f"Not-yet-live video blocked download for URL: {url}")
+                raise HTTPException(
+                    409,
+                    "This video is a scheduled premiere or live stream that hasn't "
+                    "started yet - try again once it's live, or try a different video."
                 )
 
             if is_bot_check_error(error_text):

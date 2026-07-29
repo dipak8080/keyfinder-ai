@@ -69,7 +69,11 @@ PERMANENT_ERROR_MARKERS = (
     "account associated with this video has been terminated",
     "this video is no longer available",
     "video is no longer available",
-    "copyright",
+    "copyright claim",  # narrowed from bare "copyright" - the bare word
+                         # risks false-matching a message that merely
+                         # MENTIONS copyright without actually being a
+                         # takedown (e.g. a disclaimer sentence), which
+                         # would wrongly give up on a retryable error.
     "this video does not exist",
     "unable to extract video data",
     # Safety net for junk/garbage/non-YouTube URLs that slip past
@@ -116,6 +120,46 @@ GEO_RESTRICTED_MARKERS = (
     "content is not available in your country",
     "video is not available in your country",
     "not available in your country",
+)
+
+# Errors meaning YouTube requires an age-verified account to view this
+# specific video. Distinct from PERMANENT_ERROR_MARKERS because a
+# DIFFERENT cookie account (if one happens to be age-verified) genuinely
+# could fix this - unlike a deleted/private video, no IP or cookie in the
+# world helps there. But also distinct from a normal retryable error:
+# retrying the SAME account 3x with backoff, or trying via proxy, can
+# never succeed either - only a different, age-verified account can. So
+# this fails fast within extract_info_with_retry (no pointless same-
+# account backoff) AND skips the proxy tier in download_with_fallback
+# (proxy fixes IP reputation, not account identity), but still allows
+# rotation to try the next cookie account, if any remain.
+AGE_RESTRICTED_MARKERS = (
+    "sign in to confirm your age",
+    "age-restricted",
+    "this video may be inappropriate for some users",
+)
+
+# Errors meaning this video is locked behind a YouTube channel membership
+# (a paid subscription to that specific channel), not a general YouTube
+# account issue. Same shape as age-restriction: a DIFFERENT cookie
+# account (one that happens to be a paying member of that channel) could
+# fix it, but the SAME account retried 3x can't, and a different IP via
+# proxy does nothing for a membership requirement either.
+MEMBERS_ONLY_MARKERS = (
+    "join this channel to get access to members-only content",
+    "this video is available to this channel's members",
+    "members-only content",
+)
+
+# Errors meaning the video is a scheduled premiere/live stream that hasn't
+# started yet. Genuinely unfixable RIGHT NOW by any cookie account, IP, or
+# retry count - but not a "gone forever" error either (it will start
+# working once the stream actually begins), so it gets its own fail-fast
+# category rather than being lumped in with permanently-dead videos.
+NOT_YET_LIVE_MARKERS = (
+    "this live event will begin in",
+    "premieres in",
+    "this video is a live stream that has not yet started",
 )
 
 
@@ -212,6 +256,42 @@ def is_geo_restricted_error(error_text: str) -> bool:
     return any(marker in normalized for marker in GEO_RESTRICTED_MARKERS)
 
 
+def is_age_restricted_error(error_text: str) -> bool:
+    """
+    True if YouTube is blocking this video behind an age-verification
+    wall. Used by extract_info_with_retry as a fail-fast signal (same-
+    account retries can't fix this) and by download_with_fallback to skip
+    the proxy tier specifically (a different IP doesn't fix an account-
+    identity requirement) while still allowing rotation to the next
+    cookie account, if one happens to be age-verified.
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in AGE_RESTRICTED_MARKERS)
+
+
+def is_members_only_error(error_text: str) -> bool:
+    """
+    True if this video is locked behind a YouTube channel membership.
+    Same handling shape as age-restriction: fail fast on same-account
+    retries, skip the proxy tier, but allow account rotation to try a
+    different (possibly member) account.
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in MEMBERS_ONLY_MARKERS)
+
+
+def is_not_yet_live_error(error_text: str) -> bool:
+    """
+    True if this is a scheduled premiere/live stream that hasn't started.
+    No cookie account, IP, or retry count fixes this right now - it's
+    fundamentally a timing issue, not an auth or availability one. Treated
+    as fail-fast + skip-proxy, same as age-restriction/members-only, since
+    none of those tools can make a stream start early.
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in NOT_YET_LIVE_MARKERS)
+
+
 def is_ip_block_error(error_text: str) -> bool:
     """
     True if this error looks like a KNOWN IP-reputation problem - the
@@ -237,8 +317,9 @@ def is_permanent_error(error_text: str) -> bool:
     """True if the error means the video itself can never be downloaded -
     no amount of retrying, cookie refreshing, or proxy switching helps.
     This is the ONLY thing that skips the proxy tier - see
-    download_with_fallback. Geo-restriction is deliberately NOT here (see
-    GEO_RESTRICTED_MARKERS) since a differently-located proxy CAN fix it."""
+    download_with_fallback. Geo-restriction, age-restriction, members-only,
+    and not-yet-live are deliberately NOT here (see their own marker lists
+    above) since a different cookie account or timing CAN fix those."""
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
@@ -615,9 +696,9 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
             # between backoff sleeps. Every subprocess/API round trip
             # (webpage + 4 player-client calls + Node PO-token + Deno
             # JS-challenge) that a retry would otherwise repeat is pure
-            # wasted Railway compute in this case. Failing fast here does
-            # NOT change which account gets tried next, whether rotation
-            # or proxy fallback happens, or what the user ultimately sees -
+            # wasted compute in this case. Failing fast here does NOT
+            # change which account gets tried next, whether rotation or
+            # proxy fallback happens, or what the user ultimately sees -
             # download_with_fallback's rotation/alerting logic (which
             # reads this same flag) is completely unchanged; this only
             # removes pointless retries BEFORE that logic ever runs.
@@ -641,6 +722,38 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 logger.warning(
                     f"Attempt {attempt}: IP-block/bot-check/geo-restriction error "
                     f"detected - not retrying on the same IP: {error_text}"
+                )
+                raise
+
+            if is_age_restricted_error(error_text):
+                # Retrying with the SAME cookie account can't fix an
+                # age-verification requirement - nothing about the account
+                # changes between backoff sleeps. Fail fast; the caller
+                # (download_with_fallback) decides whether a different
+                # cookie account should be tried, and skips the proxy tier
+                # entirely for this error type since a different IP
+                # doesn't fix an account-identity requirement.
+                logger.warning(
+                    f"Attempt {attempt}: age-restricted video, this cookie "
+                    f"account isn't age-verified - not retrying: {error_text}"
+                )
+                raise
+
+            if is_members_only_error(error_text):
+                # Same reasoning as age-restriction: this account isn't a
+                # channel member, and retrying won't change that.
+                logger.warning(
+                    f"Attempt {attempt}: members-only video, this cookie "
+                    f"account isn't a member - not retrying: {error_text}"
+                )
+                raise
+
+            if is_not_yet_live_error(error_text):
+                # A scheduled premiere/stream that hasn't started - no
+                # retry count, cookie, or IP makes it start early.
+                logger.warning(
+                    f"Attempt {attempt}: video is a premiere/live stream that "
+                    f"hasn't started yet - not retrying: {error_text}"
                 )
                 raise
 
@@ -676,17 +789,25 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 doubly: extract_info_with_retry already stops retrying
                 that account's own backoff loop the instant it's flagged,
                 and this loop then moves on to the next account rather
-                than trying the dead one again). If an attempt fails for
-                ANY OTHER reason (IP-block, permanent, unknown), rotation
-                stops immediately - swapping cookie accounts won't fix an
-                IP-reputation or availability problem, so we fall through
-                to Layer 2 instead of wasting the remaining accounts on a
-                failure they can't fix either.
+                than trying the dead one again). If an attempt fails with
+                an age-restriction, members-only, or not-yet-live error,
+                rotation also continues to the next account (a different
+                account might genuinely be verified/a member), WITHOUT
+                disabling the current one (it isn't dead, just not
+                privileged for this specific video). If an attempt fails
+                for ANY OTHER reason (IP-block, permanent, unknown),
+                rotation stops immediately - swapping cookie accounts
+                won't fix an IP-reputation or availability problem, so we
+                fall through to Layer 2 instead of wasting the remaining
+                accounts on a failure they can't fix either.
 
       Layer 2 - PROXY, tried for any Layer 1 failure EXCEPT a confirmed
-                permanent error (video deleted/private/copyright - see
-                is_permanent_error). Uses whichever cookie account is
-                STILL available (not yet disabled) at this point, if any -
+                permanent error, age-restriction, members-only, or
+                not-yet-live error (see is_permanent_error and the three
+                account-identity/timing checks below) - a different IP
+                fixes IP-reputation problems, not account privilege or
+                stream timing. Uses whichever cookie account is STILL
+                available (not yet disabled) at this point, if any -
                 proxy fixes IP reputation, cookies fix session identity,
                 the two are independent problems that can combine (e.g. an
                 IP-blocked request might still benefit from a valid
@@ -741,6 +862,19 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 _disable_cookie_account(account_path)
                 continue  # try the next account, if any remain
 
+            if (
+                is_age_restricted_error(error_text)
+                or is_members_only_error(error_text)
+                or is_not_yet_live_error(error_text)
+            ):
+                # This account isn't privileged for this specific video
+                # (not age-verified, not a member) or the video simply
+                # hasn't started - a DIFFERENT account might still work,
+                # so keep rotating WITHOUT disabling this one (it's not
+                # dead, just unprivileged/early for this particular
+                # video).
+                continue
+
             # Failure wasn't confirmed as THIS account's identity being
             # rejected (could be IP-block, transient, or cookie-less) -
             # rotating accounts further won't help. Stop here and let the
@@ -750,6 +884,22 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     first_error = str(last_error)
 
     if is_permanent_error(first_error):
+        raise last_error
+
+    if (
+        is_age_restricted_error(first_error)
+        or is_members_only_error(first_error)
+        or is_not_yet_live_error(first_error)
+    ):
+        # Every available cookie account hit the same account-privilege
+        # or timing wall. A different IP (the proxy) does nothing for
+        # these, so skip that tier entirely rather than burning proxy
+        # bandwidth and ~30s on a guaranteed repeat failure.
+        logger.warning(
+            "[PROXY] Skipping proxy tier - failure is an age-restriction/"
+            "members-only/not-yet-live requirement, not an IP/bot-check "
+            "problem: no available cookie account satisfies it for this video."
+        )
         raise last_error
 
     if not proxy_url:
