@@ -23,8 +23,15 @@ consistent with the rest of the codebase rather than a new paradigm.
 Reuses the same persistent bind-mounted directory (/app/data on the VPS)
 that already holds logs.db and survives container redeploys - no new
 deploy.yml/volume change needed.
+
+The cache size cap (CACHE_MAX_BYTES) can be overridden two ways:
+- CACHE_MAX_GB / CACHE_MAX_BYTES env vars (checked once at startup)
+- set_cache_max_gb() at runtime via the admin panel, which persists the
+  override into the cache_settings table so it survives container
+  restarts without needing to touch .env or redeploy.
 """
 import os
+import shutil
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -64,6 +71,18 @@ def _init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON cache_entries(last_accessed_at)")
+        # Small key/value settings table - currently just holds an
+        # admin-set override for the cache size cap, so it can be changed
+        # from the admin panel at runtime and survive container restarts,
+        # without anyone needing to touch .env or redeploy.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -78,6 +97,28 @@ def _get_db():
         yield conn
     finally:
         conn.close()
+
+
+def _load_persisted_max_bytes(env_default: int) -> int:
+    """An admin-set override (via set_cache_max_gb below) takes priority
+    over the CACHE_MAX_GB/CACHE_MAX_BYTES env vars once one has been
+    saved - this is what makes the limit editable from the admin panel
+    without touching .env or restarting the container."""
+    try:
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT value FROM cache_settings WHERE key = 'max_bytes'"
+            ).fetchone()
+            if row:
+                return int(row["value"])
+    except Exception as e:
+        logger.warning(f"[CACHE] Failed to load persisted cache limit override (non-fatal): {e}")
+    return env_default
+
+
+# The env-derived value above is only the DEFAULT - _load_persisted_max_bytes
+# checks for an admin-set override in the DB and uses that instead if present.
+CACHE_MAX_BYTES = _load_persisted_max_bytes(CACHE_MAX_BYTES)
 
 
 def _cache_file_path(video_id: str, fmt: str) -> str:
@@ -241,14 +282,31 @@ def _evict_if_over_limit() -> None:
         logger.warning(f"[CACHE] Eviction check failed (non-fatal): {e}")
 
 
+def get_disk_usage() -> dict:
+    """Real filesystem usage for the disk the cache actually lives on -
+    separate from the cache's own bookkeeping below, since the VPS's disk
+    is also shared with the OS, Docker images, and every other app file.
+    Lets the admin panel show 'X of Y GB used on the whole disk' next to
+    'X of Y GB allocated to the cache specifically', so picking a cache
+    size isn't a guessing game against unknown free space."""
+    total, used, free = shutil.disk_usage(CACHE_DIR)
+    return {
+        "disk_total_gb": round(total / (1024 ** 3), 2),
+        "disk_used_gb": round(used / (1024 ** 3), 2),
+        "disk_free_gb": round(free / (1024 ** 3), 2),
+        "disk_percent_used": round(100 * used / total, 1) if total > 0 else 0,
+    }
+
+
 def get_cache_stats() -> dict:
-    """For the admin endpoint - current cache size, entry count, and the
-    configured limit, so you can check status without SSHing in."""
+    """For the admin endpoint - current cache size, entry count, the
+    configured limit, and real disk usage, so you can check status
+    without SSHing in."""
     with _get_db() as conn:
         row = conn.execute(
             "SELECT COUNT(*) as count, COALESCE(SUM(size_bytes), 0) as total_bytes FROM cache_entries"
         ).fetchone()
-    return {
+    stats = {
         "entry_count": row["count"],
         "total_bytes": row["total_bytes"],
         "total_gb": round(row["total_bytes"] / (1024 * 1024 * 1024), 3),
@@ -256,6 +314,31 @@ def get_cache_stats() -> dict:
         "max_gb": round(CACHE_MAX_BYTES / (1024 * 1024 * 1024), 3),
         "percent_full": round(100 * row["total_bytes"] / CACHE_MAX_BYTES, 1) if CACHE_MAX_BYTES > 0 else 0,
     }
+    stats.update(get_disk_usage())
+    return stats
+
+
+def set_cache_max_gb(gb: float) -> dict:
+    """Updates the cache size cap at runtime from the admin panel and
+    persists it to the settings table so it survives container restarts -
+    no .env edit or redeploy needed. Immediately re-checks eviction in
+    case the new limit is now below what's currently cached."""
+    global CACHE_MAX_BYTES
+    if gb <= 0:
+        raise ValueError("gb must be a positive number")
+
+    new_max_bytes = int(gb * 1024 * 1024 * 1024)
+    with _get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_settings (key, value) VALUES ('max_bytes', ?)",
+            (str(new_max_bytes),),
+        )
+        conn.commit()
+
+    CACHE_MAX_BYTES = new_max_bytes
+    logger.info(f"[CACHE] Max cache size updated to {gb} GB via admin panel")
+    _evict_if_over_limit()
+    return get_cache_stats()
 
 
 def clear_cache() -> dict:

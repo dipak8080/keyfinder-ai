@@ -102,7 +102,7 @@ from youtube import (
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
-from cache import get_cached_audio, put_cached_audio, get_cache_stats, clear_cache
+from cache import get_cached_audio, put_cached_audio, get_cache_stats, clear_cache, set_cache_max_gb
 from monitoring import record_result, get_status_snapshot
 from download_progress import make_progress_hook
 from jobs import (
@@ -1681,6 +1681,15 @@ async def admin_clear_cache(key: str = Query(...)):
     logger.info(f"[CACHE] Admin manually cleared cache: {result}")
     return {"status": "cache cleared", **result}
 
+@router.post("/admin/cache/limit")
+async def admin_set_cache_limit(key: str = Query(...), gb: float = Query(..., gt=0, le=1000)):
+    if key != ADMIN_STATUS_KEY:
+        raise HTTPException(403, "Invalid admin key")
+    try:
+        stats = set_cache_max_gb(gb)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"status": "updated", **stats}
 
 @router.get("/")
 async def root():

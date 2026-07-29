@@ -32,7 +32,7 @@ from config import (
 # actual traffic (melodic house, DJ tracks). This is the single highest-
 # leverage lever to try first; if accuracy doesn't improve on your own
 # test tracks, 'edmm' (a close variant) is worth trying next.
-KEY_PROFILE_TYPE = "edma"
+KEY_PROFILE_TYPE = "bgate"
 from utils import (
     release_memory_to_os,
     cleanup_file,
