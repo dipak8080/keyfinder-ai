@@ -2879,6 +2879,390 @@ async def youtube_stems_download(job_id: str, stem: str = Query(...)):
     return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
 
 
+
+# ============================================================
+# /fade - Fade in/out (async job flow)
+# ============================================================
+
+async def _run_fade_background(job_id: str, input_path: str, output_path: str,
+                                  source_format: str, fade_in_seconds: float,
+                                  fade_out_seconds: float, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(apply_fade, input_path, output_path, source_format, fade_in_seconds, fade_out_seconds)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[FADE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[FADE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Fade failed unexpectedly.")
+            logger.error(f"[FADE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/fade", succeeded)
+
+
+@router.post(
+    "/fade",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=FADE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=FADE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def fade_route(
+    file: UploadFile = File(...),
+    fade_in_seconds: float = Form(0.0),
+    fade_out_seconds: float = Form(0.0),
+):
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if fade_in_seconds <= 0 and fade_out_seconds <= 0:
+        raise HTTPException(400, "At least one of fade_in_seconds or fade_out_seconds must be greater than 0.")
+    if fade_in_seconds < 0 or fade_in_seconds > FADE_MAX_SECONDS:
+        raise HTTPException(400, f"fade_in_seconds must be between 0 and {FADE_MAX_SECONDS}.")
+    if fade_out_seconds < 0 or fade_out_seconds > FADE_MAX_SECONDS:
+        raise HTTPException(400, f"fade_out_seconds must be between 0 and {FADE_MAX_SECONDS}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="fade")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_fade_background(
+        job_id, input_path, output_path, source_format, fade_in_seconds, fade_out_seconds, file.filename
+    ))
+
+    logger.info(f"[FADE] Job {job_id} queued: '{file.filename}' (in={fade_in_seconds}s out={fade_out_seconds}s)")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/fade/status/{job_id}")
+async def fade_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "fade":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {"job_id": job_id, "status": job["status"], "title": job.get("title"), "error": job.get("error")}
+
+
+@router.get("/fade/preview/{job_id}")
+async def fade_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "fade")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/fade/download/{job_id}")
+async def fade_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "fade")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"faded.{fmt}")
+
+
+# ============================================================
+# /channels - Mono <-> stereo conversion (async job flow)
+# ============================================================
+
+async def _run_channels_background(job_id: str, input_path: str, output_path: str,
+                                       source_format: str, target: str, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(convert_channels, input_path, output_path, source_format, target)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[CHANNELS] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[CHANNELS] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Channel conversion failed unexpectedly.")
+            logger.error(f"[CHANNELS] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/channels", succeeded)
+
+
+@router.post(
+    "/channels",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=CHANNELS_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=CHANNELS_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def channels_route(file: UploadFile = File(...), target: str = Form(...)):
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    target = target.strip().lower()
+    if target not in ("mono", "stereo"):
+        raise HTTPException(400, "target must be 'mono' or 'stereo'.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="channels")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_channels_background(job_id, input_path, output_path, source_format, target, file.filename))
+
+    logger.info(f"[CHANNELS] Job {job_id} queued: '{file.filename}' -> {target}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/channels/status/{job_id}")
+async def channels_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "channels":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {"job_id": job_id, "status": job["status"], "title": job.get("title"), "error": job.get("error")}
+
+
+@router.get("/channels/preview/{job_id}")
+async def channels_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "channels")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/channels/download/{job_id}")
+async def channels_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "channels")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"converted.{fmt}")
+
+
+# ============================================================
+# /resample - Sample rate / bit depth conversion (async job flow)
+# ============================================================
+
+async def _run_resample_background(job_id: str, input_path: str, output_path: str,
+                                       source_format: str, sample_rate: int, bit_depth,
+                                       original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(resample_audio, input_path, output_path, source_format, sample_rate, bit_depth)
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(f"[RESAMPLE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[RESAMPLE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Resampling failed unexpectedly.")
+            logger.error(f"[RESAMPLE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/resample", succeeded)
+
+
+@router.post(
+    "/resample",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=RESAMPLE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=RESAMPLE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def resample_route(
+    file: UploadFile = File(...),
+    sample_rate: int = Form(...),
+    bit_depth: int = Form(None),
+):
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if sample_rate not in RESAMPLE_ALLOWED_RATES:
+        raise HTTPException(400, f"sample_rate must be one of: {', '.join(str(r) for r in RESAMPLE_ALLOWED_RATES)}")
+    if bit_depth is not None and bit_depth not in RESAMPLE_ALLOWED_BIT_DEPTHS:
+        raise HTTPException(400, f"bit_depth must be one of: {', '.join(str(b) for b in RESAMPLE_ALLOWED_BIT_DEPTHS)}")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="resample")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_resample_background(
+        job_id, input_path, output_path, source_format, sample_rate, bit_depth, file.filename
+    ))
+
+    logger.info(f"[RESAMPLE] Job {job_id} queued: '{file.filename}' -> {sample_rate}Hz")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/resample/status/{job_id}")
+async def resample_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "resample":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {"job_id": job_id, "status": job["status"], "title": job.get("title"), "error": job.get("error")}
+
+
+@router.get("/resample/preview/{job_id}")
+async def resample_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "resample")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/resample/download/{job_id}")
+async def resample_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "resample")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"resampled.{fmt}")
+
+
+# ============================================================
+# /ringtone - Trim + M4A-as-M4R ringtone maker (async job flow)
+#
+# .m4r is not a distinct codec - it's an M4A (AAC) file that iOS
+# recognizes by extension. make_ringtone() writes standard .m4a bytes;
+# only the download route's filename carries the .m4r extension.
+# ============================================================
+
+async def _run_ringtone_background(job_id: str, input_path: str, output_path: str,
+                                       start_seconds: float, duration_seconds: float, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            await run_blocking(make_ringtone, input_path, output_path, start_seconds, duration_seconds)
+            mark_tool_complete(job_id, original_filename, output_path, "m4a")
+            logger.info(f"[RINGTONE] Job {job_id} finished successfully")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[RINGTONE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Ringtone creation failed unexpectedly.")
+            logger.error(f"[RINGTONE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/ringtone", succeeded)
+
+
+@router.post(
+    "/ringtone",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=RINGTONE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=RINGTONE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def ringtone_route(
+    file: UploadFile = File(...),
+    start_seconds: float = Form(0.0),
+    duration_seconds: float = Form(30.0),
+):
+    cleanup_expired_jobs()
+
+    validate_input_format(file.filename)
+
+    if duration_seconds <= 0 or duration_seconds > RINGTONE_MAX_DURATION_SECONDS:
+        raise HTTPException(400, f"duration_seconds must be between 0 and {RINGTONE_MAX_DURATION_SECONDS}.")
+    if start_seconds < 0:
+        raise HTTPException(400, "start_seconds must be non-negative.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="ringtone")
+    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    output_path = os.path.join(UPLOAD_DIR, f"{job_id}_ringtone.m4a")
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_ringtone_background(
+        job_id, input_path, output_path, start_seconds, duration_seconds, file.filename
+    ))
+
+    logger.info(f"[RINGTONE] Job {job_id} queued: '{file.filename}' [{start_seconds}s, {duration_seconds}s]")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/ringtone/status/{job_id}")
+async def ringtone_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "ringtone":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {"job_id": job_id, "status": job["status"], "title": job.get("title"), "error": job.get("error")}
+
+
+@router.get("/ringtone/preview/{job_id}")
+async def ringtone_preview(job_id: str):
+    path, _ = _resolve_tool_output_path(job_id, "ringtone")
+    return FileResponse(path, media_type="audio/mp4")
+
+
+@router.get("/ringtone/download/{job_id}")
+async def ringtone_download(job_id: str):
+    path, _ = _resolve_tool_output_path(job_id, "ringtone")
+    # The .m4r extension lives ONLY here - the file on disk is a normal
+    # .m4a, this is what makes iOS's Ringtones app recognize the download.
+    return FileResponse(path, media_type="audio/mp4", filename="ringtone.m4r")
+
+
 @router.post("/admin/clear-cache")
 async def admin_clear_cache(key: str = Query(...)):
     if key != ADMIN_STATUS_KEY:
@@ -2947,7 +3331,15 @@ async def root():
             "Async ffmpeg silence-gap stripping with bounds-checked threshold_db/min_duration_seconds and TTL cleanup",
             "Inline <audio> preview endpoints (correct MIME per format) alongside every audio-tool's own status/download routes, matching the /separate/preview pattern",
             "Async faster-whisper speech-to-text transcription on its own dedicated semaphore (isolated from the ffmpeg/rubberband pool) with a longer job TTL and JSON result endpoint",
-        ]
+        ],
+        # Read by the frontend's server-side getFeatureFlags() to decide
+        # whether to render the Studio Quality toggle at all. This is a
+        # deliberately minimal surface - only a boolean, not the model
+        # name, timeout, or any other internal detail - so there's nothing
+        # here for a client to learn about the feature beyond "on or off".
+        "features": {
+            "separation_hq_enabled": SEPARATION_HQ_ENABLED,
+        },
     }
 
 
