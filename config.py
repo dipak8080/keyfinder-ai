@@ -453,3 +453,160 @@ MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURAT
 
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+
+
+
+
+
+# ---------- VIDEO TO AUDIO ----------
+# Input-only formats: valid as an upload to /video-to-audio and nowhere
+# else. Deliberately kept OUT of ALLOWED_AUDIO_INPUT_FORMATS and the
+# conversion matrix - no other endpoint should accept a video, and no
+# endpoint should ever output one.
+ALLOWED_VIDEO_INPUT_FORMATS = frozenset({
+    "mp4", "mov", "mkv", "avi", "webm", "flv", "wmv", "m4v", "3gp", "mpeg", "mpg",
+})
+
+# Video files are an order of magnitude larger than the audio this app
+# normally handles - a few minutes of phone video routinely exceeds
+# MAX_UPLOAD_BYTES' 50MB. This endpoint therefore gets its own, much
+# higher cap.
+#
+# Safe to raise this only because /video-to-audio streams the upload to
+# disk in chunks instead of reading the whole body into memory the way
+# every other route does. Reading 200MB via `await file.read()` on a 6GB
+# box would be reckless; writing it in 1MB chunks costs almost nothing.
+MAX_VIDEO_UPLOAD_BYTES = int(os.environ.get("MAX_VIDEO_UPLOAD_BYTES", str(200 * 1024 * 1024)))  # 200 MB
+
+# Separate from MAX_VIDEO_DURATION_SECONDS (which caps YouTube
+# DOWNLOADS) - same units, completely different purpose. Audio-only
+# extraction is cheap even for long videos, especially on the
+# stream-copy path, so this can be generous.
+VIDEO_EXTRACT_MAX_DURATION_SECONDS = int(os.environ.get("VIDEO_EXTRACT_MAX_DURATION_SECONDS", "3600"))  # 60 min
+
+# Longer than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s: re-encoding
+# an hour of audio out of a large container takes real time, and the
+# 120s figure was scaled for short audio clips.
+VIDEO_TO_AUDIO_TIMEOUT_SECONDS = int(os.environ.get("VIDEO_TO_AUDIO_TIMEOUT_SECONDS", "300"))  # 5 min
+
+# Stricter than /convert's 5-per-60s despite similar CPU cost - the
+# limiting factor here is upload bandwidth and disk, not compute.
+VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS", "5"))
+VIDEO_TO_AUDIO_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TO_AUDIO_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+
+
+
+# ---------- JOIN / MERGE ----------
+# Cap on files per request. The filter graph string grows one clause per
+# input, and the frontend's reorder list stops being usable much past
+# this anyway.
+JOIN_MAX_FILES = int(os.environ.get("JOIN_MAX_FILES", "10"))
+
+# Total across ALL files in one request, not per file - ten files at
+# 45MB each would otherwise sail past a per-file check and land 450MB on
+# disk. Same streaming-upload reasoning as MAX_VIDEO_UPLOAD_BYTES.
+JOIN_MAX_TOTAL_BYTES = int(os.environ.get("JOIN_MAX_TOTAL_BYTES", str(150 * 1024 * 1024)))  # 150 MB
+
+# Also a total, for the same reason: ten four-minute files is a
+# forty-minute re-encode however modest each one looks alone.
+JOIN_MAX_TOTAL_DURATION_SECONDS = int(os.environ.get("JOIN_MAX_TOTAL_DURATION_SECONDS", "1800"))  # 30 min
+
+# Every input is resampled to this before concatenation. 44100 is the
+# right default for music; the value matters less than the fact that all
+# inputs share it, which is what makes mismatched files join cleanly
+# instead of playing at the wrong speed.
+JOIN_OUTPUT_SAMPLE_RATE = int(os.environ.get("JOIN_OUTPUT_SAMPLE_RATE", "44100"))
+
+# Longer than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s, which was
+# scaled for a single short clip - this re-encodes up to 30 minutes of
+# audio through a multi-input filter graph.
+JOIN_TIMEOUT_SECONDS = int(os.environ.get("JOIN_TIMEOUT_SECONDS", "300"))  # 5 min
+
+JOIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("JOIN_RATE_LIMIT_MAX_REQUESTS", "5"))
+JOIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("JOIN_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+
+
+
+
+# ---------- LOUDNESS NORMALIZATION (LUFS) ----------
+# Named presets covering what producers actually target in practice,
+# resolved to a raw LUFS number before audio_loudnorm.py ever sees them.
+# Streaming platforms (Spotify, YouTube, Apple Music) generally target
+# around -14 LUFS; club/DJ material is mastered louder; broadcast follows
+# the EBU R128 / ATSC A/85 standard of -23 LUFS.
+LOUDNORM_PRESETS = {
+    "streaming": -14.0,
+    "club": -9.0,
+    "broadcast": -23.0,
+}
+
+# Bounds for the custom_lufs override. -70 to 5 covers every legitimate
+# use case (even -5 is absurdly loud) while rejecting typos like "-1400".
+LOUDNORM_MIN_LUFS = float(os.environ.get("LOUDNORM_MIN_LUFS", "-70"))
+LOUDNORM_MAX_LUFS = float(os.environ.get("LOUDNORM_MAX_LUFS", "5"))
+
+# True peak ceiling and loudness range target, held fixed rather than
+# exposed as user params - these are secondary to the integrated loudness
+# target for what this tool is for, and exposing every loudnorm knob
+# would turn a two-choice tool into a five-field form.
+LOUDNORM_TRUE_PEAK = float(os.environ.get("LOUDNORM_TRUE_PEAK", "-1.5"))
+LOUDNORM_LRA = float(os.environ.get("LOUDNORM_LRA", "11"))
+
+# Two separate timeouts since the two ffmpeg passes have different
+# costs: the analysis pass just measures (cheap), the apply pass
+# actually re-encodes the whole file (proportional to length).
+LOUDNORM_ANALYSIS_TIMEOUT_SECONDS = int(os.environ.get("LOUDNORM_ANALYSIS_TIMEOUT_SECONDS", "120"))
+LOUDNORM_APPLY_TIMEOUT_SECONDS = int(os.environ.get("LOUDNORM_APPLY_TIMEOUT_SECONDS", "120"))
+
+LOUDNORM_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("LOUDNORM_RATE_LIMIT_MAX_REQUESTS", "5"))
+LOUDNORM_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOUDNORM_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+
+
+# ---------- YOUTUBE CHAINED TOOLS (paste a URL, skip the manual re-upload) ----------
+# These stack TWO of the app's heaviest subsystems in one request - a
+# YouTube download (yt-dlp + proxy/cookie logic) followed by either
+# Essentia analysis or Demucs separation. The rate limit here is
+# deliberately the strictest in the app: a single request can occupy
+# BOTH the download semaphore and the separation semaphore in sequence,
+# so this is the one tool whose abuse potential touches almost every
+# other subsystem at once.
+YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "2"))
+YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS", "600"))  # 10 min
+
+# TTL for /youtube/analyze jobs specifically - result is inline JSON, not
+# a file, so this can be short. Mirrors TRANSCRIPTION_JOB_TTL_SECONDS'
+# reasoning.
+YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SECONDS", str(60 * 60)))  # 1 hour
+
+
+# ---------- AUDIO EFFECTS: FADE / CHANNELS / RESAMPLE / RINGTONE ----------
+FADE_MAX_SECONDS = float(os.environ.get("FADE_MAX_SECONDS", "30"))
+
+RESAMPLE_ALLOWED_RATES = (22050, 44100, 48000, 96000)
+RESAMPLE_ALLOWED_BIT_DEPTHS = (16, 24, 32)
+
+# iPhone's own ringtone length limit - not a server-load guard, a real
+# constraint of the format. A "ringtone" longer than this isn't one.
+RINGTONE_MAX_DURATION_SECONDS = float(os.environ.get("RINGTONE_MAX_DURATION_SECONDS", "40"))
+
+FADE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("FADE_RATE_LIMIT_MAX_REQUESTS", "5"))
+FADE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("FADE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+CHANNELS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("CHANNELS_RATE_LIMIT_MAX_REQUESTS", "5"))
+CHANNELS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("CHANNELS_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+RESAMPLE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RESAMPLE_RATE_LIMIT_MAX_REQUESTS", "5"))
+RESAMPLE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RESAMPLE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+RINGTONE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RINGTONE_RATE_LIMIT_MAX_REQUESTS", "5"))
+RINGTONE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RINGTONE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+
+# ---------- SILENCE SPLIT ----------
+SILENCE_SPLIT_MAX_SEGMENTS = int(os.environ.get("SILENCE_SPLIT_MAX_SEGMENTS", "50"))
+SILENCE_SPLIT_MIN_SEGMENT_SECONDS = float(os.environ.get("SILENCE_SPLIT_MIN_SEGMENT_SECONDS", "1.0"))
+SILENCE_SPLIT_DETECT_TIMEOUT_SECONDS = int(os.environ.get("SILENCE_SPLIT_DETECT_TIMEOUT_SECONDS", "120"))
+SILENCE_SPLIT_CUT_TIMEOUT_SECONDS = int(os.environ.get("SILENCE_SPLIT_CUT_TIMEOUT_SECONDS", "60"))
+SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS", "3"))
+SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS", "300"))

@@ -24,6 +24,7 @@ import uuid
 import base64
 import asyncio
 import shutil
+from typing import List
 from functools import partial
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
@@ -92,6 +93,33 @@ from config import (
     MAX_TRANSCRIPTION_DURATION_SECONDS,
     AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    ALLOWED_AUDIO_INPUT_FORMATS,
+    MAX_VIDEO_UPLOAD_BYTES,
+    VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS,
+    VIDEO_TO_AUDIO_RATE_LIMIT_WINDOW_SECONDS,
+    JOIN_MAX_FILES,
+    JOIN_MAX_TOTAL_BYTES,
+    JOIN_RATE_LIMIT_MAX_REQUESTS,
+    JOIN_RATE_LIMIT_WINDOW_SECONDS,
+    LOUDNORM_RATE_LIMIT_MAX_REQUESTS,
+    LOUDNORM_RATE_LIMIT_WINDOW_SECONDS,
+    SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS,
+    SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_ANALYZE_JOB_TTL_SECONDS,
+    FADE_MAX_SECONDS,
+    FADE_RATE_LIMIT_MAX_REQUESTS,
+    FADE_RATE_LIMIT_WINDOW_SECONDS,
+    CHANNELS_RATE_LIMIT_MAX_REQUESTS,
+    CHANNELS_RATE_LIMIT_WINDOW_SECONDS,
+    RESAMPLE_ALLOWED_RATES,
+    RESAMPLE_ALLOWED_BIT_DEPTHS,
+    RESAMPLE_RATE_LIMIT_MAX_REQUESTS,
+    RESAMPLE_RATE_LIMIT_WINDOW_SECONDS,
+    RINGTONE_MAX_DURATION_SECONDS,
+    RINGTONE_RATE_LIMIT_MAX_REQUESTS,
+    RINGTONE_RATE_LIMIT_WINDOW_SECONDS,
 )
 from utils import (
     cleanup_file,
@@ -129,6 +157,7 @@ from jobs import (
     mark_stems_complete,
     mark_tool_complete,
     mark_transcription_complete,
+    mark_data_complete,
     mark_failed,
     get_job,
     cleanup_expired_jobs,
@@ -154,6 +183,12 @@ from voice_cleaner import clean_voice
 from echo_remover import remove_echo
 from silence_remover import remove_silence
 from speech_to_text import transcribe
+from video_to_audio import extract_audio, validate_video_input_format
+from audio_joiner import join_audio
+from audio_loudnorm import normalize_loudness, resolve_target_lufs
+from silence_splitter import split_on_silence
+from youtube_chain import download_audio_to_file, ChainDownloadError
+from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 
 router = APIRouter()
 
@@ -1962,6 +1997,887 @@ async def speech_to_text_result(job_id: str):
     if not result:
         raise HTTPException(404, "Transcript not found (it may have expired).")
     return JSONResponse(result)
+
+
+# ============================================================
+# /video-to-audio - Extract the audio track from a video file
+#
+# The one endpoint that does NOT read its upload into memory whole.
+# Every other route does `content = await file.read()`, which is fine at
+# MAX_UPLOAD_BYTES' 50MB but would mean holding up to 200MB of video in
+# RAM here. This one streams the body to disk in 1MB chunks and enforces
+# its size cap as it goes, so an oversized upload is rejected partway
+# through rather than after being fully buffered.
+# ============================================================
+
+async def _run_video_to_audio_background(job_id: str, input_path: str, output_path: str,
+                                            target_format: str, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            was_copied = await run_blocking(extract_audio, input_path, output_path, target_format)
+            mark_tool_complete(job_id, original_filename, output_path, target_format)
+            logger.info(
+                f"[VIDEO_TO_AUDIO] Job {job_id} finished successfully "
+                f"({'stream copy' if was_copied else 're-encoded'})"
+            )
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[VIDEO_TO_AUDIO] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Audio extraction failed unexpectedly.")
+            logger.error(f"[VIDEO_TO_AUDIO] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/video-to-audio", succeeded)
+
+
+@router.post(
+    "/video-to-audio",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=VIDEO_TO_AUDIO_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def video_to_audio_route(file: UploadFile = File(...), target_format: str = Form("mp3")):
+    """
+    Accepts a video file + target audio format, returns a job_id
+    immediately, runs the ffmpeg extraction in the background. Poll
+    GET /video-to-audio/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    target_format = target_format.strip().lower()
+    if target_format not in ALLOWED_AUDIO_INPUT_FORMATS:
+        raise HTTPException(400, f"target_format must be one of: {', '.join(sorted(ALLOWED_AUDIO_INPUT_FORMATS))}")
+
+    try:
+        source_format = validate_video_input_format(file.filename)
+    except AudioToolError as e:
+        raise HTTPException(400, str(e))
+
+    job_id = create_job(job_type="video_to_audio")
+    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    output_path = build_output_path(job_id, target_format)
+
+    # Streamed write with the size cap enforced per chunk. On overflow the
+    # partial file is deleted immediately - without that, a rejected
+    # 200MB upload would still leave 200MB sitting on a 30GB disk until
+    # the TTL sweep noticed.
+    total = 0
+    try:
+        with open(input_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_VIDEO_UPLOAD_BYTES:
+                    raise HTTPException(
+                        400,
+                        f"File too large. Maximum allowed size is "
+                        f"{MAX_VIDEO_UPLOAD_BYTES // (1024*1024)} MB."
+                    )
+                f.write(chunk)
+    except HTTPException:
+        cleanup_file(input_path)
+        mark_failed(job_id, "Upload rejected.")
+        raise
+    except Exception as e:
+        cleanup_file(input_path)
+        mark_failed(job_id, "Upload failed.")
+        logger.error(f"[VIDEO_TO_AUDIO] Upload write failed for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to receive the uploaded file.")
+
+    if total == 0:
+        cleanup_file(input_path)
+        mark_failed(job_id, "Empty file.")
+        raise HTTPException(400, "Empty file")
+
+    asyncio.create_task(_run_video_to_audio_background(
+        job_id, input_path, output_path, target_format, file.filename
+    ))
+
+    logger.info(
+        f"[VIDEO_TO_AUDIO] Job {job_id} queued: '{file.filename}' "
+        f"({source_format} -> {target_format}, {total / (1024*1024):.1f} MB)"
+    )
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/video-to-audio/status/{job_id}")
+async def video_to_audio_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "video_to_audio":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/video-to-audio/preview/{job_id}")
+async def video_to_audio_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "video_to_audio")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/video-to-audio/download/{job_id}")
+async def video_to_audio_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "video_to_audio")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"audio.{fmt}")
+
+
+
+# ============================================================
+# /join - Concatenate several audio files into one (async job flow)
+#
+# The only endpoint taking MULTIPLE uploads. Two consequences worth
+# knowing: the size cap is enforced across the whole batch rather than
+# per file, and the ORDER of the uploaded files is the order of the
+# output - FastAPI preserves List[UploadFile] ordering, so the frontend
+# controls sequencing purely by the order it appends to the form.
+# ============================================================
+
+async def _run_join_background(job_id: str, input_paths: List[str], output_path: str,
+                                  target_format: str, original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            total_duration = await run_blocking(join_audio, input_paths, output_path, target_format)
+            mark_tool_complete(job_id, original_filename, output_path, target_format)
+            logger.info(f"[JOIN] Job {job_id} finished successfully ({total_duration:.1f}s total)")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[JOIN] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Joining failed unexpectedly.")
+            logger.error(f"[JOIN] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            for path in input_paths:
+                cleanup_file(path)
+            release_memory_to_os()
+            record_result("/join", succeeded)
+
+
+@router.post(
+    "/join",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=JOIN_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=JOIN_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def join_route(files: List[UploadFile] = File(...), target_format: str = Form("mp3")):
+    """
+    Accepts two or more audio files plus a target format, returns a
+    job_id immediately, runs the ffmpeg concat in the background. Poll
+    GET /join/status/{job_id} to track progress.
+
+    Output order matches upload order.
+    """
+    cleanup_expired_jobs()
+
+    target_format = target_format.strip().lower()
+    if target_format not in ALLOWED_AUDIO_INPUT_FORMATS:
+        raise HTTPException(400, f"target_format must be one of: {', '.join(sorted(ALLOWED_AUDIO_INPUT_FORMATS))}")
+
+    if len(files) < 2:
+        raise HTTPException(400, "Joining needs at least two files.")
+    if len(files) > JOIN_MAX_FILES:
+        raise HTTPException(400, f"You can join up to {JOIN_MAX_FILES} files at a time.")
+
+    for f in files:
+        try:
+            validate_input_format(f.filename)
+        except AudioToolError as e:
+            raise HTTPException(400, str(e))
+
+    job_id = create_job(job_type="join")
+    input_paths: List[str] = []
+    total = 0
+
+    # Streamed to disk with the cap tracked ACROSS files, not per file -
+    # and every already-written file is cleaned up on any failure, since
+    # a rejected batch would otherwise leave up to 150MB behind until the
+    # TTL sweep caught it.
+    try:
+        for index, f in enumerate(files):
+            path = os.path.join(UPLOAD_DIR, f"{job_id}_{index}_{f.filename}")
+            input_paths.append(path)
+
+            with open(path, "wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > JOIN_MAX_TOTAL_BYTES:
+                        raise HTTPException(
+                            400,
+                            f"Combined file size too large. Maximum total is "
+                            f"{JOIN_MAX_TOTAL_BYTES // (1024*1024)} MB."
+                        )
+                    out.write(chunk)
+
+            if os.path.getsize(path) == 0:
+                raise HTTPException(400, f"'{f.filename}' is empty.")
+
+    except HTTPException:
+        for path in input_paths:
+            cleanup_file(path)
+        mark_failed(job_id, "Upload rejected.")
+        raise
+    except Exception as e:
+        for path in input_paths:
+            cleanup_file(path)
+        mark_failed(job_id, "Upload failed.")
+        logger.error(f"[JOIN] Upload write failed for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to receive the uploaded files.")
+
+    output_path = build_output_path(job_id, target_format)
+
+    asyncio.create_task(_run_join_background(
+        job_id, input_paths, output_path, target_format, files[0].filename
+    ))
+
+    logger.info(
+        f"[JOIN] Job {job_id} queued: {len(files)} files -> {target_format} "
+        f"({total / (1024*1024):.1f} MB)"
+    )
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/join/status/{job_id}")
+async def join_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "join":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/join/preview/{job_id}")
+async def join_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "join")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/join/download/{job_id}")
+async def join_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "join")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"joined.{fmt}")
+
+# ============================================================
+# /loudnorm - Two-pass LUFS loudness normalization (async job flow)
+# ============================================================
+
+async def _run_loudnorm_background(job_id: str, input_path: str, output_path: str,
+                                      target_lufs: float, original_filename: str, source_format: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            measured_lufs, applied_target = await run_blocking(
+                normalize_loudness, input_path, output_path, target_lufs
+            )
+            mark_tool_complete(job_id, original_filename, output_path, source_format)
+            logger.info(
+                f"[LOUDNORM] Job {job_id} finished successfully "
+                f"(measured {measured_lufs} LUFS -> {applied_target} LUFS)"
+            )
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[LOUDNORM] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Loudness normalization failed unexpectedly.")
+            logger.error(f"[LOUDNORM] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/loudnorm", succeeded)
+
+
+@router.post(
+    "/loudnorm",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=LOUDNORM_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=LOUDNORM_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def loudnorm_route(
+    file: UploadFile = File(...),
+    preset: str = Form("streaming"),
+    custom_lufs: float = Form(None),
+):
+    """
+    Accepts an audio file plus either a named preset (streaming/club/
+    broadcast) or an explicit custom_lufs override, returns a job_id
+    immediately, runs the two-pass ffmpeg loudnorm in the background.
+    Poll GET /loudnorm/status/{job_id} to track progress.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    try:
+        target_lufs = resolve_target_lufs(preset, custom_lufs)
+    except AudioToolError as e:
+        raise HTTPException(400, str(e))
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="loudnorm")
+    input_path = build_temp_input_path(job_id, file.filename)
+    output_path = build_output_path(job_id, source_format)
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    try:
+        validate_duration(input_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        raise HTTPException(400, str(e))
+
+    asyncio.create_task(_run_loudnorm_background(
+        job_id, input_path, output_path, target_lufs, file.filename, source_format
+    ))
+
+    logger.info(f"[LOUDNORM] Job {job_id} queued: '{file.filename}' -> {target_lufs} LUFS")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/loudnorm/status/{job_id}")
+async def loudnorm_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "loudnorm":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/loudnorm/preview/{job_id}")
+async def loudnorm_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "loudnorm")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/loudnorm/download/{job_id}")
+async def loudnorm_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "loudnorm")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"normalized.{fmt}")
+
+
+# ============================================================
+# /silence-split - Cut a file into segments at silent gaps
+#
+# Reuses the "stems" job shape from /stems: a {name: path} dict, the
+# same mark_stems_complete(), and the same status-lists-available-names
+# pattern - the only actual difference from /stems is what produced the
+# dict and how many entries it has.
+# ============================================================
+
+async def _run_silence_split_background(job_id: str, input_path: str, target_format: str,
+                                            threshold_db: float, min_duration_seconds: float,
+                                            original_filename: str):
+    succeeded = False
+    async with _audio_tools_semaphore:
+        try:
+            segments = await run_blocking(
+                split_on_silence, input_path, job_id, target_format, threshold_db, min_duration_seconds
+            )
+            mark_stems_complete(job_id, original_filename, segments)
+            logger.info(f"[SILENCE_SPLIT] Job {job_id} finished successfully ({len(segments)} segments)")
+            succeeded = True
+        except AudioToolError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[SILENCE_SPLIT] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Splitting failed unexpectedly.")
+            logger.error(f"[SILENCE_SPLIT] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(input_path)
+            release_memory_to_os()
+            record_result("/silence-split", succeeded)
+
+
+@router.post(
+    "/silence-split",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def silence_split_route(
+    file: UploadFile = File(...),
+    target_format: str = Form("mp3"),
+    threshold_db: float = Form(-30.0),
+    min_duration_seconds: float = Form(0.5),
+):
+    """
+    Accepts an audio file, returns a job_id immediately, detects silent
+    gaps and cuts the file into one segment per non-silent span in the
+    background. Poll GET /silence-split/status/{job_id} - the response
+    lists the available segment names once complete, same pattern as
+    /stems/status.
+    """
+    cleanup_expired_jobs()
+
+    source_format = validate_input_format(file.filename)
+
+    if target_format.strip().lower() not in ALLOWED_AUDIO_INPUT_FORMATS:
+        raise HTTPException(400, f"target_format must be one of: {', '.join(sorted(ALLOWED_AUDIO_INPUT_FORMATS))}")
+    if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
+        raise HTTPException(400, f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}.")
+    if min_duration_seconds < SILENCE_MIN_DURATION_SECONDS or min_duration_seconds > SILENCE_MAX_DURATION_SECONDS:
+        raise HTTPException(400, f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} and {SILENCE_MAX_DURATION_SECONDS}.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="silence_split")
+    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    with open(input_path, "wb") as f:
+        f.write(content)
+    del content
+
+    target_format = target_format.strip().lower()
+
+    asyncio.create_task(_run_silence_split_background(
+        job_id, input_path, target_format, threshold_db, min_duration_seconds, file.filename
+    ))
+
+    logger.info(f"[SILENCE_SPLIT] Job {job_id} queued: '{file.filename}' (threshold={threshold_db}dB)")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/silence-split/status/{job_id}")
+async def silence_split_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "silence_split":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    segments = job.get("stems") or {}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+        "segments": sorted(segments.keys()),
+    }
+
+
+def _resolve_silence_split_file(job_id: str, segment: str) -> str:
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "silence_split":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    segments = job.get("stems") or {}
+    if segment not in segments:
+        raise HTTPException(400, f"segment must be one of: {', '.join(sorted(segments.keys()))}")
+    path = segments[segment]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Segment file not found (it may have expired).")
+    return path
+
+
+@router.get("/silence-split/preview/{job_id}")
+async def silence_split_preview(job_id: str, segment: str = Query(...)):
+    path = _resolve_silence_split_file(job_id, segment)
+    return FileResponse(path, media_type=get_audio_mime_type(path.rsplit(".", 1)[-1]))
+
+
+@router.get("/silence-split/download/{job_id}")
+async def silence_split_download(job_id: str, segment: str = Query(...)):
+    path = _resolve_silence_split_file(job_id, segment)
+    ext = path.rsplit(".", 1)[-1]
+    return FileResponse(path, media_type="application/octet-stream", filename=f"{segment}.{ext}")
+
+
+
+
+# ============================================================
+# /youtube/* - Paste a URL, get the processed result directly, skipping
+# the manual download-then-reupload step.
+#
+# Each of these is TWO of the app's heaviest operations chained in one
+# background job: a YouTube download, then either analysis or Demucs
+# separation. The download step acquires _download_semaphore (via the
+# same acquire_slot_or_503 queue-then-503 pattern /download itself uses)
+# and RELEASES IT before the processing step acquires its own semaphore -
+# the two are never held at once, so a slow separation doesn't also
+# tie up a download slot the whole time, and vice versa.
+# ============================================================
+
+async def _run_youtube_analyze_background(job_id: str, url: str):
+    succeeded = False
+    file_path = None
+
+    await acquire_slot_or_503(_download_semaphore, "youtube-analyze-download")
+    try:
+        file_path, title = await run_blocking(download_audio_to_file, url, job_id)
+    except ChainDownloadError as e:
+        mark_failed(job_id, str(e))
+        logger.warning(f"[YOUTUBE_ANALYZE] Job {job_id} download failed: {e}")
+        _download_semaphore.release()
+        record_result("/youtube/analyze", False)
+        return
+    except Exception as e:
+        mark_failed(job_id, "Download failed unexpectedly.")
+        logger.error(f"[YOUTUBE_ANALYZE] Job {job_id} download failed unexpectedly: {e}", exc_info=True)
+        _download_semaphore.release()
+        record_result("/youtube/analyze", False)
+        return
+    else:
+        _download_semaphore.release()
+
+    analysis_path = file_path
+    await acquire_slot_or_503(_analysis_semaphore, "youtube-analyze")
+    try:
+        if ANALYSIS_MAX_SECONDS is not None:
+            analysis_path = await run_blocking(trim_audio_for_analysis, file_path, ANALYSIS_MAX_SECONDS)
+
+        key, scale, key_conf, bpm, bpm_conf, audio_array, essentia_sr = await run_blocking(
+            detect_key_bpm_essentia, analysis_path
+        )
+        key, scale, key_conf, bpm, bpm_conf, agreement = await run_blocking(
+            cross_check_with_librosa, audio_array, essentia_sr, key, scale, key_conf, bpm, bpm_conf
+        )
+
+        camelot = get_camelot(key, scale)
+        result = {
+            "key": f"{key} {scale}",
+            "camelot": camelot,
+            "bpm": bpm,
+            "confidence": int(min(0.99, key_conf) * 100),
+            "bpm_confidence": min(99, bpm_conf),
+            "cross_check": agreement,
+        }
+        mark_data_complete(job_id, title, result)
+        logger.info(f"[YOUTUBE_ANALYZE] Job {job_id} finished successfully: {result}")
+        succeeded = True
+    except Exception as e:
+        mark_failed(job_id, "Analysis failed unexpectedly.")
+        logger.error(f"[YOUTUBE_ANALYZE] Job {job_id} analysis failed: {e}", exc_info=True)
+    finally:
+        cleanup_file(file_path)
+        if analysis_path != file_path:
+            cleanup_file(analysis_path)
+        _analysis_semaphore.release()
+        release_memory_to_os()
+        record_result("/youtube/analyze", succeeded)
+
+
+@router.post(
+    "/youtube/analyze",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def youtube_analyze_route(url: str = Form(...)):
+    """
+    Accepts a YouTube URL, returns a job_id immediately, downloads the
+    audio and runs key/BPM analysis in the background. Poll
+    GET /youtube/analyze/status/{job_id}, then
+    GET /youtube/analyze/result/{job_id} once complete.
+    """
+    if not is_valid_youtube_url(url):
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    job_id = create_job(job_type="youtube_analyze", ttl_seconds=YOUTUBE_ANALYZE_JOB_TTL_SECONDS)
+    asyncio.create_task(_run_youtube_analyze_background(job_id, url))
+
+    logger.info(f"[YOUTUBE_ANALYZE] Job {job_id} queued for {url}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/youtube/analyze/status/{job_id}")
+async def youtube_analyze_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_analyze":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/youtube/analyze/result/{job_id}")
+async def youtube_analyze_result(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_analyze":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    result = job.get("result_data")
+    if not result:
+        raise HTTPException(404, "Result not found (it may have expired).")
+    return JSONResponse(result)
+
+
+# ------------------------------------------------------------
+# /youtube/separate - download then vocal/instrumental separation
+# ------------------------------------------------------------
+
+async def _run_youtube_separate_background(job_id: str, url: str):
+    succeeded = False
+    file_path = None
+
+    await acquire_slot_or_503(_download_semaphore, "youtube-separate-download")
+    try:
+        file_path, title = await run_blocking(download_audio_to_file, url, job_id)
+    except ChainDownloadError as e:
+        mark_failed(job_id, str(e))
+        logger.warning(f"[YOUTUBE_SEPARATE] Job {job_id} download failed: {e}")
+        _download_semaphore.release()
+        record_result("/youtube/separate", False)
+        return
+    except Exception as e:
+        mark_failed(job_id, "Download failed unexpectedly.")
+        logger.error(f"[YOUTUBE_SEPARATE] Job {job_id} download failed unexpectedly: {e}", exc_info=True)
+        _download_semaphore.release()
+        record_result("/youtube/separate", False)
+        return
+    else:
+        _download_semaphore.release()
+
+    async with _separation_semaphore:
+        try:
+            vocals_path, instrumental_path = await run_blocking(
+                run_separation, file_path, job_id,
+                SEPARATION_MODEL, SEPARATION_OVERLAP,
+                DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS,
+            )
+            mark_complete(job_id, title, vocals_path, instrumental_path)
+            logger.info(f"[YOUTUBE_SEPARATE] Job {job_id} finished successfully")
+            succeeded = True
+        except SeparationError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[YOUTUBE_SEPARATE] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Separation failed unexpectedly.")
+            logger.error(f"[YOUTUBE_SEPARATE] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(file_path)
+            release_memory_to_os()
+            record_result("/youtube/separate", succeeded)
+
+
+@router.post(
+    "/youtube/separate",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def youtube_separate_route(url: str = Form(...)):
+    """
+    Accepts a YouTube URL, returns a job_id immediately, downloads the
+    audio and runs standard-tier Demucs vocal/instrumental separation in
+    the background. Poll GET /youtube/separate/status/{job_id}. Once
+    complete, stem paths are stored the same way /separate stores them -
+    reuse /separate/preview and /separate/download with this job_id.
+    """
+    if not is_valid_youtube_url(url):
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    job_id = create_job(job_type="youtube_separate")
+    asyncio.create_task(_run_youtube_separate_background(job_id, url))
+
+    logger.info(f"[YOUTUBE_SEPARATE] Job {job_id} queued for {url}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/youtube/separate/status/{job_id}")
+async def youtube_separate_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_separate":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+    }
+
+
+@router.get("/youtube/separate/preview/{job_id}")
+async def youtube_separate_preview(job_id: str, stem: str = Query(...)):
+    """Reuses the same stem-path resolution as /separate/preview - stem
+    is 'vocals' or 'instrumental', looked up on this job_id instead."""
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_separate":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if stem not in ("vocals", "instrumental"):
+        raise HTTPException(400, "stem must be 'vocals' or 'instrumental'")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["vocals_path"] if stem == "vocals" else job["instrumental_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Stem file not found (it may have expired).")
+    return FileResponse(path, media_type="audio/wav")
+
+
+@router.get("/youtube/separate/download/{job_id}")
+async def youtube_separate_download(job_id: str, stem: str = Query(...)):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_separate":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if stem not in ("vocals", "instrumental"):
+        raise HTTPException(400, "stem must be 'vocals' or 'instrumental'")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    path = job["vocals_path"] if stem == "vocals" else job["instrumental_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Stem file not found (it may have expired).")
+    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+
+
+# ------------------------------------------------------------
+# /youtube/stems - download then full 4-stem separation
+# ------------------------------------------------------------
+
+async def _run_youtube_stems_background(job_id: str, url: str):
+    succeeded = False
+    file_path = None
+
+    await acquire_slot_or_503(_download_semaphore, "youtube-stems-download")
+    try:
+        file_path, title = await run_blocking(download_audio_to_file, url, job_id)
+    except ChainDownloadError as e:
+        mark_failed(job_id, str(e))
+        logger.warning(f"[YOUTUBE_STEMS] Job {job_id} download failed: {e}")
+        _download_semaphore.release()
+        record_result("/youtube/stems", False)
+        return
+    except Exception as e:
+        mark_failed(job_id, "Download failed unexpectedly.")
+        logger.error(f"[YOUTUBE_STEMS] Job {job_id} download failed unexpectedly: {e}", exc_info=True)
+        _download_semaphore.release()
+        record_result("/youtube/stems", False)
+        return
+    else:
+        _download_semaphore.release()
+
+    async with _separation_semaphore:
+        try:
+            stems = await run_blocking(
+                run_stem_separation, file_path, job_id,
+                SEPARATION_MODEL, SEPARATION_OVERLAP,
+                DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS,
+            )
+            mark_stems_complete(job_id, title, stems)
+            logger.info(f"[YOUTUBE_STEMS] Job {job_id} finished successfully ({len(stems)} stems)")
+            succeeded = True
+        except SeparationError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[YOUTUBE_STEMS] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Stem separation failed unexpectedly.")
+            logger.error(f"[YOUTUBE_STEMS] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(file_path)
+            release_memory_to_os()
+            record_result("/youtube/stems", succeeded)
+
+
+@router.post(
+    "/youtube/stems",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def youtube_stems_route(url: str = Form(...)):
+    """
+    Accepts a YouTube URL, returns a job_id immediately, downloads the
+    audio and runs standard-tier full 4-stem Demucs separation in the
+    background. Poll GET /youtube/stems/status/{job_id} - lists
+    available stem names once complete, same as /stems/status.
+    """
+    if not is_valid_youtube_url(url):
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    job_id = create_job(job_type="youtube_stems")
+    asyncio.create_task(_run_youtube_stems_background(job_id, url))
+
+    logger.info(f"[YOUTUBE_STEMS] Job {job_id} queued for {url}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.get("/youtube/stems/status/{job_id}")
+async def youtube_stems_status(job_id: str):
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_stems":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    stems = job.get("stems") or {}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+        "stems": sorted(stems.keys()),
+    }
+
+
+def _resolve_youtube_stems_file(job_id: str, stem: str) -> str:
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "youtube_stems":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    stems = job.get("stems") or {}
+    if stem not in stems:
+        raise HTTPException(400, f"stem must be one of: {', '.join(sorted(stems.keys()))}")
+    path = stems[stem]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Stem file not found (it may have expired).")
+    return path
+
+
+@router.get("/youtube/stems/preview/{job_id}")
+async def youtube_stems_preview(job_id: str, stem: str = Query(...)):
+    path = _resolve_youtube_stems_file(job_id, stem)
+    return FileResponse(path, media_type="audio/wav")
+
+
+@router.get("/youtube/stems/download/{job_id}")
+async def youtube_stems_download(job_id: str, stem: str = Query(...)):
+    path = _resolve_youtube_stems_file(job_id, stem)
+    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+
 
 @router.post("/admin/clear-cache")
 async def admin_clear_cache(key: str = Query(...)):
