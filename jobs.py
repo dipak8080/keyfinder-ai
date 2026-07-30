@@ -1,8 +1,9 @@
 """
 jobs.py - In-memory job tracking for long-running background work:
-vocal/instrumental separation, the audio-tools (convert, trim, pitch,
-tempo, volume, reverse, noise-remove, voice-clean, echo-remove,
-silence-remove), and speech-to-text transcription.
+vocal/instrumental separation, full multi-stem separation, the
+audio-tools (convert, trim, pitch, tempo, volume, reverse, noise-remove,
+voice-clean, echo-remove, silence-remove), and speech-to-text
+transcription.
 
 Same pattern as rate_limit.py / monitoring.py: in-memory, per-instance,
 thread-safe via a single lock. Fine for a single-VPS deployment; if this
@@ -18,9 +19,13 @@ immediately, the actual work runs in the background, and the frontend
 polls GET .../status/{id} every few seconds until it flips to "complete"
 or "failed".
 
-THREE JOB SHAPES, ONE TABLE:
+FOUR JOB SHAPES, ONE TABLE:
 - Separation jobs (job_type="separation") produce TWO output files
   (vocals_path, instrumental_path) - unchanged from the original design.
+- Stems jobs (job_type="stems") produce N output files held in a
+  {stem_name: path} dict (stems) - four for htdemucs/htdemucs_ft, six
+  if a 6-source model is ever wired up. A dict rather than named fields
+  precisely so the stem count isn't baked into this schema.
 - Audio-tool jobs (job_type="convert"/"trim"/"pitch"/"tempo"/"volume"/
   "reverse"/"noise_remove"/"voice_clean"/"echo_remove"/"silence_remove")
   produce ONE output file (output_path).
@@ -28,7 +33,7 @@ THREE JOB SHAPES, ONE TABLE:
   (result_data) instead of a file - transcription output is a small
   JSON-serializable dict, not audio, so there's no file to write/clean
   up for this job type.
-Keeping all three shapes in the same table (rather than separate parallel
+Keeping all four shapes in the same table (rather than separate parallel
 job systems) means one cleanup sweep, one lock, one TTL mechanism to
 reason about - the mark_*_complete() functions below just populate
 different fields on the same underlying dict.
@@ -48,9 +53,10 @@ _lock = threading.Lock()
 
 # job_id -> {
 #   status: "processing" | "complete" | "failed",
-#   job_type: "separation" | "convert" | "trim" | "pitch" | "tempo" |
-#             "volume" | "reverse" | "noise_remove" | "voice_clean" |
-#             "echo_remove" | "silence_remove" | "transcribe",
+#   job_type: "separation" | "stems" | "convert" | "trim" | "pitch" |
+#             "tempo" | "volume" | "reverse" | "noise_remove" |
+#             "voice_clean" | "echo_remove" | "silence_remove" |
+#             "transcribe",
 #   created_at: float,
 #   ttl_seconds: int,
 #   title: Optional[str],
@@ -58,6 +64,8 @@ _lock = threading.Lock()
 #   # separation jobs only:
 #   vocals_path: Optional[str],
 #   instrumental_path: Optional[str],
+#   # stems jobs only:
+#   stems: Optional[dict],          # {"vocals": path, "drums": path, ...}
 #   # audio-tool jobs only:
 #   output_path: Optional[str],
 #   output_format: Optional[str],
@@ -79,12 +87,20 @@ def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) 
     explicitly, since transcription doesn't share AUDIO_TOOL_JOB_TTL_SECONDS's
     default.
 
-    ttl_seconds defaults to SEPARATION_JOB_TTL_SECONDS for separation
-    jobs and AUDIO_TOOL_JOB_TTL_SECONDS for everything else, unless
-    explicitly overridden.
+    ttl_seconds defaults to SEPARATION_JOB_TTL_SECONDS for BOTH Demucs
+    job types (separation and stems) and AUDIO_TOOL_JOB_TTL_SECONDS for
+    everything else, unless explicitly overridden. Stems deliberately
+    shares separation's longer 2h TTL rather than falling through to the
+    audio-tools 1h default: a stems job can take 15+ minutes of CPU to
+    produce, so expiring its output after an hour would throw away
+    expensive work while the user is still previewing it.
     """
     if ttl_seconds is None:
-        ttl_seconds = SEPARATION_JOB_TTL_SECONDS if job_type == "separation" else AUDIO_TOOL_JOB_TTL_SECONDS
+        ttl_seconds = (
+            SEPARATION_JOB_TTL_SECONDS
+            if job_type in ("separation", "stems")
+            else AUDIO_TOOL_JOB_TTL_SECONDS
+        )
 
     job_id = uuid.uuid4().hex
     with _lock:
@@ -97,6 +113,7 @@ def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) 
             "error": None,
             "vocals_path": None,
             "instrumental_path": None,
+            "stems": None,
             "output_path": None,
             "output_format": None,
             "result_data": None,
@@ -113,6 +130,29 @@ def mark_complete(job_id: str, title: str, vocals_path: str, instrumental_path: 
                 "title": title,
                 "vocals_path": vocals_path,
                 "instrumental_path": instrumental_path,
+            })
+
+
+def mark_stems_complete(job_id: str, title: str, stems: dict):
+    """
+    Marks a STEMS job complete. Unlike mark_complete()'s fixed
+    vocals_path/instrumental_path pair, this stores a dict of
+    {stem_name: path} - "vocals"/"drums"/"bass"/"other" for htdemucs and
+    htdemucs_ft, plus "guitar"/"piano" if a 6-source model is ever
+    wired up.
+
+    A dict rather than four named fields so the stem count isn't baked
+    into the schema: cleanup_expired_jobs() iterates the values, and the
+    preview/download routes validate the requested stem against the
+    dict's own keys, so supporting a different stem set needs no change
+    to this file at all.
+    """
+    with _lock:
+        if job_id in _jobs:
+            _jobs[job_id].update({
+                "status": "complete",
+                "title": title,
+                "stems": stems,
             })
 
 
@@ -179,12 +219,16 @@ def cleanup_expired_jobs():
     otherwise leave both the job dict entry and its output files on
     disk forever.
 
-    Handles all three job shapes: separation jobs clean up vocals_path
-    + instrumental_path, audio-tool jobs clean up output_path,
-    transcription jobs have no file to clean up (result_data is just
-    removed along with the dict entry itself). A job with a None path
-    (never got that far, already cleaned up, or a transcription job)
-    is skipped safely.
+    Handles all four job shapes: separation jobs clean up vocals_path
+    + instrumental_path, stems jobs clean up every path in their stems
+    dict, audio-tool jobs clean up output_path, transcription jobs have
+    no file to clean up (result_data is just removed along with the dict
+    entry itself). A job with a None path (never got that far, already
+    cleaned up, or a transcription job) is skipped safely.
+
+    The stems dict MUST be walked separately from the named path fields -
+    a stems job holds 4 full-length WAVs, so missing them here would
+    leak roughly double a separation job's disk per expired job, forever.
     """
     import os
 
@@ -201,8 +245,14 @@ def cleanup_expired_jobs():
             job = _jobs.pop(job_id, None)
             if not job:
                 continue
-            for path_key in ("vocals_path", "instrumental_path", "output_path"):
-                path = job.get(path_key)
+
+            paths = [job.get(k) for k in ("vocals_path", "instrumental_path", "output_path")]
+
+            stems = job.get("stems")
+            if isinstance(stems, dict):
+                paths.extend(stems.values())
+
+            for path in paths:
                 if path and os.path.exists(path):
                     try:
                         os.remove(path)

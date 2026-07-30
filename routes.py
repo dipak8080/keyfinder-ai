@@ -37,6 +37,21 @@ from config import (
     ADMIN_STATUS_KEY,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+    SEPARATION_MODEL,
+    SEPARATION_OVERLAP,
+    DEMUCS_TIMEOUT_SECONDS,
+    MAX_SEPARATION_DURATION_SECONDS,
+    SEPARATION_MODEL_HQ,
+    SEPARATION_OVERLAP_HQ,
+    DEMUCS_TIMEOUT_SECONDS_HQ,
+    MAX_SEPARATION_DURATION_SECONDS_HQ,
+    SEPARATION_HQ_ENABLED,
+    SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
+    SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    STEMS_RATE_LIMIT_MAX_REQUESTS,
+    STEMS_RATE_LIMIT_WINDOW_SECONDS,
+    STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+    STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
     MAX_CONCURRENT_SEPARATIONS,
     MAX_CONCURRENT_AUDIO_TOOLS,
     AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
@@ -111,13 +126,14 @@ from download_progress import make_progress_hook
 from jobs import (
     create_job,
     mark_complete,
+    mark_stems_complete,
     mark_tool_complete,
     mark_transcription_complete,
     mark_failed,
     get_job,
     cleanup_expired_jobs,
 )
-from separation import run_separation, SeparationError
+from separation import run_separation, run_stem_separation, SeparationError
 from audio_common import (
     validate_input_format,
     validate_conversion_pair,
@@ -398,7 +414,16 @@ async def analyze_audio(file: UploadFile = File(...)):
 # /separate - Demucs vocal/instrumental separation (async job flow)
 # ============================================================
 
-async def _run_separation_background(job_id: str, file_path: str, original_filename: str):
+async def _run_separation_background(
+    job_id: str,
+    file_path: str,
+    original_filename: str,
+    model: str,
+    overlap: float,
+    timeout_seconds: int,
+    max_duration_seconds: int,
+    metric_label: str,
+):
     """
     Runs after POST /separate has already returned a response to the
     caller - this is what makes the endpoint non-blocking. Acquires the
@@ -409,9 +434,12 @@ async def _run_separation_background(job_id: str, file_path: str, original_filen
     succeeded = False
     async with _separation_semaphore:
         try:
-            vocals_path, instrumental_path = await run_blocking(run_separation, file_path, job_id)
+            vocals_path, instrumental_path = await run_blocking(
+                run_separation, file_path, job_id,
+                model, overlap, timeout_seconds, max_duration_seconds,
+            )
             mark_complete(job_id, original_filename, vocals_path, instrumental_path)
-            logger.info(f"[SEPARATION] Job {job_id} finished successfully")
+            logger.info(f"[SEPARATION] Job {job_id} finished successfully ({model})")
             succeeded = True
         except SeparationError as e:
             mark_failed(job_id, str(e))
@@ -422,8 +450,43 @@ async def _run_separation_background(job_id: str, file_path: str, original_filen
         finally:
             cleanup_file(file_path)
             release_memory_to_os()
-            record_result("/separate", succeeded)
+            record_result(metric_label, succeeded)
 
+
+async def _queue_separation(
+    file: UploadFile,
+    model: str,
+    overlap: float,
+    timeout_seconds: int,
+    max_duration_seconds: int,
+    metric_label: str,
+) -> JSONResponse:
+    """Shared submit path for /separate and /separate-hq - the two routes
+    differ only in run knobs and rate limit, so the read/size-check/write/
+    queue sequence lives here once. Knobs are resolved by the CALLER at
+    submission time, so a config change can't alter a job already queued."""
+    cleanup_expired_jobs()  # opportunistic sweep of old jobs/files
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job()
+    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    with open(file_path, "wb") as f:
+        f.write(content)
+    del content
+
+    asyncio.create_task(_run_separation_background(
+        job_id, file_path, file.filename,
+        model, overlap, timeout_seconds, max_duration_seconds, metric_label,
+    ))
+
+    logger.info(f"[SEPARATION] Job {job_id} queued for '{file.filename}' (model={model})")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
 
 @router.post(
     "/separate",
@@ -440,26 +503,46 @@ async def separate_audio(file: UploadFile = File(...)):
     1-5+ minutes on CPU, far too long for a normal synchronous request.
     Poll GET /separate/status/{job_id} to track progress.
     """
-    cleanup_expired_jobs()  # opportunistic sweep of old jobs/files
+    return await _queue_separation(
+        file, SEPARATION_MODEL, SEPARATION_OVERLAP,
+        DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS, "/separate",
+    )
 
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(400, "Empty file")
-    if len(content) > MAX_UPLOAD_BYTES:
-        size_mb = len(content) / (1024 * 1024)
-        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+@router.post(
+    "/separate-hq",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def separate_audio_hq(file: UploadFile = File(...)):
+    """
+    High-quality separation: htdemucs_ft (4-model ensemble) at raised
+    overlap. Roughly 5x the CPU time of /separate for a real quality
+    gain, so it gets a longer timeout, a TIGHTER input duration cap, and
+    a stricter rate limit.
 
-    job_id = create_job()
-    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-    with open(file_path, "wb") as f:
-        f.write(content)
-    del content
+    A separate route rather than a `quality` form field on /separate
+    because rate-limit dependencies are evaluated before the request
+    body is read - a Depends() can't see a Form value, so per-tier
+    limits need per-tier routes.
 
-    asyncio.create_task(_run_separation_background(job_id, file_path, file.filename))
+    Shares the same job store and the same /separate/status,
+    /separate/preview and /separate/download routes - the frontend only
+    changes which URL it POSTs to.
+    """
+    if not SEPARATION_HQ_ENABLED:
+        raise HTTPException(
+            503,
+            "High quality separation is temporarily unavailable due to server load. "
+            "Please use standard separation."
+        )
 
-    logger.info(f"[SEPARATION] Job {job_id} queued for '{file.filename}'")
-    return JSONResponse({"job_id": job_id, "status": "processing"})
-
+    return await _queue_separation(
+        file, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
+        DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ, "/separate-hq",
+    )
 
 @router.get("/separate/status/{job_id}")
 async def separation_status(job_id: str):
@@ -504,6 +587,185 @@ async def separation_download(job_id: str, stem: str = Query(...)):
     filename = f"{stem}.wav"
     return FileResponse(path, media_type="audio/wav", filename=filename)
 
+# ============================================================
+# /stems - Demucs full multi-stem separation (async job flow)
+#
+# Same model, same semaphore, same CPU cost as /separate - the only
+# difference is that the four internally-separated sources are kept as
+# individual files instead of three being summed into no_vocals.wav.
+#
+# Its own status/preview/download routes rather than reusing /separate's,
+# because the output shape differs: a stems job stores a {stem: path}
+# dict, so the stem name is validated against that dict's keys rather
+# than a fixed vocals/instrumental pair.
+# ============================================================
+
+async def _run_stems_background(
+    job_id: str,
+    file_path: str,
+    original_filename: str,
+    model: str,
+    overlap: float,
+    timeout_seconds: int,
+    max_duration_seconds: int,
+    metric_label: str,
+):
+    succeeded = False
+    async with _separation_semaphore:
+        try:
+            stems = await run_blocking(
+                run_stem_separation, file_path, job_id,
+                model, overlap, timeout_seconds, max_duration_seconds,
+            )
+            mark_stems_complete(job_id, original_filename, stems)
+            logger.info(f"[STEMS] Job {job_id} finished successfully ({model}, {len(stems)} stems)")
+            succeeded = True
+        except SeparationError as e:
+            mark_failed(job_id, str(e))
+            logger.warning(f"[STEMS] Job {job_id} failed: {e}")
+        except Exception as e:
+            mark_failed(job_id, "Stem separation failed unexpectedly.")
+            logger.error(f"[STEMS] Job {job_id} failed unexpectedly: {e}", exc_info=True)
+        finally:
+            cleanup_file(file_path)
+            release_memory_to_os()
+            record_result(metric_label, succeeded)
+
+
+async def _queue_stems(
+    file: UploadFile,
+    model: str,
+    overlap: float,
+    timeout_seconds: int,
+    max_duration_seconds: int,
+    metric_label: str,
+) -> JSONResponse:
+    """Shared submit path for /stems and /stems-hq. Mirrors
+    _queue_separation above, but creates a "stems"-typed job so the
+    status/preview/download routes below can reject a job_id that
+    belongs to a different tool."""
+    cleanup_expired_jobs()
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_BYTES:
+        size_mb = len(content) / (1024 * 1024)
+        raise HTTPException(400, f"File too large ({size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    job_id = create_job(job_type="stems")
+    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    with open(file_path, "wb") as f:
+        f.write(content)
+    del content
+
+    asyncio.create_task(_run_stems_background(
+        job_id, file_path, file.filename,
+        model, overlap, timeout_seconds, max_duration_seconds, metric_label,
+    ))
+
+    logger.info(f"[STEMS] Job {job_id} queued for '{file.filename}' (model={model})")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.post(
+    "/stems",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=STEMS_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=STEMS_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def stems_route(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, immediately returns a job_id, and runs full
+    4-stem Demucs separation (vocals/drums/bass/other) in the
+    background. Poll GET /stems/status/{job_id} to track progress - the
+    status response lists the available stem names once complete.
+    """
+    return await _queue_stems(
+        file, SEPARATION_MODEL, SEPARATION_OVERLAP,
+        DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS, "/stems",
+    )
+
+
+@router.post(
+    "/stems-hq",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def stems_route_hq(file: UploadFile = File(...)):
+    """
+    High-quality full stem separation: htdemucs_ft at raised overlap.
+    Same longer timeout, tighter duration cap and stricter rate limit as
+    /separate-hq, and gated by the same SEPARATION_HQ_ENABLED switch.
+    """
+    if not SEPARATION_HQ_ENABLED:
+        raise HTTPException(
+            503,
+            "High quality separation is temporarily unavailable due to server load. "
+            "Please use standard stem separation."
+        )
+
+    return await _queue_stems(
+        file, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
+        DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ, "/stems-hq",
+    )
+
+
+@router.get("/stems/status/{job_id}")
+async def stems_status(job_id: str):
+    """Returns the usual status fields plus the list of stem names that
+    are actually available - so the frontend can render download buttons
+    from the response instead of hardcoding stem names and breaking if a
+    different model is ever configured."""
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "stems":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    stems = job.get("stems") or {}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "title": job.get("title"),
+        "error": job.get("error"),
+        "stems": sorted(stems.keys()),
+    }
+
+
+def _resolve_stems_file(job_id: str, stem: str) -> str:
+    """Stems equivalent of _resolve_stem_path above. Validates the
+    requested stem against the job's OWN stem dict rather than a
+    hardcoded tuple, so the valid set follows whatever model produced
+    the job."""
+    job = get_job(job_id)
+    if job is None or job["job_type"] != "stems":
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    stems = job.get("stems") or {}
+    if stem not in stems:
+        raise HTTPException(400, f"stem must be one of: {', '.join(sorted(stems.keys()))}")
+    path = stems[stem]
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Stem file not found (it may have expired).")
+    return path
+
+
+@router.get("/stems/preview/{job_id}")
+async def stems_preview(job_id: str, stem: str = Query(...)):
+    """Streams one stem inline for in-browser <audio> playback."""
+    path = _resolve_stems_file(job_id, stem)
+    return FileResponse(path, media_type="audio/wav")
+
+
+@router.get("/stems/download/{job_id}")
+async def stems_download(job_id: str, stem: str = Query(...)):
+    """Same file as /preview, served as a downloadable attachment."""
+    path = _resolve_stems_file(job_id, stem)
+    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
 
 # ============================================================
 # Shared helper for every audio-tool's preview/download routes below

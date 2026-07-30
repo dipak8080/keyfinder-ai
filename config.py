@@ -116,18 +116,60 @@ ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")
 # ---------- CACHING ----------
 CACHE_MAX_AGE_SECONDS = int(os.environ.get("CACHE_MAX_AGE_SECONDS", str(30 * 24 * 60 * 60)))  # 30 days
 
-# ---------- SEPARATION (Demucs vocal/instrumental remover) ----------
+# ---------- SEPARATION (Demucs vocal remover + full stem splitter) ----------
 # Local VPS disk, not R2 - stems are large (up to ~4x original file size
-# across vocals+instrumental), rarely re-requested (unlike the download
-# cache), and only need to live for a couple hours (preview + download
-# window), so a TTL-cleaned local directory is simpler and cheaper than
-# routing through R2 for something this ephemeral.
+# across vocals+instrumental, and roughly double that again for a full
+# 4-stem split), rarely re-requested (unlike the download cache), and
+# only need to live for a couple hours (preview + download window), so a
+# TTL-cleaned local directory is simpler and cheaper than routing through
+# R2 for something this ephemeral.
 SEPARATION_DIR = "separated"
 os.makedirs(SEPARATION_DIR, exist_ok=True)
 
+# Every Demucs model this app is allowed to invoke. Nothing outside this
+# tuple ever reaches the `demucs -n <model>` CLI arg. Two reasons this is
+# a whitelist rather than a free-form string:
+#   1. A model name is passed straight through to a subprocess arg list -
+#      a value beginning with "-" would be parsed by Demucs as a FLAG,
+#      not a model name. (No shell injection risk since we never use
+#      shell=True, but arg-position confusion is still real.)
+#   2. A typo'd-but-harmless name means Demucs tries to fetch weights
+#      that don't exist, and the job fails minutes later with an opaque
+#      error instead of being rejected instantly at config load.
+# NOTE: only models whose weights are already on disk (see TORCH_HOME on
+# the persistent volume) should be listed here. A model listed here but
+# NOT cached will make its first request spend several minutes
+# downloading ~1GB of weights and almost certainly blow the timeout.
+ALLOWED_SEPARATION_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s")
+
+# Which stems each model actually produces, in the order Demucs names
+# them. Used by separation.py to know which output files to expect from a
+# full (non-two-stems) run, and by the /stems routes to validate a
+# requested stem name. Keeping this as data rather than hardcoding
+# ("vocals", "drums", "bass", "other") in separation.py means wiring up
+# htdemucs_6s later needs no code change at all.
+MODEL_STEM_NAMES = {
+    "htdemucs": ("vocals", "drums", "bass", "other"),
+    "htdemucs_ft": ("vocals", "drums", "bass", "other"),
+    "htdemucs_6s": ("vocals", "drums", "bass", "other", "guitar", "piano"),
+}
+
+# ----- STANDARD (fast) separation path -----
 # Demucs model name - htdemucs is the standard pretrained model, good
-# quality/speed balance for two-stem (vocals/instrumental) separation.
+# quality/speed balance.
+#
+# Worth knowing: --two-stems=vocals does NOT make the vocal remover
+# cheaper than a full stem split. Demucs separates all sources
+# internally either way and simply sums the non-vocal ones for us. That's
+# why /stems costs the same CPU as /separate and shares every tunable
+# below.
 SEPARATION_MODEL = os.environ.get("SEPARATION_MODEL", "htdemucs")
+
+# Demucs' own default overlap between the chunks it splits a long track
+# into before processing. Made explicit here (rather than relying on the
+# CLI default) so both paths pass the flag and the standard-vs-HQ
+# difference is visible in one place.
+SEPARATION_OVERLAP = float(os.environ.get("SEPARATION_OVERLAP", "0.25"))
 
 # Hard ceiling on how long the Demucs subprocess is allowed to run before
 # it's killed - protects against a hung/stuck process eating a worker
@@ -141,21 +183,101 @@ DEMUCS_TIMEOUT_SECONDS = int(os.environ.get("DEMUCS_TIMEOUT_SECONDS", "600"))
 # budget on its own. 600s = 10 min track cap.
 MAX_SEPARATION_DURATION_SECONDS = int(os.environ.get("MAX_SEPARATION_DURATION_SECONDS", "600"))
 
+# ----- HIGH QUALITY (slow) separation path -----
+# htdemucs_ft is a "bag of 4" - four separate model instances, each
+# fine-tuned toward one stem, ensembled. It is the highest-quality model
+# Demucs ships (better SDR across every stem than plain htdemucs), and it
+# costs roughly 4x the CPU time because it's effectively 4 forward passes
+# instead of 1.
+#
+# NOT htdemucs_6s: that model adds guitar/piano stems but scores WORSE on
+# the four core stems (vocals/drums/bass/other) because its capacity is
+# split six ways. It's a different feature, not a quality upgrade.
+SEPARATION_MODEL_HQ = os.environ.get("SEPARATION_MODEL_HQ", "htdemucs_ft")
+
+# Raising overlap from Demucs' 0.25 default reduces chunk-boundary
+# artifacts on longer tracks. Cheapest quality knob available (~1.3x
+# time) - far better value per CPU-second than --shifts, which is why
+# --shifts is deliberately NOT wired up: at ~2x on top of htdemucs_ft's
+# 4x it pushes a normal track past any tolerable wait.
+SEPARATION_OVERLAP_HQ = float(os.environ.get("SEPARATION_OVERLAP_HQ", "0.5"))
+
+# ~5x the standard path's cost (4x model + 1.3x overlap), so the timeout
+# has to grow with it or every HQ job dies on a technicality.
+DEMUCS_TIMEOUT_SECONDS_HQ = int(os.environ.get("DEMUCS_TIMEOUT_SECONDS_HQ", "1800"))  # 30 min
+
+# Tighter than the standard path's cap, NOT looser - counterintuitive but
+# correct: at ~5x the per-minute-of-audio cost, a 10 min track would eat
+# the entire 30 min timeout budget and gamble on finishing. 6 min keeps
+# worst case comfortably inside the timeout.
+MAX_SEPARATION_DURATION_SECONDS_HQ = int(os.environ.get("MAX_SEPARATION_DURATION_SECONDS_HQ", "360"))  # 6 min
+
+# Kill switch covering BOTH high-quality routes (/separate-hq and
+# /stems-hq). Flip to false to stop accepting 15-20 min jobs that
+# monopolise the single separation slot - submissions get a clean
+# rejection pointing at the standard path instead of silently queueing
+# behind each other.
+#
+# Env-driven, so changing it needs a redeploy or container restart. The
+# public root response exposes it so the frontend can hide the HQ toggle
+# rather than letting users submit into a guaranteed error.
+SEPARATION_HQ_ENABLED = os.environ.get("SEPARATION_HQ_ENABLED", "true").lower() == "true"
+
+# ----- Model whitelist enforcement -----
+# Applied AFTER both model settings are read so one loop covers both. A
+# bad value falls back to the known-good default rather than raising: a
+# typo'd env var shouldn't take the whole API down on boot, it should
+# just mean separation runs the model we know is cached.
+for _var_name, _fallback in (("SEPARATION_MODEL", "htdemucs"), ("SEPARATION_MODEL_HQ", "htdemucs_ft")):
+    _value = globals()[_var_name]
+    if _value not in ALLOWED_SEPARATION_MODELS:
+        logger.error(
+            f"[SEPARATION] {_var_name}='{_value}' is not an allowed model "
+            f"{ALLOWED_SEPARATION_MODELS} - falling back to '{_fallback}'"
+        )
+        globals()[_var_name] = _fallback
+
+# ----- Job lifetime -----
 # How long a completed/failed job (and its stem files, if complete) stays
 # around before cleanup_expired_jobs() deletes it. 2 hours is generous
 # for a preview-then-download flow without accumulating stale files.
+# Shared by separation AND stems jobs (see jobs.py's create_job) - stems
+# takes just as long to produce, so it needs just as long a window.
 SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", str(2 * 60 * 60)))
 
+# ----- Rate limits -----
 # Separation is by far the most expensive endpoint (CPU + RAM heavy,
 # minutes not seconds) so it gets its own, much stricter rate limit than
 # /download and /analyze's shared 3-per-60s rule.
 SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "2"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
 
-# Caps how many Demucs subprocesses can run at once across ALL users -
-# separate from MAX_CONCURRENT_ANALYSIS/DOWNLOADS since Demucs is far more
-# RAM-hungry per job than either of those. Keep at 1 unless you've
-# confirmed your VPS has RAM to spare for more.
+# Stricter still for HQ: one job can hold the single separation slot for
+# 15-20 minutes, so 2/hour would let a single IP occupy most of an hour
+# and starve everyone else's standard-path jobs behind it.
+SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
+SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+
+# /stems costs the same CPU as /separate (same model, same run - only the
+# output files differ) so it gets the same limits. Note these are
+# SEPARATE per-IP buckets from /separate's, since the rate limiter keys
+# on path: one IP can spend its /separate budget AND its /stems budget in
+# the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS=1
+# regardless, so the practical cap is wait time, not throughput.
+STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "2"))
+STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+
+STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
+STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+
+# Caps how many Demucs subprocesses can run at once across ALL users and
+# ALL FOUR separation routes (/separate, /separate-hq, /stems,
+# /stems-hq) - separate from MAX_CONCURRENT_ANALYSIS/DOWNLOADS since
+# Demucs is far more RAM-hungry per job than either of those.
+#
+# Doubly non-negotiable now: htdemucs_ft holds this slot for 15-20 min at
+# a time, and all four routes share it. Raising this doesn't add
+# throughput on 4 cores, it just makes every concurrent job slower.
 MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "1"))
 
 
