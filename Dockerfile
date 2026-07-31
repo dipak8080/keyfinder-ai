@@ -58,5 +58,11 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Copy all your code
 COPY . .
 
+# Ensure entrypoint.sh is executable regardless of the file mode git stored
+# for it (Windows-authored files often lose the exec bit on commit) - this
+# guarantees the container can always run it, independent of host OS or
+# git config.
+RUN chmod +x entrypoint.sh
+
 # Run the app with dynamic port
 CMD ["/app/entrypoint.sh"]
