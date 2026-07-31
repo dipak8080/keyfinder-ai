@@ -103,6 +103,18 @@ PROXY_QUOTA_ERROR_MARKERS = (
     "account suspended",
     "proxy authentication failed",  # several providers reuse this for "balance = 0", not just bad creds
     "407",  # HTTP 407 Proxy Authentication Required - overloaded by some providers for "no balance"
+    # Connection-level failures, not billing - a proxy provider outage
+    # (their gateway can't reach the destination at all) looks
+    # different from a quota error but is exactly as unrecoverable
+    # within the current request. Without these, an outage like this
+    # never trips the breaker, so every subsequent request keeps
+    # paying the ~30s proxy-retry cost until the outage ends on its
+    # own - broad-matching here is the same "false positive is cheap,
+    # false negative is expensive" reasoning as the rest of this list.
+    "no_host_connection",
+    "tunnel connection failed",
+    "unable to connect to proxy",
+    "502",
 )
 
 # Errors meaning the video is blocked FOR A SPECIFIC REGION by the
