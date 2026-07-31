@@ -325,6 +325,40 @@ def is_ip_block_error(error_text: str) -> bool:
     )
 
 
+def should_use_proxy(error_text: str) -> bool:
+    """
+    Narrows proxy escalation to failures that actually LOOK like an
+    IP-reputation problem - a bot-check page, a 403 on the media fetch, or
+    another marker in IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - rather than
+    escalating on every non-permanent failure like the previous behavior
+    did. The goal is to stop paying proxy bandwidth on truly generic/
+    unrecognized yt-dlp errors (network blips, a brand-new uncatalogued
+    error string) where there's no actual evidence a different IP would
+    help.
+
+    IMPORTANT CAVEAT: this does NOT reduce proxy usage for the current
+    known mweb/web PO-token-bound-to-video-id 403 bug (tracked upstream in
+    yt-dlp) - that error text ("unable to download video data: HTTP Error
+    403: Forbidden") already matches IP_BLOCK_MARKERS, so this function
+    still returns True for it, same as before this change. Proxy has
+    already been confirmed NOT to fix that specific bug (the same 403
+    occurs through the proxy too) - this function only reduces spend on
+    failures OUTSIDE that known issue, it is not a cost-control measure
+    for it. Toggle YT_PROXY_URL off entirely if you want to stop paying
+    for proxy attempts against that specific bug until yt-dlp ships an
+    upstream fix.
+
+    Trade-off worth knowing: like every other classifier in this file,
+    this is marker-list based. A genuinely new, not-yet-catalogued
+    YouTube error that a different IP WOULD have fixed will now skip
+    proxy entirely until its text is recognized and added to
+    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - watch the
+    "[PROXY] Not escalating to proxy" log line for repeating unrecognized
+    error text as the signal something needs adding.
+    """
+    return is_ip_block_error(error_text) or is_bot_check_error(error_text)
+
+
 def is_permanent_error(error_text: str) -> bool:
     """True if the error means the video itself can never be downloaded -
     no amount of retrying, cookie refreshing, or proxy switching helps.
@@ -813,17 +847,22 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 fall through to Layer 2 instead of wasting the remaining
                 accounts on a failure they can't fix either.
 
-      Layer 2 - PROXY, tried for any Layer 1 failure EXCEPT a confirmed
-                permanent error, age-restriction, members-only, or
-                not-yet-live error (see is_permanent_error and the three
-                account-identity/timing checks below) - a different IP
-                fixes IP-reputation problems, not account privilege or
-                stream timing. Uses whichever cookie account is STILL
-                available (not yet disabled) at this point, if any -
-                proxy fixes IP reputation, cookies fix session identity,
-                the two are independent problems that can combine (e.g. an
-                IP-blocked request might still benefit from a valid
-                cookie session once retried through a clean IP).
+      Layer 2 - PROXY, tried only when should_use_proxy() confirms the
+                failure actually LOOKS like an IP-reputation problem (a
+                bot-check page, a 403 on the media fetch, or another
+                IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS match) - AND it
+                isn't a confirmed permanent error, age-restriction,
+                members-only, or not-yet-live error (see is_permanent_error
+                and the three account-identity/timing checks below), since
+                a different IP fixes IP-reputation problems, not account
+                privilege, stream timing, or a truly generic/unrecognized
+                failure with no evidence a different IP would help. Uses
+                whichever cookie account is STILL available (not yet
+                disabled) at this point, if any - proxy fixes IP
+                reputation, cookies fix session identity, the two are
+                independent problems that can combine (e.g. an IP-blocked
+                request might still benefit from a valid cookie session
+                once retried through a clean IP).
 
     Before EVERY attempt (both layers), _set_active_account() records
     which cookie file (if any) is in use for THIS attempt - this is what
@@ -911,6 +950,19 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             "[PROXY] Skipping proxy tier - failure is an age-restriction/"
             "members-only/not-yet-live requirement, not an IP/bot-check "
             "problem: no available cookie account satisfies it for this video."
+        )
+        raise last_error
+
+    # IMPORTANT: paid proxy is only used for failures that actually match
+    # a known IP-reputation/bot-check signal - see should_use_proxy() for
+    # the reasoning and its caveat about the current mweb 403 bug still
+    # qualifying here (proxy just doesn't happen to fix that particular
+    # bug, even though it's a legitimate IP-block-shaped error).
+    if not should_use_proxy(first_error):
+        logger.warning(
+            f"[PROXY] Not escalating to proxy - failure doesn't match a known "
+            f"IP-reputation/bot-check signal, so a different IP is unlikely to "
+            f"help: {first_error[:200]}"
         )
         raise last_error
 
