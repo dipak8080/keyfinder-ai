@@ -230,7 +230,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     output_file = os.path.join(UPLOAD_DIR, f"{temp_id}.{format}")
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': '140/bestaudio/best',
         'outtmpl': temp_path,
         'quiet': False,
         'verbose': True,
