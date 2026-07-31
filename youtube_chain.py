@@ -117,7 +117,7 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         'ffmpeg_location': '/usr/bin/ffmpeg',
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'android_vr', 'mweb', 'web']
+                'player_client': ['mweb', 'web', 'android', 'ios', 'android_vr']
             }
         },
         'postprocessors': [{
