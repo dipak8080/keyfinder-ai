@@ -238,7 +238,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'ffmpeg_location': '/usr/bin/ffmpeg',
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'android_vr', 'mweb', 'web']
+                'player_client': ['ios', 'android', 'android_vr']
             }
         },
         'postprocessors': [{
