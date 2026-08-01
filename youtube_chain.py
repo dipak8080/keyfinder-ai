@@ -109,7 +109,7 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     output_file = os.path.join(UPLOAD_DIR, f"{job_id}_ytchain.wav")
 
     ydl_opts = {
-        'format': '140/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': temp_path,
         'quiet': False,
         'verbose': True,
