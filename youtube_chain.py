@@ -115,10 +115,7 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         'verbose': True,
         'noplaylist': True,
         'ffmpeg_location': '/usr/bin/ffmpeg',
-                'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'android', 'android_vr', 'mweb', 'web']
-            },
+        'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
             }
