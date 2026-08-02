@@ -16,7 +16,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 FFMPEG_PATH = "/usr/bin/ffmpeg"
 
 # ---------- UPLOAD LIMITS ----------
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))  # 80 MB
 
 # ---------- YT-DLP RETRY CONFIG ----------
 YT_DLP_MAX_ATTEMPTS = 3
@@ -101,7 +101,7 @@ ALLOW_LOVABLE_PREVIEW_ORIGINS = os.environ.get("ALLOW_LOVABLE_PREVIEW_ORIGINS", 
 
 # ---------- RATE LIMITING ----------
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true"
-RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "3"))
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 # ---------- MONITORING / ALERTING ----------
@@ -249,7 +249,7 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # Separation is by far the most expensive endpoint (CPU + RAM heavy,
 # minutes not seconds) so it gets its own, much stricter rate limit than
 # /download and /analyze's shared 3-per-60s rule.
-SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "2"))
+SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "10"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
 
 # Stricter still for HQ: one job can hold the single separation slot for
@@ -264,7 +264,7 @@ SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE
 # on path: one IP can spend its /separate budget AND its /stems budget in
 # the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS=1
 # regardless, so the practical cap is wait time, not throughput.
-STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "2"))
+STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "10"))
 STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
 
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
