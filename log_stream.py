@@ -65,6 +65,29 @@ FIXES APPLIED (2026-07-24):
      sent). The frontend uses this to draw a divider only when the
      request ID actually changes between consecutive log lines, instead
      of between every single line.
+
+FIXES APPLIED (2026-08-02):
+  8. "Failed" used to mean "not a 2xx/3xx," which counted a LOT of
+     completely normal traffic as failure: a bot probing for
+     /api/auth/validate-sso (404 - the route correctly doesn't exist), a
+     visitor who hit a rate limit (429 - working as designed), a
+     separation request rejected because the queue was full (503 - also
+     working as designed). All of that is CLIENT behavior, not a server
+     problem, and lumping it in with "failed" made the dashboard's top
+     numbers actively misleading - a spike of bot noise looked identical
+     to the app being broken.
+
+     Split into three buckets instead of two:
+       - success: status_code < 400
+       - client:  400-499  (bad/rejected requests - expected, not a bug)
+       - server:  500+     (the backend actually broke - THIS is what to
+                            chase)
+
+     The JSON responses from get_http_logs() now return
+     {total, success, client, server, logs} instead of
+     {total, success, failed, logs}. Per-row coloring in the table was
+     already correct (amber for 4xx, red for 5xx) - only the SUMMARY
+     counters were conflating the two.
 --------------------------------------------------------------------------
 """
 
@@ -235,6 +258,40 @@ def _check_admin(key: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _status_counts(conn) -> dict:
+    """
+    Shared by the full-window and delta code paths in get_http_logs()
+    below, so the two can never define "success"/"client"/"server"
+    differently by accident.
+
+    Three buckets, not two:
+      - success: < 400
+      - client:  400-499 - the CALLER's request was rejected for a normal
+                 reason (bad upload, rate limit, queue full, bot probing
+                 a route that doesn't exist). Expected traffic, not a bug.
+      - server:  >= 500 - the backend itself broke. This is the number
+                 worth watching; a spike here means something is actually
+                 wrong, unlike a spike in "client" which usually just
+                 means more bots found the server today.
+    """
+    total = conn.execute("SELECT COUNT(*) as c FROM request_logs").fetchone()["c"]
+    success = conn.execute(
+        "SELECT COUNT(*) as c FROM request_logs WHERE status_code < 400"
+    ).fetchone()["c"]
+    client_errors = conn.execute(
+        "SELECT COUNT(*) as c FROM request_logs WHERE status_code >= 400 AND status_code < 500"
+    ).fetchone()["c"]
+    server_errors = conn.execute(
+        "SELECT COUNT(*) as c FROM request_logs WHERE status_code >= 500"
+    ).fetchone()["c"]
+    return {
+        "total": total,
+        "success": success,
+        "client": client_errors,
+        "server": server_errors,
+    }
+
+
 @router.get("/admin/logs/http/data")
 def get_http_logs(
     key: str = Query(...),
@@ -255,13 +312,8 @@ def get_http_logs(
             rows = conn.execute(
                 "SELECT * FROM request_logs ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        total = conn.execute("SELECT COUNT(*) as c FROM request_logs").fetchone()["c"]
-        success = conn.execute(
-            "SELECT COUNT(*) as c FROM request_logs WHERE status_code < 400"
-        ).fetchone()["c"]
-    return JSONResponse(
-        {"total": total, "success": success, "failed": total - success, "logs": [dict(r) for r in rows]}
-    )
+        counts = _status_counts(conn)
+    return JSONResponse({**counts, "logs": [dict(r) for r in rows]})
 
 
 async def _http_log_event_generator():
@@ -393,6 +445,12 @@ def delete_logs(key: str = Query(...), older_than_days: int = Query(None)):
 
 # ============================================================
 # 4. DASHBOARD UI
+#
+# This inline HTML dashboard is a separate, self-contained fallback UI
+# from the Next.js /admin/logs page - the Next.js page is what you
+# actually use day to day, but this one hits the exact same
+# get_http_logs()/get_system_logs() endpoints and must stay consistent
+# with the same {success, client, server} shape.
 # ============================================================
 
 @router.get("/admin/logs", response_class=HTMLResponse)
@@ -415,7 +473,8 @@ def logs_dashboard(key: str = Query(...)):
   .stat-box .label { font-size: 12px; color: #888; }
   .stat-box .value { font-size: 20px; font-weight: 600; }
   .success { color: #4ade80; }
-  .failed { color: #f87171; }
+  .client-error { color: #fbbf24; }
+  .server-error { color: #f87171; }
   .controls { margin-bottom: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .controls-label { font-size: 12px; color: #666; margin-right: 4px; }
   select, input[type=text], input[type=date] {
@@ -470,7 +529,8 @@ def logs_dashboard(key: str = Query(...)):
     <div class="stats">
       <div class="stat-box"><div class="label">Total</div><div class="value" id="total">-</div></div>
       <div class="stat-box"><div class="label">Success</div><div class="value success" id="success">-</div></div>
-      <div class="stat-box"><div class="label">Failed</div><div class="value failed" id="failed">-</div></div>
+      <div class="stat-box"><div class="label">Client Errors</div><div class="value client-error" id="clientErrors">-</div></div>
+      <div class="stat-box"><div class="label">Server Errors</div><div class="value server-error" id="serverErrors">-</div></div>
     </div>
 
     <div class="controls">
@@ -549,16 +609,22 @@ const MAX_LOGS_IN_MEMORY = 1000; // caps client-side memory growth for long-runn
 let isPaused = false;
 let pendingCount = 0;
 
-// FIX #2: track counters as real numbers, never re-parse DOM text (which
-// starts as "-" and turns any increment into NaN forever).
+// Track counts as real numbers, never re-parse DOM text (which starts as
+// "-" and turns any increment into NaN forever). Three buckets now, not
+// two - see the FIXES APPLIED note at the top of this file for why
+// "failed" was replaced with separate client (4xx) and server (5xx)
+// counts: a 404 from a bot or a 429 rate-limit is normal client
+// behavior, not evidence the app is broken.
 let totalCount = 0;
 let successCount = 0;
-let failedCount = 0;
+let clientErrorCount = 0;
+let serverErrorCount = 0;
 
 function renderCounters() {
   document.getElementById("total").innerText = totalCount;
   document.getElementById("success").innerText = successCount;
-  document.getElementById("failed").innerText = failedCount;
+  document.getElementById("clientErrors").innerText = clientErrorCount;
+  document.getElementById("serverErrors").innerText = serverErrorCount;
 }
 
 const NOISE_PATTERNS = [
@@ -591,13 +657,11 @@ function toNepalTime(isoString) {
   });
 }
 
-// FIX #1: isoString may already end in "Z" (e.g. new Date().toISOString()
-// from nepalTodayYMD()) or may be a bare SQLite timestamp with no zone
-// (e.g. "2026-07-19T15:15:16.963554" from the DB). Blindly appending "Z"
-// broke the first case ("...000ZZ" -> Invalid Date -> uncaught RangeError
-// in formatToParts -> whole init script halted, which is why the page
-// looked empty after every refresh even though the backend had all the
-// data). Only append "Z" when there's no zone suffix already.
+// isoString may already end in "Z" (e.g. new Date().toISOString() from
+// nepalTodayYMD()) or may be a bare SQLite timestamp with no zone (e.g.
+// "2026-07-19T15:15:16.963554" from the DB). Blindly appending "Z" broke
+// the first case ("...000ZZ" -> Invalid Date -> uncaught RangeError in
+// formatToParts). Only append "Z" when there's no zone suffix already.
 function getNepalYMD(isoString) {
   const hasZone = /Z$|[+-]\d{2}:\d{2}$/.test(isoString);
   const date = new Date(hasZone ? isoString : isoString + "Z");
@@ -626,9 +690,6 @@ function nepalTodayYMD() {
 }
 
 // ---------------- FILTER PERSISTENCE (localStorage) ----------------
-// This is a real production webpage (not a Claude artifact sandbox), so
-// localStorage works normally here - saves your filter preferences (e.g.
-// "always hide bot noise") across page reloads/tab closes.
 function saveFilterPrefs() {
   const prefs = {
     method: document.getElementById("methodFilter").value,
@@ -759,7 +820,8 @@ async function loadInitialHttp() {
     const data = await res.json();
     totalCount = data.total;
     successCount = data.success;
-    failedCount = data.failed;
+    clientErrorCount = data.client;
+    serverErrorCount = data.server;
     renderCounters();
     allHttpLogs = data.logs.reverse();
     applyFilter();
@@ -783,8 +845,10 @@ httpSource.onmessage = (event) => {
   totalCount++;
   if (log.status_code < 400) {
     successCount++;
+  } else if (log.status_code < 500) {
+    clientErrorCount++;
   } else {
-    failedCount++;
+    serverErrorCount++;
   }
   renderCounters();
 
@@ -843,12 +907,8 @@ async function deleteLogs(days) {
   loadInitialSystem();
 }
 
-// FIX #3: wrap the init sequence so one bad edge case (e.g. a date helper
-// throwing) can never again block loadInitialHttp()/loadInitialSystem()
-// from running, which was the actual root cause of the "empty after
-// refresh" bug — the uncaught RangeError from getNepalYMD (fixed above)
-// was thrown on this very line, halting the script before either load
-// call below ever executed.
+// Wrapped in try/catch so one bad date/edge case can never again block
+// the rest of the dashboard from loading.
 try {
   document.getElementById("customDate").max = ymdToKey(nepalTodayYMD());
 } catch (e) {
