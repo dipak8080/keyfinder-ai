@@ -35,7 +35,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 )
 
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))  # 15 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))  # 30 min
 
 # ---------- ANALYSIS TUNING ----------
 ANALYSIS_MAX_SECONDS: Optional[int] = 180
@@ -247,28 +247,34 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 
 # ----- Rate limits -----
 # Separation is by far the most expensive endpoint (CPU + RAM heavy,
-# minutes not seconds) so it gets its own, much stricter rate limit than
-# /download and /analyze's shared 3-per-60s rule.
+# minutes not seconds) so it gets its own, stricter rate limit than the
+# shared /download and /analyze rule.
+#
+# NOTE on why this is per-HOUR while the cheap tools are per-minute: the
+# limit here is not really about request rate, it's about how much of a
+# single-slot resource one person may claim. See MAX_QUEUED_SEPARATIONS
+# below - that, not this, is what actually protects the server. This
+# number only decides how often one IP may join the queue.
 SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "10"))
-SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # Stricter still for HQ: one job can hold the single separation slot for
-# 15-20 minutes, so 2/hour would let a single IP occupy most of an hour
-# and starve everyone else's standard-path jobs behind it.
+# 15-20 minutes, so a looser limit would let a single IP occupy most of
+# an hour and starve everyone else's standard-path jobs behind it.
 SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
-SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # /stems costs the same CPU as /separate (same model, same run - only the
 # output files differ) so it gets the same limits. Note these are
 # SEPARATE per-IP buckets from /separate's, since the rate limiter keys
 # on path: one IP can spend its /separate budget AND its /stems budget in
-# the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS=1
+# the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS
 # regardless, so the practical cap is wait time, not throughput.
 STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "10"))
-STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
-STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1/hour
+STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # Caps how many Demucs subprocesses can run at once across ALL users and
 # ALL FOUR separation routes (/separate, /separate-hq, /stems,
@@ -280,8 +286,21 @@ STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WIN
 # throughput on 4 cores, it just makes every concurrent job slower.
 MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "1"))
 
-
-
+# How many separation jobs may be in flight (running + waiting) before
+# new submissions are rejected with a 503.
+#
+# MAX_CONCURRENT_SEPARATIONS above caps how many RUN at once, but the
+# semaphore that enforces it is acquired INSIDE the background task -
+# so extra submissions were never rejected, they queued in memory with
+# no limit. Each queued job holds its uploaded file on disk and its
+# entry in the job table until it eventually runs, and the person
+# watching the spinner has no way to know they're twelfth in line.
+#
+# At ~3-5 min per standard job on one slot, 3 in flight is already a
+# ~15 minute wait for the last one. Past that, an immediate "the queue
+# is full, try again shortly" is more honest - and far cheaper - than
+# an open-ended wait that looks identical to the app being broken.
+MAX_QUEUED_SEPARATIONS = int(os.environ.get("MAX_QUEUED_SEPARATIONS", "3"))
 
 
 # ---------- AUDIO TOOLS (convert / trim / pitch / tempo / volume / reverse) ----------
@@ -469,13 +488,13 @@ ALLOWED_VIDEO_INPUT_FORMATS = frozenset({
 
 # Video files are an order of magnitude larger than the audio this app
 # normally handles - a few minutes of phone video routinely exceeds
-# MAX_UPLOAD_BYTES' 50MB. This endpoint therefore gets its own, much
-# higher cap.
+# MAX_UPLOAD_BYTES. This endpoint therefore gets its own, much higher
+# cap.
 #
-# Safe to raise this only because /video-to-audio streams the upload to
-# disk in chunks instead of reading the whole body into memory the way
-# every other route does. Reading 200MB via `await file.read()` on a 6GB
-# box would be reckless; writing it in 1MB chunks costs almost nothing.
+# Safe to raise this only because uploads are streamed to disk in chunks
+# rather than read whole into memory (see upload.py). Reading 200MB via
+# `await file.read()` on a 6GB box with no swap would be reckless;
+# writing it in 1MB chunks costs almost nothing.
 MAX_VIDEO_UPLOAD_BYTES = int(os.environ.get("MAX_VIDEO_UPLOAD_BYTES", str(200 * 1024 * 1024)))  # 200 MB
 
 # Separate from MAX_VIDEO_DURATION_SECONDS (which caps YouTube
@@ -505,6 +524,11 @@ JOIN_MAX_FILES = int(os.environ.get("JOIN_MAX_FILES", "10"))
 # Total across ALL files in one request, not per file - ten files at
 # 45MB each would otherwise sail past a per-file check and land 450MB on
 # disk. Same streaming-upload reasoning as MAX_VIDEO_UPLOAD_BYTES.
+#
+# NOTE: this is a TOTAL, and the per-file MAX_UPLOAD_BYTES still applies
+# to each individual file in the batch. Both limits are real, and the
+# frontend needs to state both - a single file over MAX_UPLOAD_BYTES is
+# rejected even when the combined total is well under this number.
 JOIN_MAX_TOTAL_BYTES = int(os.environ.get("JOIN_MAX_TOTAL_BYTES", str(150 * 1024 * 1024)))  # 150 MB
 
 # Also a total, for the same reason: ten four-minute files is a
