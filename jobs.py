@@ -47,11 +47,45 @@ different fields on the same underlying dict.
 Existing call sites (create_job() with no args, mark_complete() with the
 original 4 positional args) are unaffected - both keep their original
 default behavior for separation jobs.
+
+--------------------------------------------------------------------------
+THREE ADDITIONS (2026-08-02), each solving a failure this file could not
+previously see:
+
+1. count_processing(job_types) - the queue-depth reading that makes a
+   BOUNDED queue possible. MAX_CONCURRENT_SEPARATIONS=1 caps how many
+   Demucs runs happen at once, but nothing capped how many were allowed
+   to PILE UP behind it. Each queued job holds its uploaded file on disk
+   and its entry in this table indefinitely, and the user watching a
+   spinner has no idea they are 12th in line. A route can now read the
+   depth and reject with a clean 503 instead of silently enqueueing.
+
+2. fail_if_unfinished(job_id, error) - the safety net for background
+   tasks. Every _run_*_background() marks its job failed in an `except`
+   block, but an exception raised OUTSIDE those handlers (most really:
+   acquire_slot_or_503() raising HTTPException inside a background task
+   where no HTTP layer exists to catch it, or a CancelledError on
+   shutdown) skips every handler. The job then sits at "processing"
+   forever, the frontend polls it until its own timeout, and the file
+   stays on disk until TTL. Called from a `finally`, this guarantees a
+   job always reaches a terminal state. It is deliberately a no-op when
+   the job already completed or failed, so it can be called
+   unconditionally without clobbering a real result.
+
+3. cleanup_expired_jobs() no longer deletes files while holding the
+   lock. It previously did os.remove() inside `with _lock:` - a stems
+   job holds 4+ full-length WAVs, so a sweep could hold the lock across
+   many blocking disk syscalls. Since get_job() needs that same lock,
+   every in-flight status poll stalled for the duration of the sweep.
+   The lock is now held only long enough to pop the expired entries and
+   collect their paths; deletion happens after releasing it.
+--------------------------------------------------------------------------
 """
+import os
 import time
 import threading
 import uuid
-from typing import Optional
+from typing import Iterable, Optional
 
 from config import logger, SEPARATION_JOB_TTL_SECONDS, AUDIO_TOOL_JOB_TTL_SECONDS
 
@@ -89,6 +123,12 @@ _jobs = {}
 # NOT here - it's ffmpeg-only and cheap to redo, so it uses the
 # audio-tools default despite sharing the "stems" dict storage shape.
 _LONG_TTL_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
+
+# Every job_type that ends up contending for the single separation
+# semaphore. Grouped here rather than spelled out at the call site so
+# adding a fifth Demucs-backed route later can't accidentally escape the
+# queue-depth check - see count_processing() below.
+SEPARATION_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
 
 
 def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) -> str:
@@ -239,21 +279,130 @@ def mark_failed(job_id: str, error: str):
             })
 
 
+def fail_if_unfinished(job_id: str, error: str = "The job ended unexpectedly.") -> bool:
+    """
+    Marks a job failed ONLY if it is still "processing". Returns True if
+    it actually changed anything.
+
+    Meant to be called from a `finally` block in every background task,
+    where it is a no-op on the happy path (the job is already "complete")
+    and a rescue on the paths no `except` clause covers:
+
+      - acquire_slot_or_503() raising HTTPException inside a background
+        task - there is no HTTP layer out there to catch it, so the
+        exception propagates out of the task and every mark_failed() in
+        the except-chain is skipped.
+      - asyncio.CancelledError during shutdown.
+      - Any bug in the handler code itself, including inside an existing
+        `except` block.
+
+    Without this, such a job sits at "processing" forever: the frontend
+    polls until its own client-side timeout and reports something vague
+    like "connection dropped", the input file waits for the TTL sweep,
+    and the server-side logs show no failure at all because none was
+    ever recorded. That combination is exactly what makes this class of
+    bug so hard to trace after the fact.
+
+    The WARNING it logs is deliberate and load-bearing: reaching this
+    function at all means an exception escaped its intended handler,
+    which is worth seeing in the dashboard even though the user now gets
+    a clean error.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None or job["status"] != "processing":
+            return False
+        job.update({"status": "failed", "error": error})
+
+    logger.warning(
+        f"[JOBS] Job {job_id} was still 'processing' when its task ended - "
+        f"force-failed via safety net: {error}"
+    )
+    return True
+
+
 def get_job(job_id: str) -> Optional[dict]:
     with _lock:
         job = _jobs.get(job_id)
         return dict(job) if job else None
 
 
-def cleanup_expired_jobs():
+def count_processing(job_types: Optional[Iterable[str]] = None) -> int:
+    """
+    How many jobs are currently "processing", optionally restricted to
+    specific job_types.
+
+    This is the reading a route needs to enforce a BOUNDED queue.
+    MAX_CONCURRENT_SEPARATIONS caps how many Demucs runs happen at once,
+    but the semaphore is acquired INSIDE the background task - so extra
+    submissions are not rejected, they queue in memory with no limit,
+    each holding an uploaded file on disk and a table entry until it
+    eventually runs. Ten queued separations on a one-slot machine is
+    roughly fifty minutes of invisible waiting for whoever is last.
+
+    Counting live rather than maintaining a separate counter avoids the
+    classic drift bug where an incremented counter never gets
+    decremented on some error path - the job table is already the source
+    of truth for what is running.
+
+    Note the count includes jobs actively running, not just waiting, so
+    a route comparing against a threshold is measuring total in-flight
+    work. That is the number worth bounding.
+    """
+    with _lock:
+        if job_types is None:
+            return sum(1 for j in _jobs.values() if j["status"] == "processing")
+        wanted = set(job_types)
+        return sum(
+            1 for j in _jobs.values()
+            if j["status"] == "processing" and j["job_type"] in wanted
+        )
+
+
+def get_job_stats() -> dict:
+    """
+    Snapshot of the job table for /admin/status and periodic logging:
+    totals by status, plus the separation-queue depth that the bounded
+    queue keys on. One pass under one lock rather than several calls
+    that could each see a different moment.
+    """
+    with _lock:
+        total = len(_jobs)
+        by_status = {"processing": 0, "complete": 0, "failed": 0}
+        separation_processing = 0
+        oldest_processing_age = 0.0
+        now = time.time()
+
+        for job in _jobs.values():
+            status = job["status"]
+            by_status[status] = by_status.get(status, 0) + 1
+            if status == "processing":
+                if job["job_type"] in SEPARATION_JOB_TYPES:
+                    separation_processing += 1
+                age = now - job["created_at"]
+                if age > oldest_processing_age:
+                    oldest_processing_age = age
+
+    return {
+        "total": total,
+        **by_status,
+        "separation_queue_depth": separation_processing,
+        "oldest_processing_seconds": round(oldest_processing_age, 1),
+    }
+
+
+def cleanup_expired_jobs() -> int:
     """
     Deletes job entries (and their on-disk output files, where
-    applicable) older than their own ttl_seconds. Call this
-    periodically (e.g. once per request, or on a background timer)
-    rather than relying on job entries to be cleaned up individually -
-    a user who never comes back to download their result would
-    otherwise leave both the job dict entry and its output files on
-    disk forever.
+    applicable) older than their own ttl_seconds. Returns how many were
+    removed.
+
+    Call this on a background timer (see main.py's _job_cleanup_loop)
+    rather than from inside request handlers - a user who never comes
+    back to download their result would otherwise leave both the job
+    dict entry and its output files on disk forever, but doing the sweep
+    on the request path means every upload pays for someone else's
+    cleanup.
 
     Handles all four job shapes: separation-shaped jobs clean up
     vocals_path + instrumental_path, stems-shaped jobs clean up every
@@ -267,35 +416,54 @@ def cleanup_expired_jobs():
     a stems job holds 4+ full-length WAVs, so missing them here would
     leak roughly double (or more) a separation job's disk per expired
     job, forever.
-    """
-    import os
 
+    LOCK SCOPE: the lock is held only long enough to identify expired
+    jobs, pop them, and collect their paths. File deletion happens after
+    it is released. Deleting inside the lock (as this originally did)
+    meant a sweep over a few stems jobs held it across a dozen blocking
+    os.remove() syscalls, and since get_job() needs the same lock, every
+    concurrent status poll stalled for that whole window.
+    """
     now = time.time()
-    to_delete = []
+    paths_to_delete = []
+    expired_count = 0
 
     with _lock:
-        for job_id, job in _jobs.items():
-            ttl = job.get("ttl_seconds", SEPARATION_JOB_TTL_SECONDS)
-            if now - job["created_at"] > ttl:
-                to_delete.append(job_id)
+        expired_ids = [
+            job_id for job_id, job in _jobs.items()
+            if now - job["created_at"] > job.get("ttl_seconds", SEPARATION_JOB_TTL_SECONDS)
+        ]
 
-        for job_id in to_delete:
+        for job_id in expired_ids:
             job = _jobs.pop(job_id, None)
             if not job:
                 continue
+            expired_count += 1
 
-            paths = [job.get(k) for k in ("vocals_path", "instrumental_path", "output_path")]
+            for key in ("vocals_path", "instrumental_path", "output_path"):
+                path = job.get(key)
+                if path:
+                    paths_to_delete.append(path)
 
             stems = job.get("stems")
             if isinstance(stems, dict):
-                paths.extend(stems.values())
+                paths_to_delete.extend(p for p in stems.values() if p)
 
-            for path in paths:
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except Exception as e:
-                        logger.warning(f"[JOBS] Failed to clean up expired file {path}: {e}")
+    # Lock released - the blocking disk work happens out here so status
+    # polls are never queued behind it.
+    deleted_files = 0
+    for path in paths_to_delete:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted_files += 1
+        except Exception as e:
+            logger.warning(f"[JOBS] Failed to clean up expired file {path}: {e}")
 
-    if to_delete:
-        logger.info(f"[JOBS] Cleaned up {len(to_delete)} expired job(s)")
+    if expired_count:
+        logger.info(
+            f"[JOBS] Cleaned up {expired_count} expired job(s), "
+            f"{deleted_files} file(s) removed"
+        )
+
+    return expired_count
