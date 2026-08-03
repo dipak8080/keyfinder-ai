@@ -258,6 +258,43 @@ def _check_admin(key: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+
+# Same patterns the frontend's "Hide noise" checkbox already filters out
+# of the TABLE rows - this list is what applies that same exclusion to
+# the SUMMARY counts too. Kept as one shared list here (not duplicated
+# per query) so an addition to it can't accidentally cover the table view
+# without covering the numbers at the top, or vice versa.
+#
+# Every entry here is automated internet-wide vulnerability scanning -
+# bots sweeping IP ranges for exposed control panels, PHP/Laravel/Drupal
+# exploits, leaked .env files, exposed Docker sockets, MCP/JSON-RPC
+# probes, and known RCE payloads (e.g. the PHPUnit eval-stdin exploit).
+# This traffic hits every public server on the internet, this one
+# included, and none of it reflects a real visitor or a real problem
+# with this app - it inflated "Client Errors" without meaning anything,
+# which is exactly the confusion the success/client/server split above
+# was meant to remove.
+_NOISE_PATTERNS = (
+    "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
+    "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php",
+    "/mcp", "/jsonrpc", "/sse", "/containers/json",
+    "eval-stdin.php", "/_ignition/", "/actuator/",
+    "/+CSCOE+/", "/+webvpn+/", "phpunit",
+)
+
+
+def _noise_exclusion_sql() -> str:
+    """
+    Builds the `path NOT LIKE ... AND path NOT LIKE ...` clause shared by
+    every count query below. A single f-string fragment rather than
+    parameterized placeholders is safe here specifically because
+    _NOISE_PATTERNS is a fixed, hardcoded tuple in this file - never
+    user input, never request data - so there is no injection surface;
+    building it as literal SQL just keeps the call sites below readable.
+    """
+    return " AND ".join(f"path NOT LIKE '%{p}%'" for p in _NOISE_PATTERNS)
+
+
 def _status_counts(conn) -> dict:
     """
     Shared by the full-window and delta code paths in get_http_logs()
@@ -266,20 +303,32 @@ def _status_counts(conn) -> dict:
 
     Three buckets, not two:
       - success: < 400
-      - client:  400-499 - the CALLER's request was rejected for a normal
-                 reason (bad upload, rate limit, queue full, bot probing
-                 a route that doesn't exist). Expected traffic, not a bug.
+      - client:  400-499, EXCLUDING known bot/scanner noise - what's left
+                 is a real caller's request being rejected for a normal
+                 reason (bad upload, rate limit, queue full). Expected
+                 traffic, not a bug, but at least now it's actually
+                 traffic from someone using the site.
       - server:  >= 500 - the backend itself broke. This is the number
                  worth watching; a spike here means something is actually
-                 wrong, unlike a spike in "client" which usually just
-                 means more bots found the server today.
+                 wrong.
+
+    NOTE: "total" and "success" deliberately still count EVERYTHING,
+    noise included - the Total box should reflect true traffic volume
+    (useful context: "833 total, most of it noise" is itself information
+    worth having), and success is unaffected by noise almost by
+    definition (a 404 or 405 scanner hit is never a 2xx). Only "client"
+    gets the noise filter, since that is the one number noise was
+    actually distorting.
     """
+    noise_filter = _noise_exclusion_sql()
+
     total = conn.execute("SELECT COUNT(*) as c FROM request_logs").fetchone()["c"]
     success = conn.execute(
         "SELECT COUNT(*) as c FROM request_logs WHERE status_code < 400"
     ).fetchone()["c"]
     client_errors = conn.execute(
-        "SELECT COUNT(*) as c FROM request_logs WHERE status_code >= 400 AND status_code < 500"
+        f"SELECT COUNT(*) as c FROM request_logs "
+        f"WHERE status_code >= 400 AND status_code < 500 AND {noise_filter}"
     ).fetchone()["c"]
     server_errors = conn.execute(
         "SELECT COUNT(*) as c FROM request_logs WHERE status_code >= 500"
