@@ -115,6 +115,20 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         'verbose': True,
         'noplaylist': True,
         'ffmpeg_location': '/usr/bin/ffmpeg',
+        # Equivalent of yt-dlp's --force-ipv4 CLI flag. Same fix as
+        # routes.py's /download route - this VPS has IPv6 enabled in
+        # DNS/routing metadata but no actual working IPv6 route out
+        # (confirmed via `curl -6` failing on every IPv6 destination
+        # with "Network is unreachable"). googlevideo.com's CDN edge
+        # nodes resolve to IPv6 addresses roughly as often as IPv4 ones,
+        # so without this, /youtube/analyze, /youtube/separate, and
+        # /youtube/stems all intermittently burned their full retry
+        # budget on a video that would have downloaded instantly over
+        # IPv4. This must be kept in sync with the identical option in
+        # routes.py's /download ydl_opts - both exist because they build
+        # separate dicts for separate reasons (see module docstring), not
+        # because the underlying network problem is different.
+        'source_address': '0.0.0.0',
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
