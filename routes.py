@@ -81,7 +81,7 @@ import asyncio
 from typing import Callable, List, Optional, Sequence
 from functools import partial
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query, Request
 from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
