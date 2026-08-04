@@ -117,6 +117,25 @@ PROXY_QUOTA_ERROR_MARKERS = (
     "502",
 )
 
+# Errors meaning THIS SERVER has no working route to the destination -
+# not a YouTube-side block, not an IP-reputation problem, not fixable by
+# retrying, rotating cookie accounts, or switching to the proxy (the
+# proxy doesn't help either, since the problem is this server's own
+# outbound networking, not its IP reputation). Specific known cause on
+# this VPS: IPv6 is enabled at the interface level but has no allocated
+# global address or default route (confirmed via `ip -6 addr show` /
+# `ip -6 route show` showing only link-local fe80:: addresses) - some
+# googlevideo.com CDN edges are IPv6-only, and a request assigned to one
+# of those can never succeed until the host allocates real IPv6
+# connectivity. Retrying 3x with backoff against the SAME assigned edge
+# wastes ~4.5s for a guaranteed identical failure each time - same
+# fail-fast reasoning as IP_BLOCK_MARKERS below, just for a different
+# root cause.
+IPV6_UNROUTABLE_MARKERS = (
+    "address family for hostname not supported",
+    "network is unreachable",
+)
+
 # Errors meaning the video is blocked FOR A SPECIFIC REGION by the
 # uploader/rights holder - distinct from PERMANENT_ERROR_MARKERS because a
 # proxy exit node in an allowed country genuinely CAN fix this (unlike a
@@ -304,6 +323,23 @@ def is_not_yet_live_error(error_text: str) -> bool:
     return any(marker in normalized for marker in NOT_YET_LIVE_MARKERS)
 
 
+def is_ipv6_unroutable_error(error_text: str) -> bool:
+    """
+    True if this failure means the SERVER has no route to the
+    destination, not that YouTube blocked/restricted anything. Used only
+    inside extract_info_with_retry as a fail-fast signal - retrying,
+    rotating cookie accounts, or trying the proxy tier are all equally
+    useless against this, since none of them change this server's own
+    IPv6 connectivity. Deliberately excluded from is_ip_block_error() and
+    should_use_proxy(): escalating to proxy for this would be actively
+    wrong (implies "try a different IP", but the actual problem is this
+    server has no path out over IPv6 at all - a different exit IP on the
+    same broken interface doesn't fix that).
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in IPV6_UNROUTABLE_MARKERS)
+
+
 def is_ip_block_error(error_text: str) -> bool:
     """
     True if this error looks like a KNOWN IP-reputation problem - the
@@ -347,6 +383,10 @@ def should_use_proxy(error_text: str) -> bool:
     for it. Toggle YT_PROXY_URL off entirely if you want to stop paying
     for proxy attempts against that specific bug until yt-dlp ships an
     upstream fix.
+
+    Also does not escalate IPv6-unroutable errors (see
+    is_ipv6_unroutable_error) - that failure means THIS server has no
+    outbound path, which no proxy exit IP changes.
 
     Trade-off worth knowing: like every other classifier in this file,
     this is marker-list based. A genuinely new, not-yet-catalogued
@@ -756,6 +796,23 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            if is_ipv6_unroutable_error(error_text):
+                # This server has no route to the assigned CDN edge - not
+                # a YouTube-side restriction, not fixable by retrying the
+                # same request. Fail immediately instead of sleeping
+                # through 2 more backoff rounds for a guaranteed repeat
+                # failure. download_with_fallback's should_use_proxy()
+                # already correctly declines to escalate this to the
+                # proxy tier (the error text doesn't match any
+                # IP-reputation marker), so this only saves the wasted
+                # retry time - it does not change the ultimate outcome.
+                logger.warning(
+                    f"Attempt {attempt}: server has no route to this CDN edge "
+                    f"(IPv6-only host, no IPv6 connectivity on this VPS) - "
+                    f"not retrying: {error_text}"
+                )
+                raise
+
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
@@ -950,6 +1007,20 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             "[PROXY] Skipping proxy tier - failure is an age-restriction/"
             "members-only/not-yet-live requirement, not an IP/bot-check "
             "problem: no available cookie account satisfies it for this video."
+        )
+        raise last_error
+
+    if is_ipv6_unroutable_error(first_error):
+        # This server has no outbound path to the assigned CDN edge at
+        # all - a proxy exit IP doesn't fix that, since the failure isn't
+        # about IP reputation, it's about this server's own missing IPv6
+        # route. Skip the proxy tier entirely rather than spending ~30s
+        # confirming the identical failure through a different door.
+        logger.warning(
+            "[PROXY] Skipping proxy tier - failure means this server has no "
+            "route to the destination (IPv6-only CDN edge, no IPv6 "
+            "connectivity on this VPS), which a different exit IP cannot fix: "
+            f"{first_error[:200]}"
         )
         raise last_error
 
