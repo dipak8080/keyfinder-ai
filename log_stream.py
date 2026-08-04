@@ -106,6 +106,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from admin_auth import guard_admin_request, verify_admin_key
+
 DB_PATH = os.environ.get("REQUEST_LOG_DB_PATH", "/app/data/logs.db")
 ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
 
@@ -253,9 +255,32 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def _check_admin(key: str):
-    if not ADMIN_KEY or key != ADMIN_KEY:
+def _check_admin(request: Request, key: str):
+    """
+    Rate-limited + lockout-protected admin check, shared by every
+    /admin/logs* route below. Replaces the previous bare equality check
+    (`if not ADMIN_KEY or key != ADMIN_KEY: raise 401`) - see
+    admin_auth.py for why a plain comparison alone isn't enough: a
+    Strix pentest run demonstrated an automated agent firing thousands
+    of key guesses in quick succession with nothing to slow it down.
+
+    NOTE: kept as 401 on failure (not 403 like routes.py/cookie_upload.py)
+    to preserve this file's existing status-code contract for its
+    callers - only the PROTECTION got stricter here, the response shape
+    for "you got the key wrong" is unchanged.
+    """
+    if not ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    client_ip = guard_admin_request(request)
+    try:
+        verify_admin_key(key, client_ip)
+    except HTTPException as e:
+        # verify_admin_key raises 403 on a wrong key; this file's own
+        # contract is 401 for "unauthorized" - translate so callers of
+        # this function see the same status code they always have.
+        if e.status_code == 403:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise
 
 
 
@@ -343,11 +368,12 @@ def _status_counts(conn) -> dict:
 
 @router.get("/admin/logs/http/data")
 def get_http_logs(
+    request: Request,
     key: str = Query(...),
     limit: int = Query(200, le=2000),
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
 ):
-    _check_admin(key)
+    _check_admin(request, key)
     with get_db() as conn:
         if after_id is not None:
             # Delta mode: used by the dashboard's poll loop. Returns only
@@ -383,8 +409,8 @@ async def _http_log_event_generator():
 
 
 @router.get("/admin/logs/http/stream")
-async def stream_http_logs(key: str = Query(...)):
-    _check_admin(key)
+async def stream_http_logs(request: Request, key: str = Query(...)):
+    _check_admin(request, key)
     return StreamingResponse(_http_log_event_generator(), media_type="text/event-stream")
 
 
@@ -422,11 +448,12 @@ def attach_system_log_capture():
 
 @router.get("/admin/logs/system/data")
 def get_system_logs(
+    request: Request,
     key: str = Query(...),
     limit: int = Query(200, le=2000),
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
 ):
-    _check_admin(key)
+    _check_admin(request, key)
     with get_db() as conn:
         if after_id is not None:
             # Delta mode - see get_http_logs() for the reasoning. Already
@@ -461,8 +488,8 @@ async def _system_log_event_generator():
 
 
 @router.get("/admin/logs/system/stream")
-async def stream_system_logs(key: str = Query(...)):
-    _check_admin(key)
+async def stream_system_logs(request: Request, key: str = Query(...)):
+    _check_admin(request, key)
     return StreamingResponse(_system_log_event_generator(), media_type="text/event-stream")
 
 
@@ -471,8 +498,8 @@ async def stream_system_logs(key: str = Query(...)):
 # ============================================================
 
 @router.delete("/admin/logs")
-def delete_logs(key: str = Query(...), older_than_days: int = Query(None)):
-    _check_admin(key)
+def delete_logs(request: Request, key: str = Query(...), older_than_days: int = Query(None)):
+    _check_admin(request, key)
     with get_db() as conn:
         if older_than_days is not None:
             cutoff = (datetime.utcnow() - timedelta(days=older_than_days)).isoformat()
@@ -503,8 +530,8 @@ def delete_logs(key: str = Query(...), older_than_days: int = Query(None)):
 # ============================================================
 
 @router.get("/admin/logs", response_class=HTMLResponse)
-def logs_dashboard(key: str = Query(...)):
-    _check_admin(key)
+def logs_dashboard(request: Request, key: str = Query(...)):
+    _check_admin(request, key)
     html = """
 <!DOCTYPE html>
 <html>

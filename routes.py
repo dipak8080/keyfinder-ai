@@ -248,6 +248,7 @@ from audio_loudnorm import normalize_loudness, resolve_target_lufs
 from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
+from admin_auth import guard_admin_request, verify_admin_key
 
 router = APIRouter()
 
@@ -2668,18 +2669,18 @@ async def youtube_stems_download(job_id: str, stem: str = Query(...)):
 # ============================================================
 
 @router.post("/admin/clear-cache")
-async def admin_clear_cache(key: str = Query(...)):
-    if key != ADMIN_STATUS_KEY:
-        raise HTTPException(403, "Invalid admin key")
+async def admin_clear_cache(request: Request, key: str = Query(...)):
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
     result = clear_cache()
     logger.info(f"[CACHE] Admin manually cleared cache: {result}")
     return {"status": "cache cleared", **result}
 
 
 @router.post("/admin/cache/limit")
-async def admin_set_cache_limit(key: str = Query(...), gb: float = Query(..., gt=0, le=1000)):
-    if key != ADMIN_STATUS_KEY:
-        raise HTTPException(403, "Invalid admin key")
+async def admin_set_cache_limit(request: Request, key: str = Query(...), gb: float = Query(..., gt=0, le=1000)):
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
     try:
         stats = set_cache_max_gb(gb)
     except ValueError as e:
@@ -2688,17 +2689,17 @@ async def admin_set_cache_limit(key: str = Query(...), gb: float = Query(..., gt
 
 
 @router.post("/admin/reset-proxy")
-async def admin_reset_proxy(key: str = Query(...)):
-    if key != ADMIN_STATUS_KEY:
-        raise HTTPException(403, "Invalid admin key")
+async def admin_reset_proxy(request: Request, key: str = Query(...)):
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
     reset_proxy_circuit_breaker()
     return {"status": "proxy circuit breaker reset"}
 
 
 @router.get("/admin/status")
-async def admin_status(key: str = Query(...)):
-    if key != ADMIN_STATUS_KEY:
-        raise HTTPException(403, "Invalid admin key")
+async def admin_status(request: Request, key: str = Query(...)):
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
     snapshot = get_status_snapshot()
     snapshot["proxy"] = {
         "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",

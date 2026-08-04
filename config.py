@@ -113,6 +113,32 @@ ALERT_COOLDOWN_SECONDS = int(os.environ.get("ALERT_COOLDOWN_SECONDS", "900"))
 
 ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")
 
+# ---------- ADMIN ROUTE PROTECTION ----------
+# Deliberately much stricter than the public tool rate limits above.
+# Only the site owner should ever call /admin/* - genuine admin traffic
+# is naturally low-frequency (checking status, clearing cache, uploading
+# cookies occasionally), so any real volume against these routes is
+# almost certainly automated abuse, not a real person being throttled
+# mid-workflow. A Strix pentest run demonstrated exactly this gap: an
+# automated agent fired thousands of key guesses against
+# /admin/upload-cookies with nothing slowing it down, and the volume
+# alone made a (local dev) target unresponsive.
+#
+# Two independent knobs, see admin_auth.py for the full reasoning:
+#   RATE_LIMIT   - caps total requests/IP to any admin route, regardless
+#                  of whether the key is right or wrong.
+#   LOCKOUT       - caps WRONG-KEY attempts specifically. This is what
+#                  actually stops a brute-force from ever completing,
+#                  not just slows it down - a patient attacker staying
+#                  under the rate limit would otherwise still
+#                  eventually work through a wordlist.
+ADMIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ADMIN_RATE_LIMIT_MAX_REQUESTS", "10"))
+ADMIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("ADMIN_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+ADMIN_LOCKOUT_THRESHOLD = int(os.environ.get("ADMIN_LOCKOUT_THRESHOLD", "5"))
+ADMIN_LOCKOUT_WINDOW_SECONDS = int(os.environ.get("ADMIN_LOCKOUT_WINDOW_SECONDS", str(5 * 60)))    # 5 min
+ADMIN_LOCKOUT_DURATION_SECONDS = int(os.environ.get("ADMIN_LOCKOUT_DURATION_SECONDS", str(15 * 60)))  # 15 min
+
 # ---------- CACHING ----------
 CACHE_MAX_AGE_SECONDS = int(os.environ.get("CACHE_MAX_AGE_SECONDS", str(30 * 24 * 60 * 60)))  # 30 days
 

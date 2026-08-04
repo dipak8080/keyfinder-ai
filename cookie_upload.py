@@ -11,10 +11,27 @@ Mount points (added to main.py):
   GET  /admin/cookies/status              -> JSON status of all 3 cookie slots
 
 Requires ?key=<ADMIN_STATUS_KEY> same as your other admin endpoints.
+
+--------------------------------------------------------------------------
+UPDATED 2026-08-04: rate limit + brute-force lockout added.
+
+This is the exact endpoint a Strix pentest run targeted with an automated
+key-bruteforce agent - thousands of guesses against the `key` query param
+fired in quick succession, with nothing previously slowing it down. See
+admin_auth.py for the full reasoning; short version: admin routes need a
+much stricter, separate guard from the public tool rate limits, since
+only the site owner should ever be calling this endpoint at all.
+
+_check_admin() now takes `request` in addition to `key` so it can resolve
+the caller's real IP (via X-Forwarded-For, same as log_stream.py) and
+check it against the shared rate-limit/lockout state in admin_auth.py
+before ever comparing the key itself. Every route below passes its
+`request` parameter through - nothing else about them changed.
+--------------------------------------------------------------------------
 """
 
 import os
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import (
@@ -22,6 +39,7 @@ from config import (
     COOKIE_ACCOUNT_2_PATH,
     COOKIE_ACCOUNT_3_PATH,
 )
+from admin_auth import guard_admin_request, verify_admin_key
 
 ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
 
@@ -41,9 +59,28 @@ for _path in _SLOT_PATHS.values():
 router = APIRouter()
 
 
-def _check_admin(key: str):
-    if not ADMIN_KEY or key != ADMIN_KEY:
+def _check_admin(request: Request, key: str):
+    """
+    Rate-limited + lockout-protected admin check - replaces the previous
+    bare equality check (`if not ADMIN_KEY or key != ADMIN_KEY: raise
+    401`). See admin_auth.py for why a plain comparison alone isn't
+    enough: this exact endpoint is what a Strix pentest run targeted with
+    an automated brute-force agent.
+
+    Kept as 401 on failure (not 403 like admin_auth's own default) to
+    preserve this file's existing status-code contract - only the
+    PROTECTION got stricter, the response shape for "wrong key" is
+    unchanged for anything already calling this endpoint.
+    """
+    if not ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    client_ip = guard_admin_request(request)
+    try:
+        verify_admin_key(key, client_ip)
+    except HTTPException as e:
+        if e.status_code == 403:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        raise
 
 
 def _cookie_path(slot: int) -> str:
@@ -52,11 +89,12 @@ def _cookie_path(slot: int) -> str:
 
 @router.post("/admin/upload-cookies")
 async def upload_cookies(
+    request: Request,
     key: str = Query(...),
     slot: int = Query(..., ge=1, le=3, description="Which cookie slot: 1, 2, or 3"),
     file: UploadFile = File(...),
 ):
-    _check_admin(key)
+    _check_admin(request, key)
     path = _cookie_path(slot)
     content = await file.read()
 
@@ -73,8 +111,8 @@ async def upload_cookies(
 
 
 @router.get("/admin/cookies/status")
-def cookies_status(key: str = Query(...)):
-    _check_admin(key)
+def cookies_status(request: Request, key: str = Query(...)):
+    _check_admin(request, key)
     result = {}
     for slot in (1, 2, 3):
         path = _cookie_path(slot)
@@ -92,8 +130,8 @@ def cookies_status(key: str = Query(...)):
 
 
 @router.get("/admin/upload-cookies", response_class=HTMLResponse)
-def upload_form(key: str = Query(...)):
-    _check_admin(key)
+def upload_form(request: Request, key: str = Query(...)):
+    _check_admin(request, key)
     html = """
 <!DOCTYPE html>
 <html>
