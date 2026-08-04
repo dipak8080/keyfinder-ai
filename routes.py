@@ -592,6 +592,23 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'verbose': True,
         'noplaylist': True,
         'ffmpeg_location': '/usr/bin/ffmpeg',
+        # Equivalent of yt-dlp's --force-ipv4 CLI flag. VPSDime assigned
+        # this VPS a real, working global IPv6 address on 2026-08-03 (see
+        # ticket - `curl -6` on the HOST now succeeds), but that
+        # connectivity does NOT reach this Docker container: Docker's
+        # default bridge networking does not forward IPv6 into containers
+        # unless explicitly configured (fixed-cidr-v6 in
+        # /etc/docker/daemon.json). Confirmed via
+        # `docker exec audioforges-api curl -6 https://ipv6.google.com`
+        # failing with "Network is unreachable" on every resolved address,
+        # the same failure the HOST used to show before VPSDime's fix.
+        # Until Docker's IPv6 networking is separately configured (a
+        # bigger infra change, tracked separately - not done here),
+        # yt-dlp inside this container still has no usable IPv6 path, so
+        # googlevideo.com edges that are IPv6-only remain unreachable.
+        # Pinning source_address to 0.0.0.0 keeps every connection this
+        # YoutubeDL instance opens on IPv4, avoiding that dead path.
+        'source_address': '0.0.0.0',
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']

@@ -115,6 +115,17 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         'verbose': True,
         'noplaylist': True,
         'ffmpeg_location': '/usr/bin/ffmpeg',
+        # Equivalent of yt-dlp's --force-ipv4 CLI flag. Same reasoning as
+        # routes.py's /download route: the VPS HOST has real IPv6 now
+        # (VPSDime assigned it 2026-08-03), but Docker does not forward
+        # IPv6 into this container by default, confirmed via
+        # `docker exec audioforges-api curl -6 ...` still failing with
+        # "Network is unreachable" on every address. Must stay in sync
+        # with routes.py's identical option until Docker's IPv6
+        # networking is separately configured (tracked as a future task,
+        # not done here - editing /etc/docker/daemon.json is a bigger
+        # infra change with its own risk, out of scope for this fix).
+        'source_address': '0.0.0.0',
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
