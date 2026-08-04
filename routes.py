@@ -592,18 +592,6 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'verbose': True,
         'noplaylist': True,
         'ffmpeg_location': '/usr/bin/ffmpeg',
-        # Equivalent of yt-dlp's --force-ipv4 CLI flag. This VPS has IPv6
-        # enabled in DNS/routing metadata but no actual working IPv6
-        # route out - confirmed via `curl -6` failing on every IPv6
-        # destination with "Network is unreachable". googlevideo.com's
-        # CDN edge nodes resolve to IPv6 addresses roughly as often as
-        # IPv4 ones, so without this, downloads intermittently picked a
-        # dead route and burned all 3 retry attempts on a video that
-        # would have succeeded instantly over IPv4. Pinning the source
-        # address to 0.0.0.0 forces every connection this YoutubeDL
-        # instance opens through an IPv4 socket, so it can never attempt
-        # the broken path in the first place.
-        'source_address': '0.0.0.0',
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
