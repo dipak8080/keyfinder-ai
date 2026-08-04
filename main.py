@@ -2,6 +2,58 @@
 main.py - App entrypoint. This file should stay tiny: create the app,
 wire middleware/lifespan, mount routes. All logic lives elsewhere.
 """
+import socket
+
+# ---------- FORCE AF_INET-ONLY DNS RESOLUTION, PROCESS-WIDE ----------
+# Placed as the very first thing this file does, before any other import,
+# so every module imported afterward (yt_dlp, urllib3, requests, aiohttp,
+# etc.) picks up the patched version - some of these libraries hold a
+# direct reference to socket.getaddrinfo at import time rather than
+# looking it up fresh on every call, so patching late would miss them.
+#
+# WHY THIS EXISTS: this container has no working IPv6 route (confirmed -
+# see IPV6_UNROUTABLE_MARKERS in youtube.py and the VPSDime support
+# ticket), even though the VPS HOST now does. yt-dlp's own
+# 'source_address': '0.0.0.0' option (the documented --force-ipv4
+# equivalent) filters candidates AFTER resolution, on the code path yt-dlp
+# controls directly - but some googlevideo.com edges are dual-stack, and
+# the underlying urllib3/socket connection logic calls getaddrinfo()
+# UNRESTRICTED (family=0), gets back a mixed list of IPv4 and IPv6
+# candidates, and can end up trying to bind our IPv4 source_address
+# against an IPv6 candidate in that mixed set. That mismatch is exactly
+# what throws "Address family for hostname not supported" - confirmed via
+# `docker exec ... python3 -c "socket.getaddrinfo(host, 443, AF_INET)"`
+# returning a perfectly valid IPv4 address instantly, proving the address
+# exists and DNS is fine; the bug is in which candidates get PAIRED with
+# the IPv4 bind, not in resolution itself.
+#
+# Restricting resolution to AF_INET at the SOURCE - before any library
+# sees a mixed result - closes this for every connection this process
+# ever makes, not just the two yt-dlp call sites that separately still
+# also set source_address as defense in depth (now largely redundant
+# with this in place, but harmless to leave).
+#
+# SCOPE: this is process-wide and affects every outbound connection this
+# API makes, not just yt-dlp - acceptable here since this container has
+# no usable IPv6 path at all right now (see docstring above), so nothing
+# is lost by refusing to attempt it anywhere in this process.
+#
+# REMOVE THIS when Docker's IPv6 networking is properly configured
+# (tracked as a separate future task - see the Incus/LXD nested-container
+# networking notes from that investigation before attempting it, it's
+# genuinely fragile in this hosting setup and not a quick fix).
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    if family in (0, socket.AF_UNSPEC, socket.AF_INET6):
+        family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4_only
+# ---------- END AF_INET-ONLY PATCH ----------
+
 import asyncio
 import os
 from contextlib import asynccontextmanager
