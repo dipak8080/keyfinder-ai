@@ -132,7 +132,7 @@ ADMIN_STATUS_KEY = os.environ.get("ADMIN_STATUS_KEY", "change-me")
 #                  not just slows it down - a patient attacker staying
 #                  under the rate limit would otherwise still
 #                  eventually work through a wordlist.
-ADMIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ADMIN_RATE_LIMIT_MAX_REQUESTS", "10"))
+ADMIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ADMIN_RATE_LIMIT_MAX_REQUESTS", "300"))
 ADMIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("ADMIN_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 ADMIN_LOCKOUT_THRESHOLD = int(os.environ.get("ADMIN_LOCKOUT_THRESHOLD", "5"))
