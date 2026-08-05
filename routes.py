@@ -72,6 +72,28 @@ copies meant every fix to the error handling had to be applied fifteen
 times - which is exactly how items 3 and 5 above came to be missing in
 the first place.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-05):
+
+/download's error-classification chain now has a dedicated branch for
+CDN connect-timeouts (is_cdn_connect_timeout_error, from youtube.py) -
+production logs showed repeated ~20s connect timeouts to the SAME
+googlevideo media edge across otherwise-unrelated requests, taking a
+full 73s (3 attempts x ~23s) to fail and then returning a generic 500.
+Two things changed:
+  - ydl_opts now sets socket_timeout=10, so a doomed connect-timeout
+    fails faster per attempt.
+  - The error chain now recognizes this failure shape explicitly and
+    returns 503 ("try again shortly") instead of falling through to the
+    generic 500 - this is transient infra flakiness on YouTube's/this
+    server's networking, not a bug in this app, and the two deserve
+    different status codes for the same reason every other branch in
+    this chain already does.
+should_use_proxy() in youtube.py was also updated to escalate this
+failure shape to the proxy tier, since a different exit IP frequently
+resolves to a different, reachable CDN edge - that change lives entirely
+in youtube.py and needs no further changes here.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -194,6 +216,7 @@ from youtube import (
     is_members_only_error,
     is_not_yet_live_error,
     is_permanent_error,
+    is_cdn_connect_timeout_error,
     is_valid_youtube_url,
     extract_video_id,
     VideoTooLongError,
@@ -610,6 +633,17 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         # Pinning source_address to 0.0.0.0 keeps every connection this
         # YoutubeDL instance opens on IPv4, avoiding that dead path.
         'source_address': '0.0.0.0',
+        # Default connect timeout is 20s (yt-dlp's own default). A
+        # connect-timeout to a dead/unreachable googlevideo edge is
+        # guaranteed to fail identically on every retry against the SAME
+        # IP (see is_cdn_connect_timeout_error in youtube.py) - lowering
+        # this means a doomed attempt fails in ~10s instead of ~20s,
+        # cutting the worst-case all-attempts-failed wall time roughly in
+        # half before the proxy tier (or the 503 branch below) takes
+        # over. 10s is still generous for a genuinely slow-but-working
+        # connection; it is not so low that it risks false-failing normal
+        # requests under typical latency.
+        'socket_timeout': 10,
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
@@ -702,6 +736,23 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     "This video is temporarily unavailable for download because YouTube is "
                     "requiring bot verification or is restricting available formats for this client. "
                     "Please try again in a few minutes."
+                )
+
+            if is_cdn_connect_timeout_error(error_text):
+                # Same failure class as the log line
+                # "[PROXY] Not escalating to proxy..." used to show before
+                # should_use_proxy() recognized this shape - a
+                # connect-timeout to a specific googlevideo media edge,
+                # now escalated to the proxy tier inside
+                # download_with_fallback. If it's still failing here, the
+                # proxy tier either isn't configured, is circuit-broken,
+                # or also couldn't reach a working edge - either way this
+                # is transient network flakiness, not a bug in this app,
+                # so it gets a 503 ("try again") rather than a generic 500.
+                logger.warning(f"[DOWNLOAD] CDN edge timeout even after fallback: {url}: {error_text}")
+                raise HTTPException(
+                    503,
+                    "Couldn't reach YouTube's servers for this video. Please try again in a moment."
                 )
 
             logger.error(f"[DOWNLOAD] Failed after all attempts: {error_text}")

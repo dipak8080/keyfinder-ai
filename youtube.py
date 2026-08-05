@@ -163,7 +163,7 @@ GEO_RESTRICTED_MARKERS = (
 # this fails fast within extract_info_with_retry (no pointless same-
 # account backoff) AND skips the proxy tier in download_with_fallback
 # (proxy fixes IP reputation, not account identity), but still allows
-# rotation to try the next cookie account, if any remain.
+# rotation to the next cookie account, if any remain.
 AGE_RESTRICTED_MARKERS = (
     "sign in to confirm your age",
     "age-restricted",
@@ -340,6 +340,36 @@ def is_ipv6_unroutable_error(error_text: str) -> bool:
     return any(marker in normalized for marker in IPV6_UNROUTABLE_MARKERS)
 
 
+def is_cdn_connect_timeout_error(error_text: str) -> bool:
+    """
+    True if this is a connect-timeout to a SPECIFIC googlevideo CDN media
+    edge (e.g. "Connection to rr8---sn-xxxx.googlevideo.com timed out.
+    (connect timeout=20.0)") - distinct from a generic/unrecognized
+    timeout elsewhere in the chain (webpage fetch, DNS, proxy handshake,
+    etc.), which has no particular reason to be fixed by a different IP.
+
+    This shape specifically DOES have known evidence a different exit IP
+    helps: YouTube assigns which CDN edge a client is routed to based on
+    the requesting IP/geo, so a proxy exit node frequently lands on a
+    different, reachable edge even when this server's direct IP keeps
+    getting assigned the same dead one on every retry.
+
+    Requiring BOTH "googlevideo.com" and "timed out" in the same message
+    (rather than matching "timed out" alone) is deliberate - it keeps this
+    narrow to the exact failure it's meant for, rather than escalating
+    proxy for every unrelated timeout in the system.
+
+    Used two places:
+      - should_use_proxy(): this shape now DOES escalate to the proxy tier
+      - extract_info_with_retry(): fail-fast, since retrying the SAME
+        googlevideo edge from the SAME IP 3x with backoff produces the
+        identical timeout every time - only a different exit IP (i.e. the
+        proxy tier the caller escalates to next) has any chance.
+    """
+    normalized = _normalize_error_text(error_text)
+    return "googlevideo.com" in normalized and "timed out" in normalized
+
+
 def is_ip_block_error(error_text: str) -> bool:
     """
     True if this error looks like a KNOWN IP-reputation problem - the
@@ -364,13 +394,21 @@ def is_ip_block_error(error_text: str) -> bool:
 def should_use_proxy(error_text: str) -> bool:
     """
     Narrows proxy escalation to failures that actually LOOK like an
-    IP-reputation problem - a bot-check page, a 403 on the media fetch, or
-    another marker in IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - rather than
+    IP-reputation problem - a bot-check page, a 403 on the media fetch,
+    another marker in IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS, or a
+    connect-timeout to a specific googlevideo CDN edge - rather than
     escalating on every non-permanent failure like the previous behavior
     did. The goal is to stop paying proxy bandwidth on truly generic/
     unrecognized yt-dlp errors (network blips, a brand-new uncatalogued
     error string) where there's no actual evidence a different IP would
     help.
+
+    The CDN connect-timeout case (is_cdn_connect_timeout_error) was added
+    after production logs showed repeated ~20s connect timeouts to the
+    SAME assigned googlevideo edge across multiple, entirely separate
+    requests - a pattern consistent with this server's direct IP being
+    routed to a specific edge that isn't reachable from here, which a
+    proxy exit IP has a real chance of routing around.
 
     IMPORTANT CAVEAT: this does NOT reduce proxy usage for the current
     known mweb/web PO-token-bound-to-video-id 403 bug (tracked upstream in
@@ -392,11 +430,16 @@ def should_use_proxy(error_text: str) -> bool:
     this is marker-list based. A genuinely new, not-yet-catalogued
     YouTube error that a different IP WOULD have fixed will now skip
     proxy entirely until its text is recognized and added to
-    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - watch the
-    "[PROXY] Not escalating to proxy" log line for repeating unrecognized
-    error text as the signal something needs adding.
+    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS (or given its own classifier,
+    as with is_cdn_connect_timeout_error) - watch the "[PROXY] Not
+    escalating to proxy" log line for repeating unrecognized error text
+    as the signal something needs adding.
     """
-    return is_ip_block_error(error_text) or is_bot_check_error(error_text)
+    return (
+        is_ip_block_error(error_text)
+        or is_bot_check_error(error_text)
+        or is_cdn_connect_timeout_error(error_text)
+    )
 
 
 def is_permanent_error(error_text: str) -> bool:
@@ -813,6 +856,22 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            if is_cdn_connect_timeout_error(error_text):
+                # A connect-timeout to a SPECIFIC googlevideo media edge -
+                # retrying from the SAME IP 2 more times just re-dials the
+                # same unreachable edge with the same result each time.
+                # Only a different exit IP (the proxy tier the caller
+                # escalates to next, since should_use_proxy() now returns
+                # True for this shape) has any real chance of landing on
+                # a different, reachable edge. Fail fast here instead of
+                # burning ~4.5s of pointless backoff on a guaranteed
+                # repeat timeout.
+                logger.warning(
+                    f"Attempt {attempt}: CDN connect-timeout to a googlevideo "
+                    f"edge - not retrying on the same IP: {error_text}"
+                )
+                raise
+
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
@@ -906,7 +965,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 
       Layer 2 - PROXY, tried only when should_use_proxy() confirms the
                 failure actually LOOKS like an IP-reputation problem (a
-                bot-check page, a 403 on the media fetch, or another
+                bot-check page, a 403 on the media fetch, a connect-
+                timeout to a specific googlevideo CDN edge, or another
                 IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS match) - AND it
                 isn't a confirmed permanent error, age-restriction,
                 members-only, or not-yet-live error (see is_permanent_error
@@ -1026,9 +1086,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 
     # IMPORTANT: paid proxy is only used for failures that actually match
     # a known IP-reputation/bot-check signal - see should_use_proxy() for
-    # the reasoning and its caveat about the current mweb 403 bug still
-    # qualifying here (proxy just doesn't happen to fix that particular
-    # bug, even though it's a legitimate IP-block-shaped error).
+    # the reasoning, including the CDN connect-timeout case, and its
+    # caveat about the current mweb 403 bug still qualifying here (proxy
+    # just doesn't happen to fix that particular bug, even though it's a
+    # legitimate IP-block-shaped error).
     if not should_use_proxy(first_error):
         logger.warning(
             f"[PROXY] Not escalating to proxy - failure doesn't match a known "
