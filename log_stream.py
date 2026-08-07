@@ -234,11 +234,25 @@ def _init_db():
                 path TEXT NOT NULL,
                 status_code INTEGER NOT NULL,
                 duration_ms REAL NOT NULL,
-                client_ip TEXT
+                client_ip TEXT,
+                request_id TEXT
             )
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs(timestamp)")
+
+        # Migration for databases created before request_id was stored on
+        # the HTTP side. system_logs has carried a request_id since
+        # 2026-07-24, but request_logs never did - which meant the two
+        # tables held the two halves of the same story with no way to join
+        # them. Seeing a 500 in the HTTP tab told you a request broke;
+        # finding the traceback meant eyeballing timestamps in the system
+        # tab and hoping nothing else was in flight. Storing the id on
+        # both sides turns that into one click.
+        try:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN request_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # System logs now share this same SQLite file (and volume mount) as
         # request_logs, so they survive container restarts/redeploys instead
         # of vanishing every time deploy.yml recreates the container.
@@ -255,6 +269,7 @@ def _init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_timestamp ON system_logs(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_request_id ON system_logs(request_id)")
 
         # Migration for databases created before request_id existed -
         # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table,
@@ -332,8 +347,8 @@ def _writer_loop() -> None:
             if http_rows:
                 conn.executemany(
                     "INSERT INTO request_logs "
-                    "(timestamp, method, path, status_code, duration_ms, client_ip) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(timestamp, method, path, status_code, duration_ms, client_ip, request_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     http_rows,
                 )
             if sys_rows:
@@ -424,6 +439,7 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                         response.status_code,
                         round(duration_ms, 2),
                         _get_real_client_ip(request),
+                        request_id,
                     ),
                 )
             except Exception:
@@ -671,9 +687,27 @@ def get_system_logs(
     limit: int = Query(200, le=2000),
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
+    request_id: str = Query(None, description="If set, return EVERY system_logs row carrying this request_id, ignoring limit/before_id/after_id entirely."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
+        if request_id is not None:
+            # Correlation lookup, not pagination. A request's log lines
+            # can span a background task that keeps running well after
+            # the HTTP row was written (see RequestLoggerMiddleware's
+            # comment on why the contextvar is never reset), so this
+            # deliberately ignores every other filter and returns the
+            # full set - there is no sane page size for "however many
+            # lines one request happened to produce", and capping it
+            # would silently hide the exact lines someone clicked through
+            # to find. No total needed either; the count IS the result.
+            rows = conn.execute(
+                "SELECT * FROM system_logs WHERE request_id = ? ORDER BY id ASC",
+                (request_id,),
+            ).fetchall()
+            logs = [dict(r) for r in rows]
+            return JSONResponse({"total": len(logs), "logs": logs})
+
         if after_id is not None:
             # Delta mode - see get_http_logs() for the reasoning. Already
             # ASC (oldest -> newest), so no reversal needed here.
