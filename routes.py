@@ -115,6 +115,17 @@ members-only siblings already were - extract_info_with_retry's fail-fast
 branch, download_with_fallback's account-rotation continue, and its
 skip-proxy guard - and gets its own 403 branch here, matching how
 age-restriction and members-only are already handled below.
+
+should_use_proxy() in youtube.py no longer escalates CDN connect-timeouts
+to the proxy tier (it still did before this date). Production logs showed
+the proxy's own exit routing frequently reaches the SAME dead googlevideo
+edge as the direct attempt, so the proxy retry was adding ~7-10s of
+latency for no better outcome than failing fast - unlike a geo-restriction,
+where a different exit COUNTRY has a real, licensing-based reason to
+succeed where direct failed. Geo-restriction, bot-check, and other
+IP-reputation-shaped errors still escalate to proxy as before; only the
+CDN-edge-timeout case was pulled out. No changes needed in this file
+beyond the log line below no longer implying a proxy attempt already ran.
 --------------------------------------------------------------------------
 """
 import os
@@ -770,17 +781,18 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                 )
 
             if is_cdn_connect_timeout_error(error_text):
-                # Same failure class as the log line
-                # "[PROXY] Not escalating to proxy..." used to show before
-                # should_use_proxy() recognized this shape - a
-                # connect-timeout to a specific googlevideo media edge,
-                # now escalated to the proxy tier inside
-                # download_with_fallback. If it's still failing here, the
-                # proxy tier either isn't configured, is circuit-broken,
-                # or also couldn't reach a working edge - either way this
-                # is transient network flakiness, not a bug in this app,
-                # so it gets a 503 ("try again") rather than a generic 500.
-                logger.warning(f"[DOWNLOAD] CDN edge timeout even after fallback: {url}: {error_text}")
+                # A connect-timeout to a specific googlevideo media edge.
+                # As of 2026-08-07, should_use_proxy() deliberately does
+                # NOT escalate this to the proxy tier - production
+                # evidence showed the proxy exit routing often reaches the
+                # same dead edge, so the proxy attempt was reliably adding
+                # latency without changing the outcome (see should_use_
+                # proxy()'s docstring in youtube.py for the full reasoning).
+                # This fails fast on the direct attempt alone now. Either
+                # way this is transient network flakiness, not a bug in
+                # this app, so it gets a 503 ("try again") rather than a
+                # generic 500.
+                logger.warning(f"[DOWNLOAD] CDN edge timeout: {url}: {error_text}")
                 raise HTTPException(
                     503,
                     "Couldn't reach YouTube's servers for this video. Please try again in a moment."

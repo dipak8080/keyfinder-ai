@@ -421,20 +421,32 @@ def should_use_proxy(error_text: str) -> bool:
     """
     Narrows proxy escalation to failures that actually LOOK like an
     IP-reputation problem - a bot-check page, a 403 on the media fetch,
-    another marker in IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS, or a
-    connect-timeout to a specific googlevideo CDN edge - rather than
-    escalating on every non-permanent failure like the previous behavior
-    did. The goal is to stop paying proxy bandwidth on truly generic/
-    unrecognized yt-dlp errors (network blips, a brand-new uncatalogued
-    error string) where there's no actual evidence a different IP would
-    help.
+    a geo-restriction, or another marker in
+    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - rather than escalating on
+    every non-permanent failure like the original behavior did. The goal
+    is to stop paying proxy bandwidth on truly generic/unrecognized
+    yt-dlp errors (network blips, a brand-new uncatalogued error string)
+    where there's no actual evidence a different IP would help.
 
-    The CDN connect-timeout case (is_cdn_connect_timeout_error) was added
-    after production logs showed repeated ~20s connect timeouts to the
-    SAME assigned googlevideo edge across multiple, entirely separate
-    requests - a pattern consistent with this server's direct IP being
-    routed to a specific edge that isn't reachable from here, which a
-    proxy exit IP has a real chance of routing around.
+    CDN CONNECT-TIMEOUTS (is_cdn_connect_timeout_error) ARE DELIBERATELY
+    EXCLUDED, as of 2026-08-07. They used to escalate here on the theory
+    that a different exit IP would land on a different, reachable
+    googlevideo edge. Production evidence didn't bear that out: repeated
+    cases where the SAME edge timeout occurred on the direct attempt AND
+    then again on the proxy retry (dataimpulse's own exit routing
+    apparently reaches some of the same dead edges) - meaning the proxy
+    escalation was reliably adding ~7-10s of extra latency (its own
+    connect-timeout attempt) on top of the direct failure, for no better
+    outcome than just failing fast. A geo-restriction has a real, distinct
+    reason a different exit COUNTRY unlocks it (rights-holder licensing is
+    keyed on the requesting IP's geolocation); a CDN edge timeout has no
+    such guarantee - it's simply whichever edge YouTube's routing assigned,
+    and a different exit IP might get assigned the identical dead edge.
+    is_cdn_connect_timeout_error() still fails fast inside
+    extract_info_with_retry() (no point burning 2 more same-IP retries
+    either way) - it just no longer pays for a proxy round-trip on top.
+    If dataimpulse (or a future proxy provider) is confirmed to reliably
+    route around these specific edges, this exclusion can be revisited.
 
     IMPORTANT CAVEAT: this does NOT reduce proxy usage for the current
     known mweb/web PO-token-bound-to-video-id 403 bug (tracked upstream in
@@ -465,15 +477,13 @@ def should_use_proxy(error_text: str) -> bool:
     this is marker-list based. A genuinely new, not-yet-catalogued
     YouTube error that a different IP WOULD have fixed will now skip
     proxy entirely until its text is recognized and added to
-    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS (or given its own classifier,
-    as with is_cdn_connect_timeout_error) - watch the "[PROXY] Not
+    IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS - watch the "[PROXY] Not
     escalating to proxy" log line for repeating unrecognized error text
     as the signal something needs adding.
     """
     return (
         is_ip_block_error(error_text)
         or is_bot_check_error(error_text)
-        or is_cdn_connect_timeout_error(error_text)
     )
 
 
