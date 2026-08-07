@@ -256,6 +256,8 @@ from youtube import (
     VideoTooLongError,
     proxy_available,
     reset_proxy_circuit_breaker,
+    cdn_breaker_status,
+    reset_cdn_breaker,
     get_cookie_accounts,
     ytdlp_alert_logger,
 )
@@ -2790,6 +2792,20 @@ async def admin_reset_proxy(request: Request, key: str = Query(...)):
     return {"status": "proxy circuit breaker reset"}
 
 
+@router.post("/admin/reset-cdn-breaker")
+async def admin_reset_cdn_breaker(request: Request, key: str = Query(...)):
+    """
+    Forces the direct path back to healthy immediately instead of waiting
+    out CDN_DEGRADED_COOLDOWN_SECONDS. Useful when you know the network
+    situation changed (proxy topped up, host routing fixed, edges came
+    back) and don't want to keep paying for proxy traffic in the meantime.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    reset_cdn_breaker()
+    return {"status": "CDN degradation breaker reset - direct path re-enabled"}
+
+
 @router.get("/admin/status")
 async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
@@ -2798,6 +2814,11 @@ async def admin_status(request: Request, key: str = Query(...)):
     snapshot["proxy"] = {
         "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",
     }
+    # Direct-path health. When this shows DEGRADED, YouTube is routing
+    # this server's IP to unreachable googlevideo edges and downloads are
+    # being sent straight to the proxy - which means proxy spend is
+    # temporarily higher, and is the number to watch if the bill moves.
+    snapshot["cdn"] = cdn_breaker_status()
     snapshot["cookies"] = {
         "accounts_available": len(get_cookie_accounts()),
     }

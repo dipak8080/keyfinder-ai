@@ -21,6 +21,9 @@ from config import (
     IP_BLOCK_MARKERS,
     MAX_VIDEO_DURATION_SECONDS,
     PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    CDN_DEGRADED_THRESHOLD,
+    CDN_DEGRADED_WINDOW_SECONDS,
+    CDN_DEGRADED_COOLDOWN_SECONDS,
     COOKIE_EXPIRY_MARKERS,
     COOKIE_EXPIRY_ALERT_THRESHOLD,
     COOKIE_EXPIRY_ALERT_WINDOW_SECONDS,
@@ -428,25 +431,29 @@ def should_use_proxy(error_text: str) -> bool:
     yt-dlp errors (network blips, a brand-new uncatalogued error string)
     where there's no actual evidence a different IP would help.
 
-    CDN CONNECT-TIMEOUTS (is_cdn_connect_timeout_error) ARE DELIBERATELY
-    EXCLUDED, as of 2026-08-07. They used to escalate here on the theory
-    that a different exit IP would land on a different, reachable
-    googlevideo edge. Production evidence didn't bear that out: repeated
-    cases where the SAME edge timeout occurred on the direct attempt AND
-    then again on the proxy retry (dataimpulse's own exit routing
-    apparently reaches some of the same dead edges) - meaning the proxy
-    escalation was reliably adding ~7-10s of extra latency (its own
-    connect-timeout attempt) on top of the direct failure, for no better
-    outcome than just failing fast. A geo-restriction has a real, distinct
-    reason a different exit COUNTRY unlocks it (rights-holder licensing is
-    keyed on the requesting IP's geolocation); a CDN edge timeout has no
-    such guarantee - it's simply whichever edge YouTube's routing assigned,
-    and a different exit IP might get assigned the identical dead edge.
-    is_cdn_connect_timeout_error() still fails fast inside
-    extract_info_with_retry() (no point burning 2 more same-IP retries
-    either way) - it just no longer pays for a proxy round-trip on top.
-    If dataimpulse (or a future proxy provider) is confirmed to reliably
-    route around these specific edges, this exclusion can be revisited.
+    CDN CONNECT-TIMEOUTS (is_cdn_connect_timeout_error) DO escalate here.
+    This was briefly removed on 2026-08-07 on the theory that the proxy
+    exit often reaches the same dead edge, then restored the same day once
+    real data contradicted it. The evidence that settled it:
+
+      - Host-level curl confirmed the dead edges are unreachable from this
+        VPS on BOTH IPv4 and IPv6, so direct genuinely cannot recover.
+      - The proxy provider's own 7-day usage log showed 190 requests to
+        googlevideo.com edges through the proxy with a 100% success rate
+        and multi-MB transfers (i.e. real audio fetched, not just a
+        connection opened).
+
+    One ambiguous app-log case suggested a proxy retry also timed out;
+    190 successful fetches outweigh it. A different exit IP demonstrably
+    lands on live edges.
+
+    See also the direct-path degradation breaker below
+    (record_cdn_timeout / direct_path_degraded): once these timeouts start
+    clustering, download_with_fallback stops attempting direct at all for
+    a cooldown window and goes straight to proxy, so the doomed ~10s
+    socket_timeout isn't paid on every request during an episode. This
+    function governs the per-request escalation decision; that breaker
+    governs whether direct is even worth trying first.
 
     IMPORTANT CAVEAT: this does NOT reduce proxy usage for the current
     known mweb/web PO-token-bound-to-video-id 403 bug (tracked upstream in
@@ -484,6 +491,7 @@ def should_use_proxy(error_text: str) -> bool:
     return (
         is_ip_block_error(error_text)
         or is_bot_check_error(error_text)
+        or is_cdn_connect_timeout_error(error_text)
     )
 
 
@@ -545,6 +553,95 @@ def reset_proxy_circuit_breaker():
     with _proxy_lock:
         _proxy_disabled_until = 0.0
     logger.info("[PROXY] Circuit breaker manually reset - proxy re-enabled.")
+
+
+# ---------- DIRECT-PATH DEGRADATION BREAKER ----------
+# The inverse of the proxy circuit breaker above. That one answers "is the
+# proxy usable?"; this one answers "is going direct even worth trying?"
+#
+# Motivation, in one line: during a dead-edge episode EVERY direct attempt
+# costs a guaranteed ~10s socket_timeout and then fails, so paying it once
+# per request is pure waste once the pattern is established.
+#
+# Rolling-window counter rather than a single-failure trip, for the same
+# reason the cookie-expiry alerting uses one: an isolated timeout is
+# normal internet flakiness and shouldn't push all traffic (and cost) onto
+# the proxy. A cluster of them inside CDN_DEGRADED_WINDOW_SECONDS is a
+# real episode, and that's what trips it.
+_cdn_lock = threading.Lock()
+_cdn_timeout_events: list = []
+_direct_degraded_until = 0.0
+
+
+def record_cdn_timeout():
+    """
+    Called by download_with_fallback whenever a DIRECT attempt fails with
+    a CDN connect-timeout. Trips the breaker once enough have accumulated
+    inside the rolling window.
+
+    Deliberately only records DIRECT-path timeouts. A timeout on the proxy
+    path says nothing about whether direct is healthy, and counting it
+    would keep the breaker latched on the very failures it's meant to
+    route around.
+    """
+    global _direct_degraded_until
+    now = time.time()
+    tripped_for = None
+
+    with _cdn_lock:
+        _cdn_timeout_events.append(now)
+        cutoff = now - CDN_DEGRADED_WINDOW_SECONDS
+        while _cdn_timeout_events and _cdn_timeout_events[0] < cutoff:
+            _cdn_timeout_events.pop(0)
+        count = len(_cdn_timeout_events)
+
+        already_degraded = now < _direct_degraded_until
+        if count >= CDN_DEGRADED_THRESHOLD and not already_degraded:
+            _direct_degraded_until = now + CDN_DEGRADED_COOLDOWN_SECONDS
+            _cdn_timeout_events.clear()  # fresh count for the next window
+            tripped_for = CDN_DEGRADED_COOLDOWN_SECONDS
+
+    if tripped_for is not None:
+        logger.warning(
+            f"[CDN] Direct path marked DEGRADED for {tripped_for // 60} min - "
+            f"{CDN_DEGRADED_THRESHOLD} googlevideo connect-timeouts within "
+            f"{CDN_DEGRADED_WINDOW_SECONDS // 60} min. YouTube is routing this "
+            f"server's IP to unreachable CDN edges; downloads will go straight "
+            f"to the proxy until this clears, skipping the doomed ~10s direct "
+            f"attempt. Direct is retried automatically after the cooldown."
+        )
+
+
+def direct_path_degraded() -> bool:
+    """True while the direct path is in its post-trip cooldown."""
+    with _cdn_lock:
+        return time.time() < _direct_degraded_until
+
+
+def cdn_breaker_status() -> dict:
+    """Snapshot for /admin/status, so an episode is visible without
+    grepping logs."""
+    now = time.time()
+    with _cdn_lock:
+        cutoff = now - CDN_DEGRADED_WINDOW_SECONDS
+        recent = [t for t in _cdn_timeout_events if t >= cutoff]
+        degraded_until = _direct_degraded_until
+    return {
+        "direct_path": "DEGRADED (routing via proxy)" if now < degraded_until else "healthy",
+        "seconds_until_direct_retried": max(0, int(degraded_until - now)),
+        "recent_cdn_timeouts": len(recent),
+        "trip_threshold": CDN_DEGRADED_THRESHOLD,
+        "window_seconds": CDN_DEGRADED_WINDOW_SECONDS,
+    }
+
+
+def reset_cdn_breaker():
+    """Manual override, mirroring reset_proxy_circuit_breaker()."""
+    global _direct_degraded_until
+    with _cdn_lock:
+        _direct_degraded_until = 0.0
+        _cdn_timeout_events.clear()
+    logger.info("[CDN] Direct-path degradation breaker manually reset.")
 
 
 # ---------- COOKIE EXPIRY ALERTING (attributed to a specific account) ----------
@@ -1051,6 +1148,68 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     disabled too - same accounting either way, just discovered a layer
     later.
     """
+    def _try_proxy(reason: str):
+        """
+        The proxy attempt, shared by two callers: the normal Layer-2
+        fallback at the bottom of this function, and the degraded-path
+        short-circuit just below (which skips direct entirely).
+
+        Uses whichever cookie account is still available - proxy fixes IP
+        reputation, cookies fix session identity; the two are independent
+        problems that can combine.
+        """
+        remaining_accounts = get_cookie_accounts()
+        proxied_opts = dict(base_ydl_opts)
+        proxied_opts["proxy"] = proxy_url
+        proxy_account = remaining_accounts[0] if remaining_accounts else None
+        if proxy_account:
+            proxied_opts["cookiefile"] = proxy_account
+        else:
+            proxied_opts.pop("cookiefile", None)
+
+        _reset_cookie_flag()
+        _set_active_account(proxy_account)
+        try:
+            result = extract_info_with_retry(proxied_opts, url)
+            logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
+            return result
+        except Exception as proxy_error:
+            proxy_error_text = str(proxy_error)
+            if is_proxy_quota_error(proxy_error_text):
+                _trip_proxy_circuit_breaker()
+            elif proxy_account and _was_cookie_flagged():
+                _disable_cookie_account(proxy_account)
+                logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
+            else:
+                logger.warning(f"[PROXY] Proxy attempt also failed (non-quota error): {proxy_error_text}")
+            raise
+
+    # DEGRADED-PATH SHORT CIRCUIT. When the direct-path breaker is
+    # tripped, every direct attempt is a known ~10s socket_timeout
+    # followed by a guaranteed failure (see record_cdn_timeout above for
+    # the confirmed root cause). Skip it entirely and spend the request
+    # on the path that actually works.
+    #
+    # Guarded on the proxy being both configured AND not circuit-broken:
+    # if there is no usable proxy, degraded or not, direct is still the
+    # only path available and attempting it beats refusing outright.
+    if direct_path_degraded() and proxy_url and proxy_available():
+        logger.info(
+            "[CDN] Direct path is degraded - going straight to proxy, "
+            "skipping the direct attempt."
+        )
+        try:
+            return _try_proxy("direct path degraded")
+        except Exception as e:
+            # Proxy failed too. Fall through to the normal direct flow
+            # rather than giving up: the breaker is a heuristic about
+            # recent history, and a working direct attempt is still
+            # better than no attempt at all.
+            logger.warning(
+                f"[CDN] Proxy failed while direct was degraded - falling back "
+                f"to a direct attempt anyway: {str(e)[:200]}"
+            )
+
     accounts = get_cookie_accounts()
     if not accounts:
         # Every configured account is currently disabled (or none are
@@ -1083,6 +1242,14 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # too long or genuinely unavailable - stop everywhere,
                 # immediately.
                 raise
+
+            if is_cdn_connect_timeout_error(error_text):
+                # A DIRECT attempt just burned ~10s on an unreachable
+                # googlevideo edge. Feed the breaker so a run of these
+                # stops future requests from paying the same cost. Only
+                # recorded here (direct path); the proxy attempt below
+                # deliberately doesn't count toward it.
+                record_cdn_timeout()
 
             if account_path and _was_cookie_flagged():
                 _disable_cookie_account(account_path)
@@ -1173,36 +1340,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 
     logger.warning(f"[PROXY] Direct attempt(s) failed ({first_error[:200]}) - retrying via proxy...")
 
-    # Use whichever account is STILL available (not yet disabled by the
-    # Layer 1 loop above) for the proxy attempt - if the direct failure
-    # was an IP-block rather than a cookie problem, the same cookie
-    # session is very likely still fine, just needs a cleaner IP.
-    remaining_accounts = get_cookie_accounts()
-    proxied_opts = dict(base_ydl_opts)
-    proxied_opts["proxy"] = proxy_url
-    proxy_account = remaining_accounts[0] if remaining_accounts else None
-    if proxy_account:
-        proxied_opts["cookiefile"] = proxy_account
-    else:
-        proxied_opts.pop("cookiefile", None)
-
-    _reset_cookie_flag()
-    _set_active_account(proxy_account)
-    try:
-        result = extract_info_with_retry(proxied_opts, url)
-        logger.info("[PROXY] Proxy retry succeeded.")
-        return result
-    except Exception as proxy_error:
-        proxy_error_text = str(proxy_error)
-        if is_proxy_quota_error(proxy_error_text):
-            _trip_proxy_circuit_breaker()
-        elif proxy_account and _was_cookie_flagged():
-            _disable_cookie_account(proxy_account)
-            logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
-        else:
-            logger.warning(f"[PROXY] Proxy retry also failed (non-quota error): {proxy_error_text}")
-        # Whatever the proxy attempt raised is the most informative
-        # error to surface - propagate it (routes.py still applies its
-        # own is_bot_check_error()/is_geo_restricted_error() classification
-        # on top of this for the user-facing message).
-        raise
+    # Whatever the proxy attempt raises propagates - it's the most
+    # informative error to surface (routes.py still applies its own
+    # is_bot_check_error()/is_geo_restricted_error()/etc. classification on
+    # top of it for the user-facing message).
+    return _try_proxy("direct attempt failed")
