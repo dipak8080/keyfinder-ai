@@ -182,6 +182,19 @@ MEMBERS_ONLY_MARKERS = (
     "members-only content",
 )
 
+# Errors meaning this video/track is locked behind a YouTube Music
+# Premium subscription - distinct from MEMBERS_ONLY_MARKERS (a paid
+# subscription to one specific CHANNEL) since this is a YouTube-wide
+# Premium subscription instead. Same handling shape as age-restriction /
+# members-only: a DIFFERENT cookie account that happens to have Music
+# Premium active could fix it, the SAME account retried 3x can't, and a
+# different IP via proxy does nothing for a subscription requirement
+# either.
+MUSIC_PREMIUM_MARKERS = (
+    "only available to music premium members",
+    "youtube music premium",
+)
+
 # Errors meaning the video is a scheduled premiere/live stream that hasn't
 # started yet. Genuinely unfixable RIGHT NOW by any cookie account, IP, or
 # retry count - but not a "gone forever" error either (it will start
@@ -311,6 +324,19 @@ def is_members_only_error(error_text: str) -> bool:
     return any(marker in normalized for marker in MEMBERS_ONLY_MARKERS)
 
 
+def is_music_premium_error(error_text: str) -> bool:
+    """
+    True if this video/track requires a YouTube Music Premium
+    subscription. Same handling shape as age-restriction / members-only:
+    fail fast on same-account retries (no plain retry grants a
+    subscription), skip the proxy tier (a different IP doesn't either),
+    but allow account rotation to try a different account that might
+    already have Music Premium active.
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in MUSIC_PREMIUM_MARKERS)
+
+
 def is_not_yet_live_error(error_text: str) -> bool:
     """
     True if this is a scheduled premiere/live stream that hasn't started.
@@ -426,6 +452,15 @@ def should_use_proxy(error_text: str) -> bool:
     is_ipv6_unroutable_error) - that failure means THIS server has no
     outbound path, which no proxy exit IP changes.
 
+    Also does not escalate age-restriction, members-only, Music Premium,
+    or not-yet-live errors - those are account-identity/timing problems,
+    not IP-reputation problems, and are excluded upstream in
+    download_with_fallback before this function is even consulted (see
+    the age/members/premium/not-yet-live skip-proxy block there); this
+    function's own marker lists never match those error shapes in the
+    first place, so this note is here only so a future reader doesn't
+    wonder why they're absent from this list.
+
     Trade-off worth knowing: like every other classifier in this file,
     this is marker-list based. A genuinely new, not-yet-catalogued
     YouTube error that a different IP WOULD have fixed will now skip
@@ -447,8 +482,9 @@ def is_permanent_error(error_text: str) -> bool:
     no amount of retrying, cookie refreshing, or proxy switching helps.
     This is the ONLY thing that skips the proxy tier - see
     download_with_fallback. Geo-restriction, age-restriction, members-only,
-    and not-yet-live are deliberately NOT here (see their own marker lists
-    above) since a different cookie account or timing CAN fix those."""
+    Music Premium, and not-yet-live are deliberately NOT here (see their
+    own marker lists above) since a different cookie account or timing CAN
+    fix those."""
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
@@ -910,6 +946,16 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            if is_music_premium_error(error_text):
+                # Same reasoning again: this account doesn't have Music
+                # Premium, and retrying the identical account 2 more
+                # times with backoff can't change that.
+                logger.warning(
+                    f"Attempt {attempt}: Music Premium required, this cookie "
+                    f"account isn't subscribed - not retrying: {error_text}"
+                )
+                raise
+
             if is_not_yet_live_error(error_text):
                 # A scheduled premiere/stream that hasn't started - no
                 # retry count, cookie, or IP makes it start early.
@@ -952,16 +998,17 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 that account's own backoff loop the instant it's flagged,
                 and this loop then moves on to the next account rather
                 than trying the dead one again). If an attempt fails with
-                an age-restriction, members-only, or not-yet-live error,
-                rotation also continues to the next account (a different
-                account might genuinely be verified/a member), WITHOUT
-                disabling the current one (it isn't dead, just not
-                privileged for this specific video). If an attempt fails
-                for ANY OTHER reason (IP-block, permanent, unknown),
-                rotation stops immediately - swapping cookie accounts
-                won't fix an IP-reputation or availability problem, so we
-                fall through to Layer 2 instead of wasting the remaining
-                accounts on a failure they can't fix either.
+                an age-restriction, members-only, Music Premium, or
+                not-yet-live error, rotation also continues to the next
+                account (a different account might genuinely be
+                verified/a member/subscribed), WITHOUT disabling the
+                current one (it isn't dead, just not privileged for this
+                specific video). If an attempt fails for ANY OTHER reason
+                (IP-block, permanent, unknown), rotation stops
+                immediately - swapping cookie accounts won't fix an
+                IP-reputation or availability problem, so we fall through
+                to Layer 2 instead of wasting the remaining accounts on a
+                failure they can't fix either.
 
       Layer 2 - PROXY, tried only when should_use_proxy() confirms the
                 failure actually LOOKS like an IP-reputation problem (a
@@ -969,11 +1016,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 timeout to a specific googlevideo CDN edge, or another
                 IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS match) - AND it
                 isn't a confirmed permanent error, age-restriction,
-                members-only, or not-yet-live error (see is_permanent_error
-                and the three account-identity/timing checks below), since
-                a different IP fixes IP-reputation problems, not account
-                privilege, stream timing, or a truly generic/unrecognized
-                failure with no evidence a different IP would help. Uses
+                members-only, Music Premium, or not-yet-live error (see
+                is_permanent_error and the account-identity/timing checks
+                below), since a different IP fixes IP-reputation
+                problems, not account privilege, subscription status,
+                stream timing, or a truly generic/unrecognized failure
+                with no evidence a different IP would help. Uses
                 whichever cookie account is STILL available (not yet
                 disabled) at this point, if any - proxy fixes IP
                 reputation, cookies fix session identity, the two are
@@ -1033,14 +1081,15 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             if (
                 is_age_restricted_error(error_text)
                 or is_members_only_error(error_text)
+                or is_music_premium_error(error_text)
                 or is_not_yet_live_error(error_text)
             ):
                 # This account isn't privileged for this specific video
-                # (not age-verified, not a member) or the video simply
-                # hasn't started - a DIFFERENT account might still work,
-                # so keep rotating WITHOUT disabling this one (it's not
-                # dead, just unprivileged/early for this particular
-                # video).
+                # (not age-verified, not a member, not a Music Premium
+                # subscriber) or the video simply hasn't started - a
+                # DIFFERENT account might still work, so keep rotating
+                # WITHOUT disabling this one (it's not dead, just
+                # unprivileged/early for this particular video).
                 continue
 
             # Failure wasn't confirmed as THIS account's identity being
@@ -1057,6 +1106,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     if (
         is_age_restricted_error(first_error)
         or is_members_only_error(first_error)
+        or is_music_premium_error(first_error)
         or is_not_yet_live_error(first_error)
     ):
         # Every available cookie account hit the same account-privilege
@@ -1065,8 +1115,9 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         # bandwidth and ~30s on a guaranteed repeat failure.
         logger.warning(
             "[PROXY] Skipping proxy tier - failure is an age-restriction/"
-            "members-only/not-yet-live requirement, not an IP/bot-check "
-            "problem: no available cookie account satisfies it for this video."
+            "members-only/Music-Premium/not-yet-live requirement, not an "
+            "IP/bot-check problem: no available cookie account satisfies it "
+            "for this video."
         )
         raise last_error
 

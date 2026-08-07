@@ -94,6 +94,28 @@ failure shape to the proxy tier, since a different exit IP frequently
 resolves to a different, reachable CDN edge - that change lives entirely
 in youtube.py and needs no further changes here.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-07):
+
+/download had no branch for a YouTube Music Premium restriction ("This
+video is only available to Music Premium members"). Before this change
+that error text matched none of the classifiers in youtube.py, so it
+fell through extract_info_with_retry's full 3-attempt backoff loop (a
+guaranteed-identical failure each time - no retry grants a subscription),
+should_use_proxy() correctly declined to escalate it (a different IP
+doesn't grant a subscription either), and routes.py's fallback branch
+returned a generic 500 containing the raw yt-dlp string.
+
+This is the same shape as the existing age-restricted / members-only
+handling: an account-privilege problem, not an IP-reputation problem. A
+different cookie account that happens to have Music Premium active could
+succeed where the current one can't. is_music_premium_error() (added in
+youtube.py) is now wired into the same three places its age-restricted /
+members-only siblings already were - extract_info_with_retry's fail-fast
+branch, download_with_fallback's account-rotation continue, and its
+skip-proxy guard - and gets its own 403 branch here, matching how
+age-restriction and members-only are already handled below.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -214,6 +236,7 @@ from youtube import (
     is_geo_restricted_error,
     is_age_restricted_error,
     is_members_only_error,
+    is_music_premium_error,
     is_not_yet_live_error,
     is_permanent_error,
     is_cdn_connect_timeout_error,
@@ -719,6 +742,14 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     403,
                     "This video is exclusive to that channel's paid members and isn't "
                     "publicly downloadable - try a different video."
+                )
+
+            if is_music_premium_error(error_text):
+                logger.warning(f"[DOWNLOAD] Music Premium required: {url}")
+                raise HTTPException(
+                    403,
+                    "This track is exclusive to YouTube Music Premium subscribers and "
+                    "isn't publicly downloadable - try a different video."
                 )
 
             if is_not_yet_live_error(error_text):
