@@ -88,6 +88,31 @@ PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(
     os.environ.get("PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", str(30 * 60))  # 30 min
 )
 
+# ---------- DIRECT-PATH DEGRADATION BREAKER (CDN dead-edge protection) ----------
+# Mirror image of the proxy circuit breaker above: that one trips when the
+# PROXY is unusable and falls back to direct. This one trips when the
+# DIRECT path is unusable and falls forward to the proxy.
+#
+# Confirmed failure, verified from the host with curl (not inferred):
+#   $ curl -v --connect-timeout 10 https://rr8---sn-ojq4f5-51.googlevideo.com
+#     Trying [2607:f8b0:4000:6a::8]:443...  -> timeout
+#     Trying 172.217.153.232:443...         -> timeout
+# YouTube keeps assigning this VPS edges in the sn-ojq4f5-51 cluster that
+# are unreachable from it on BOTH address families. Retrying is pointless
+# (different rrN front-ends resolve into the same dead cluster). A
+# different exit IP is the only thing that reaches a live edge - the proxy
+# provider's usage log confirms it: 190/190 googlevideo fetches through
+# the proxy succeeded over a 7-day window.
+#
+# So instead of paying the doomed ~10s socket_timeout on every request
+# during an episode, THRESHOLD timeouts inside WINDOW seconds mark direct
+# degraded for COOLDOWN seconds and downloads skip straight to proxy.
+# Deliberately NOT "always use proxy": direct is free and works most of
+# the time, so proxy is engaged only while direct is provably broken.
+CDN_DEGRADED_THRESHOLD = int(os.environ.get("CDN_DEGRADED_THRESHOLD", "3"))
+CDN_DEGRADED_WINDOW_SECONDS = int(os.environ.get("CDN_DEGRADED_WINDOW_SECONDS", "300"))    # 5 min
+CDN_DEGRADED_COOLDOWN_SECONDS = int(os.environ.get("CDN_DEGRADED_COOLDOWN_SECONDS", "600"))  # 10 min
+
 # ---------- CORS ----------
 _allowed_origins_raw = os.environ.get(
     "ALLOWED_ORIGINS", "https://www.audioforges.com,https://audioforges.com"
