@@ -88,6 +88,50 @@ FIXES APPLIED (2026-08-02):
      {total, success, failed, logs}. Per-row coloring in the table was
      already correct (amber for 4xx, red for 5xx) - only the SUMMARY
      counters were conflating the two.
+
+PERFORMANCE PASS (2026-08-07):
+  9. Every logged HTTP request opened a brand-new SQLite connection,
+     wrote one row, committed (an fsync), and closed the connection -
+     INSIDE the request/response path, before the response was returned
+     to the visitor. Every single system log line did the same thing,
+     synchronously, from inside whatever code called logger.info(). On a
+     $7 VPS with no swap that's the most expensive thing in the whole
+     hot path, and it scales with traffic in exactly the wrong
+     direction: the busier the site gets, the more each request pays.
+
+     Writes now go onto an in-process queue and are flushed by a single
+     background thread in batches (executemany + one commit per batch,
+     up to ~500 rows or 250ms, whichever comes first). Logging is now a
+     queue append - microseconds - and never touches the disk on the
+     request path. The queue is bounded and drops on overflow rather
+     than ever blocking a request: losing a log line under extreme load
+     is strictly better than adding latency to a real user's response.
+
+ 10. Enabled WAL mode (journal_mode=WAL, synchronous=NORMAL). The
+     default rollback journal takes an exclusive lock for every write,
+     so the dashboard's read queries and the writer thread were
+     serialising against each other and periodically throwing
+     "database is locked." WAL lets readers and the single writer run
+     concurrently, which is the whole reason it exists.
+
+ 11. Connections are now reused per-thread instead of opened and closed
+     on every single query. sqlite3.connect() is not free - it parses
+     the path, opens the file, and re-runs PRAGMA setup each time.
+
+ 12. _status_counts() ran FOUR separate COUNT(*) queries - four full
+     scans of request_logs - on every poll, every 3 seconds, forever,
+     including the one with a 17-clause LIKE chain. Collapsed into a
+     single scan using conditional SUM(), and cached for a couple of
+     seconds so a burst of polls (or several open dashboard tabs)
+     shares one scan instead of each paying for their own.
+
+ 13. Added before_id cursor pagination to both data endpoints. "Load
+     older entries" previously worked by re-requesting an ever-larger
+     `limit`, but `limit` is capped at 2000 server-side, so entry 2001
+     of 14,482 was permanently unreachable no matter how many times the
+     button was clicked. Paging backwards from a cursor has no ceiling
+     and, unlike a growing limit, each page costs the same regardless
+     of how far back you have scrolled.
 --------------------------------------------------------------------------
 """
 
@@ -96,7 +140,9 @@ import contextvars
 import json
 import logging
 import os
+import queue
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -126,11 +172,59 @@ _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 
 # ============================================================
-# 1. HTTP REQUEST LOGGING (SQLite-backed)
+# 0. CONNECTION HANDLING
 # ============================================================
+# One connection per thread, created once and kept. Previously every
+# query - including the one fired by the middleware on every single HTTP
+# request - paid for a fresh sqlite3.connect() plus PRAGMA setup plus a
+# close(). Under a poll loop plus live traffic that adds up to thousands
+# of pointless open/close cycles a minute.
+
+_local = threading.local()
+
+
+def _configure(conn: sqlite3.Connection) -> sqlite3.Connection:
+    conn.row_factory = sqlite3.Row
+    # WAL: readers never block the writer and the writer never blocks
+    # readers. Without this the dashboard's polling reads and the log
+    # writer contend for an exclusive lock on the same file.
+    conn.execute("PRAGMA journal_mode=WAL")
+    # NORMAL is the standard companion to WAL: durable across process
+    # crashes, only at risk in an OS-level crash/power loss. For a log
+    # table that tradeoff is obviously correct, and it removes an fsync
+    # from every commit.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    # ~8MB page cache (negative = KiB). Keeps the hot end of the log
+    # table resident so the common "last N rows" query stays in memory.
+    conn.execute("PRAGMA cache_size=-8000")
+    return conn
+
+
+def _new_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    return _configure(conn)
+
+
+@contextmanager
+def get_db():
+    """
+    Yields this thread's long-lived connection. Kept as a contextmanager
+    so every existing `with get_db() as conn:` call site is unchanged -
+    the only difference is that exiting the block no longer closes the
+    connection.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = _new_conn()
+        _local.conn = conn
+    yield conn
+
 
 def _init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    conn = _new_conn()
+    try:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS request_logs (
@@ -175,20 +269,104 @@ def _init_db():
             pass  # column already exists
 
         conn.commit()
+    finally:
+        conn.close()
 
 
 _init_db()
 
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+# ============================================================
+# 0b. BATCHED BACKGROUND WRITER
+# ============================================================
+# Nothing on the request path writes to SQLite directly any more. Both
+# the request-logging middleware and the logging handler just append to
+# this queue; a single daemon thread owns the only write connection and
+# flushes in batches.
+#
+# One writer thread (not a pool) is deliberate: SQLite allows exactly one
+# writer at a time regardless, so extra threads would only contend. One
+# thread with executemany also means one commit amortised across up to
+# 500 rows instead of one commit per row.
 
+_HTTP = 0
+_SYS = 1
+
+_MAX_QUEUE = 20000      # ~20k pending rows before we start dropping
+_BATCH_MAX = 500        # rows per flush
+_BATCH_WINDOW = 0.25    # seconds to wait accumulating a batch
+
+_write_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=_MAX_QUEUE)
+_dropped_rows = 0
+
+
+def _enqueue(kind: int, row: tuple) -> None:
+    """Never blocks, never raises. Dropping a log line is always better
+    than adding latency to a real request or deadlocking the logger."""
+    global _dropped_rows
+    try:
+        _write_queue.put_nowait((kind, row))
+    except queue.Full:
+        _dropped_rows += 1
+
+
+def _writer_loop() -> None:
+    conn = _new_conn()
+    while True:
+        try:
+            first = _write_queue.get()  # blocks until there's work
+            batch = [first]
+            deadline = time.monotonic() + _BATCH_WINDOW
+            while len(batch) < _BATCH_MAX:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(_write_queue.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            http_rows = [r for k, r in batch if k == _HTTP]
+            sys_rows = [r for k, r in batch if k == _SYS]
+
+            if http_rows:
+                conn.executemany(
+                    "INSERT INTO request_logs "
+                    "(timestamp, method, path, status_code, duration_ms, client_ip) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    http_rows,
+                )
+            if sys_rows:
+                conn.executemany(
+                    "INSERT INTO system_logs "
+                    "(timestamp, level, logger, message, request_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    sys_rows,
+                )
+            conn.commit()
+        except Exception:
+            # Never let the writer thread die - a dead writer would
+            # silently stop all logging for the life of the container.
+            # Deliberately not using logging here: a failure inside the
+            # log writer must not re-enter the log writer.
+            try:
+                conn.rollback()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = _new_conn()
+            time.sleep(0.5)
+
+
+_writer_thread = threading.Thread(target=_writer_loop, name="log-writer", daemon=True)
+_writer_thread.start()
+
+
+# ============================================================
+# 1. HTTP REQUEST LOGGING (SQLite-backed)
+# ============================================================
 
 def _get_real_client_ip(request: Request) -> str:
     """
@@ -214,6 +392,9 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
     emitted anywhere in the call stack while handling this request -
     including from a background task the request spawns - can be tagged
     with which request it came from (see BufferLogHandler.emit()).
+
+    The row is handed to the background writer rather than inserted
+    inline, so the visitor's response is never waiting on a disk commit.
     """
 
     async def dispatch(self, request: Request, call_next):
@@ -228,29 +409,25 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         # "-" and splitting into a separate orphan group in the dashboard.
         _request_id_ctx.set(request_id)
 
-        start = time.time()
+        start = time.perf_counter()
         response = await call_next(request)
-        duration_ms = (time.time() - start) * 1000
+        duration_ms = (time.perf_counter() - start) * 1000
 
         if not request.url.path.startswith("/admin/logs"):
             try:
-                client_ip = _get_real_client_ip(request)
-                with get_db() as conn:
-                    conn.execute(
-                        "INSERT INTO request_logs (timestamp, method, path, status_code, duration_ms, client_ip) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            datetime.utcnow().isoformat(),
-                            request.method,
-                            request.url.path,
-                            response.status_code,
-                            round(duration_ms, 2),
-                            client_ip,
-                        ),
-                    )
-                    conn.commit()
+                _enqueue(
+                    _HTTP,
+                    (
+                        datetime.utcnow().isoformat(),
+                        request.method,
+                        request.url.path,
+                        response.status_code,
+                        round(duration_ms, 2),
+                        _get_real_client_ip(request),
+                    ),
+                )
             except Exception:
-                logging.getLogger(__name__).exception("Failed to write request log")
+                pass  # logging must never break a real response
 
         return response
 
@@ -281,7 +458,6 @@ def _check_admin(request: Request, key: str):
         if e.status_code == 403:
             raise HTTPException(status_code=401, detail="Unauthorized")
         raise
-
 
 
 # Same patterns the frontend's "Hide noise" checkbox already filters out
@@ -320,6 +496,30 @@ def _noise_exclusion_sql() -> str:
     return " AND ".join(f"path NOT LIKE '%{p}%'" for p in _NOISE_PATTERNS)
 
 
+# Built once at import instead of re-joining 17 strings on every request.
+_NOISE_SQL = _noise_exclusion_sql()
+
+_COUNTS_SQL = f"""
+    SELECT
+        COUNT(*)                                                       AS total,
+        COALESCE(SUM(status_code < 400), 0)                            AS success,
+        COALESCE(SUM(status_code >= 400 AND status_code < 500
+                     AND {_NOISE_SQL}), 0)                             AS client,
+        COALESCE(SUM(status_code >= 500), 0)                           AS server
+    FROM request_logs
+"""
+
+_COUNTS_TTL = 2.0  # seconds
+_counts_lock = threading.Lock()
+_counts_cache: dict = {"at": 0.0, "val": None}
+
+
+def _invalidate_counts() -> None:
+    with _counts_lock:
+        _counts_cache["at"] = 0.0
+        _counts_cache["val"] = None
+
+
 def _status_counts(conn) -> dict:
     """
     Shared by the full-window and delta code paths in get_http_logs()
@@ -344,26 +544,28 @@ def _status_counts(conn) -> dict:
     definition (a 404 or 405 scanner hit is never a 2xx). Only "client"
     gets the noise filter, since that is the one number noise was
     actually distorting.
-    """
-    noise_filter = _noise_exclusion_sql()
 
-    total = conn.execute("SELECT COUNT(*) as c FROM request_logs").fetchone()["c"]
-    success = conn.execute(
-        "SELECT COUNT(*) as c FROM request_logs WHERE status_code < 400"
-    ).fetchone()["c"]
-    client_errors = conn.execute(
-        f"SELECT COUNT(*) as c FROM request_logs "
-        f"WHERE status_code >= 400 AND status_code < 500 AND {noise_filter}"
-    ).fetchone()["c"]
-    server_errors = conn.execute(
-        "SELECT COUNT(*) as c FROM request_logs WHERE status_code >= 500"
-    ).fetchone()["c"]
-    return {
-        "total": total,
-        "success": success,
-        "client": client_errors,
-        "server": server_errors,
+    PERF: one scan, not four, and memoised for _COUNTS_TTL seconds. The
+    poll loop asks for these counts every few seconds per open tab; at
+    14k+ rows four full scans per poll was the single most expensive
+    thing this module did.
+    """
+    now = time.monotonic()
+    cached = _counts_cache["val"]
+    if cached is not None and (now - _counts_cache["at"]) < _COUNTS_TTL:
+        return cached
+
+    row = conn.execute(_COUNTS_SQL).fetchone()
+    val = {
+        "total": row["total"],
+        "success": row["success"],
+        "client": row["client"],
+        "server": row["server"],
     }
+    with _counts_lock:
+        _counts_cache["at"] = now
+        _counts_cache["val"] = val
+    return val
 
 
 @router.get("/admin/logs/http/data")
@@ -371,7 +573,8 @@ def get_http_logs(
     request: Request,
     key: str = Query(...),
     limit: int = Query(200, le=2000),
-    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
+    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
+    before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
@@ -382,6 +585,15 @@ def get_http_logs(
             # whole window every 3 seconds.
             rows = conn.execute(
                 "SELECT * FROM request_logs WHERE id > ? ORDER BY id ASC", (after_id,)
+            ).fetchall()
+        elif before_id is not None:
+            # Cursor pagination: one fixed-size page of older rows,
+            # walking backwards from what the client already holds.
+            # Returned in the SAME newest-first order as the default
+            # branch below, so the client reverses both identically.
+            rows = conn.execute(
+                "SELECT * FROM request_logs WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (before_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -422,20 +634,26 @@ async def stream_http_logs(request: Request, key: str = Query(...)):
 # or redeploys, which made older system logs disappear after every push.
 
 class BufferLogHandler(logging.Handler):
+    """
+    emit() must be cheap and must never block: it runs inline inside
+    whatever code called logger.info(), including code holding locks or
+    running inside a request. It used to open a connection, insert, and
+    commit - a full fsync - on every single log line. Now it formats the
+    record and appends to the writer queue.
+    """
+
     def emit(self, record):
         try:
-            with get_db() as conn:
-                conn.execute(
-                    "INSERT INTO system_logs (timestamp, level, logger, message, request_id) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        datetime.utcfromtimestamp(record.created).isoformat(),
-                        record.levelname,
-                        record.name,
-                        record.getMessage(),
-                        _request_id_ctx.get(),
-                    ),
-                )
-                conn.commit()
+            _enqueue(
+                _SYS,
+                (
+                    datetime.utcfromtimestamp(record.created).isoformat(),
+                    record.levelname,
+                    record.name,
+                    record.getMessage(),
+                    _request_id_ctx.get(),
+                ),
+            )
         except Exception:
             pass
 
@@ -451,7 +669,8 @@ def get_system_logs(
     request: Request,
     key: str = Query(...),
     limit: int = Query(200, le=2000),
-    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), newest-last, ignoring `limit`."),
+    after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
+    before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
@@ -462,6 +681,12 @@ def get_system_logs(
                 "SELECT * FROM system_logs WHERE id > ? ORDER BY id ASC", (after_id,)
             ).fetchall()
             logs = [dict(r) for r in rows]
+        elif before_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM system_logs WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (before_id, limit),
+            ).fetchall()
+            logs = [dict(r) for r in rows][::-1]  # oldest -> newest, same shape as default
         else:
             rows = conn.execute(
                 "SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (limit,)
@@ -511,6 +736,11 @@ def delete_logs(request: Request, key: str = Query(...), older_than_days: int = 
         conn.commit()
         deleted_http = cur.rowcount
         deleted_system = cur_sys.rowcount
+
+    # The cached counters describe a table that no longer looks like
+    # that. Without this the dashboard would show pre-delete numbers for
+    # up to _COUNTS_TTL seconds after a deletion.
+    _invalidate_counts()
 
     return {
         "deleted_http_logs": deleted_http,
