@@ -116,16 +116,21 @@ branch, download_with_fallback's account-rotation continue, and its
 skip-proxy guard - and gets its own 403 branch here, matching how
 age-restriction and members-only are already handled below.
 
-should_use_proxy() in youtube.py no longer escalates CDN connect-timeouts
-to the proxy tier (it still did before this date). Production logs showed
-the proxy's own exit routing frequently reaches the SAME dead googlevideo
-edge as the direct attempt, so the proxy retry was adding ~7-10s of
-latency for no better outcome than failing fast - unlike a geo-restriction,
-where a different exit COUNTRY has a real, licensing-based reason to
-succeed where direct failed. Geo-restriction, bot-check, and other
-IP-reputation-shaped errors still escalate to proxy as before; only the
-CDN-edge-timeout case was pulled out. No changes needed in this file
-beyond the log line below no longer implying a proxy attempt already ran.
+should_use_proxy() in youtube.py briefly stopped escalating CDN
+connect-timeouts to the proxy tier the same day, then was reverted a few
+hours later once the proxy provider's own usage log showed 190/190
+googlevideo fetches succeeding through it - the removal was based on one
+ambiguous case, the revert on much stronger evidence. CDN connect-timeouts
+DO escalate to proxy again, same as geo-restriction and bot-check (see
+should_use_proxy()'s docstring in youtube.py for the full history).
+
+On top of that, a direct-path degradation breaker was added
+(CDN_DEGRADED_THRESHOLD/_WINDOW_SECONDS/_COOLDOWN_SECONDS in config.py,
+record_cdn_timeout()/direct_path_degraded() in youtube.py): once enough
+direct-path CDN timeouts cluster together, further downloads skip the
+doomed ~10s direct attempt entirely and go straight to proxy for a
+cooldown window, surfaced via GET /admin/status's "cdn" block and
+resettable via POST /admin/reset-cdn-breaker below.
 --------------------------------------------------------------------------
 """
 import os
@@ -784,16 +789,19 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
 
             if is_cdn_connect_timeout_error(error_text):
                 # A connect-timeout to a specific googlevideo media edge.
-                # As of 2026-08-07, should_use_proxy() deliberately does
-                # NOT escalate this to the proxy tier - production
-                # evidence showed the proxy exit routing often reaches the
-                # same dead edge, so the proxy attempt was reliably adding
-                # latency without changing the outcome (see should_use_
-                # proxy()'s docstring in youtube.py for the full reasoning).
-                # This fails fast on the direct attempt alone now. Either
-                # way this is transient network flakiness, not a bug in
-                # this app, so it gets a 503 ("try again") rather than a
-                # generic 500.
+                # should_use_proxy() DOES escalate this to the proxy tier
+                # (see its docstring in youtube.py for the back-and-forth
+                # on that decision and the evidence that settled it) - so
+                # reaching this branch means direct failed AND the proxy
+                # attempt either wasn't available or also failed. The
+                # direct-path degradation breaker (cdn_breaker_status()
+                # below, config.py's CDN_DEGRADED_* knobs) separately
+                # tracks repeated direct-path timeouts and, once enough
+                # cluster together, skips the doomed ~10s direct attempt
+                # entirely for a cooldown window rather than paying for it
+                # on every request. Either way this is transient network
+                # flakiness, not a bug in this app, so it gets a 503 ("try
+                # again") rather than a generic 500.
                 logger.warning(f"[DOWNLOAD] CDN edge timeout: {url}: {error_text}")
                 raise HTTPException(
                     503,
