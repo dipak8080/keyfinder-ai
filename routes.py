@@ -2814,6 +2814,58 @@ async def admin_reset_cdn_breaker(request: Request, key: str = Query(...)):
     return {"status": "CDN degradation breaker reset - direct path re-enabled"}
 
 
+@router.get("/admin/endpoints")
+async def admin_endpoints(request: Request, key: str = Query(...)):
+    """
+    Returns every user-facing endpoint this router actually serves, read
+    straight from FastAPI's own route table via router.routes - not a
+    hand-maintained list living in a second file that someone has to
+    remember to update every time a tool is added.
+
+    This is what the admin dashboard's path-search typeahead calls to
+    build its suggestion list. Without this, suggestions could only be
+    derived from traffic already seen (see cdn_breaker_status-adjacent
+    reasoning elsewhere in this file about not trusting derived state
+    where a source of truth exists) - meaning a brand-new tool wouldn't
+    show up as a suggestion until someone had already called it once,
+    which defeats the actual purpose of a "did I forget the name of this
+    endpoint" search aid.
+
+    /admin/* paths are excluded - they're operator tooling, not "tools"
+    in the product sense, and listing them here would surface admin
+    routes (including this one) as search suggestions in the same list
+    as /convert and /pitch, which is confusing noise for what this is
+    actually for.
+
+    Static route paths only (FastAPI/Starlette route.path already uses
+    the {job_id}-style placeholder form, e.g. "/separate/status/{job_id}"
+    - never a real id), so this never leaks any live job id, IP, or other
+    per-request data. It is pure route metadata, identical for every
+    caller and every request.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+
+    seen: set = set()
+    endpoints = []
+    for route in router.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods or path.startswith("/admin"):
+            continue
+        for method in sorted(methods):
+            if method == "HEAD":  # implied by GET, not a distinct action worth surfacing
+                continue
+            key_tuple = (method, path)
+            if key_tuple in seen:
+                continue
+            seen.add(key_tuple)
+            endpoints.append({"method": method, "path": path})
+
+    endpoints.sort(key=lambda e: (e["path"], e["method"]))
+    return {"endpoints": endpoints}
+
+
 @router.get("/admin/status")
 async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
