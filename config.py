@@ -98,7 +98,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 )
 
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2700"))  # 45 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))  # 30 min
 
 # ---------- ANALYSIS TUNING ----------
 ANALYSIS_MAX_SECONDS: Optional[int] = 180
@@ -175,6 +175,31 @@ PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(
 CDN_DEGRADED_THRESHOLD = int(os.environ.get("CDN_DEGRADED_THRESHOLD", "3"))
 CDN_DEGRADED_WINDOW_SECONDS = int(os.environ.get("CDN_DEGRADED_WINDOW_SECONDS", "300"))    # 5 min
 CDN_DEGRADED_COOLDOWN_SECONDS = int(os.environ.get("CDN_DEGRADED_COOLDOWN_SECONDS", "600"))  # 10 min
+
+# ---------- PROXY BOT-CHECK BREAKER (cost control) ----------
+# Third breaker, and the one that protects the bill rather than latency.
+#
+# The proxy exists to fix IP reputation. When the proxy ITSELF starts
+# returning "Sign in to confirm you're not a bot", that has stopped being
+# true: the exit IP currently in rotation is challenged, and every
+# further escalation is a paid request with a known outcome. Observed
+# 2026-08-08: direct hit a dead CDN edge, escalated to proxy, proxy
+# bot-checked in 3 seconds - repeatedly, across different videos.
+#
+# Deliberately separate from the proxy QUOTA breaker
+# (PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS above): that one means "the
+# proxy account is out of money", this one means "the proxy works fine
+# but YouTube is challenging its current exits". Different causes,
+# different recovery, so a quota trip shouldn't be masked by bot-check
+# noise or vice versa.
+#
+# Threshold is higher than the CDN breaker's because a single bot-check
+# is genuinely common and self-resolving (rotating residential exits
+# mean the next request may land on a clean IP). It's a sustained run
+# that indicates the whole exit pool is currently challenged.
+PROXY_BOTCHECK_THRESHOLD = int(os.environ.get("PROXY_BOTCHECK_THRESHOLD", "5"))
+PROXY_BOTCHECK_WINDOW_SECONDS = int(os.environ.get("PROXY_BOTCHECK_WINDOW_SECONDS", "600"))    # 10 min
+PROXY_BOTCHECK_COOLDOWN_SECONDS = int(os.environ.get("PROXY_BOTCHECK_COOLDOWN_SECONDS", "900"))  # 15 min
 
 # ---------- CORS ----------
 _allowed_origins_raw = os.environ.get(

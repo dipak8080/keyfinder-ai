@@ -265,6 +265,10 @@ from youtube import (
     reset_proxy_circuit_breaker,
     cdn_breaker_status,
     reset_cdn_breaker,
+    proxy_botcheck_degraded,
+    reset_proxy_botcheck_breaker,
+    get_account_health,
+    get_path_stats,
     get_cookie_accounts,
     ytdlp_alert_logger,
 )
@@ -2935,6 +2939,21 @@ def _humanize_endpoint(segments: list) -> str:
     return " ".join(words)
 
 
+@router.post("/admin/reset-proxy-botcheck")
+async def admin_reset_proxy_botcheck(request: Request, key: str = Query(...)):
+    """
+    Clears the proxy bot-check breaker immediately instead of waiting out
+    PROXY_BOTCHECK_COOLDOWN_SECONDS. Use after changing YT_PROXY_URL
+    (e.g. pinning a sticky session or a fixed exit country) so the new
+    configuration gets tried right away rather than sitting behind a
+    cooldown earned by the old one.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    reset_proxy_botcheck_breaker()
+    return {"status": "proxy bot-check breaker reset - escalation re-enabled"}
+
+
 @router.get("/admin/status")
 async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
@@ -2942,14 +2961,30 @@ async def admin_status(request: Request, key: str = Query(...)):
     snapshot = get_status_snapshot()
     snapshot["proxy"] = {
         "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",
+        # Separate from the quota breaker above: this one means the proxy
+        # works but YouTube is challenging its exits, so escalations are
+        # being skipped to avoid paying for known-bad requests.
+        "botcheck_breaker": "ACTIVE (escalation paused)" if proxy_botcheck_degraded() else "clear",
     }
     # Direct-path health. When this shows DEGRADED, YouTube is routing
     # this server's IP to unreachable googlevideo edges and downloads are
     # being sent straight to the proxy - which means proxy spend is
     # temporarily higher, and is the number to watch if the bill moves.
     snapshot["cdn"] = cdn_breaker_status()
+    # Per-path success rates. Answers "is the proxy actually working?"
+    # and "did that proxy config change help?" - both previously
+    # unanswerable without reading raw logs.
+    snapshot["paths"] = get_path_stats()
     snapshot["cookies"] = {
         "accounts_available": len(get_cookie_accounts()),
+        # Per-account detail, including WHICH phase each account last
+        # failed in. A media-phase failure means extraction succeeded,
+        # which means the cookie was ACCEPTED - so a high failure count
+        # with last_failure_phase="media" is a network problem, not a
+        # cookie problem. That distinction is the whole reason this
+        # exists; without it a healthy account looks identical to a dead
+        # one.
+        "accounts": get_account_health(),
     }
     snapshot["cache"] = {
         "enabled": True,

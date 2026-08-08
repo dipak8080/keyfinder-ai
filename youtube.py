@@ -24,6 +24,9 @@ from config import (
     CDN_DEGRADED_THRESHOLD,
     CDN_DEGRADED_WINDOW_SECONDS,
     CDN_DEGRADED_COOLDOWN_SECONDS,
+    PROXY_BOTCHECK_THRESHOLD,
+    PROXY_BOTCHECK_WINDOW_SECONDS,
+    PROXY_BOTCHECK_COOLDOWN_SECONDS,
     COOKIE_EXPIRY_MARKERS,
     COOKIE_EXPIRY_ALERT_THRESHOLD,
     COOKIE_EXPIRY_ALERT_WINDOW_SECONDS,
@@ -399,6 +402,41 @@ def is_cdn_connect_timeout_error(error_text: str) -> bool:
     return "googlevideo.com" in normalized and "timed out" in normalized
 
 
+def is_media_phase_error(error_text: str) -> bool:
+    """
+    True if this failure happened while fetching the actual audio bytes,
+    rather than during extraction (webpage fetch, player API calls, PO
+    token generation, JS challenge).
+
+    WHY THIS MATTERS - it is the single most diagnostic signal available,
+    and it settled a real production question on 2026-08-08:
+
+      A media-phase failure PROVES extraction succeeded, which PROVES
+      the cookies were accepted. yt-dlp cannot reach a googlevideo media
+      URL without first completing an authenticated extraction.
+
+    That day's logs showed the same cookie file failing at the MEDIA
+    phase on the direct path (so: accepted) and then bot-checking at the
+    EXTRACTION phase through the proxy seconds later (so: rejected) - same
+    cookies, same minute, different exit IP. Without this distinction the
+    obvious-looking conclusion is "cookies are stale, re-export all
+    three", which would have been an hour of work fixing something that
+    was never broken. The actual variable was the proxy's rotating exit
+    IP presenting a Nepal-issued session from a different country.
+
+    Detection: yt-dlp prefixes media-phase failures with "[download] Got
+    error:" and they reference a googlevideo host. Extraction failures
+    carry the "[youtube] <video_id>:" prefix instead.
+    """
+    normalized = _normalize_error_text(error_text)
+    return "[download] got error" in normalized or "googlevideo.com" in normalized
+
+
+def failure_phase(error_text: str) -> str:
+    """Human-readable phase label for logs and /admin/status."""
+    return "media" if is_media_phase_error(error_text) else "extraction"
+
+
 def is_ip_block_error(error_text: str) -> bool:
     """
     True if this error looks like a KNOWN IP-reputation problem - the
@@ -642,6 +680,210 @@ def reset_cdn_breaker():
         _direct_degraded_until = 0.0
         _cdn_timeout_events.clear()
     logger.info("[CDN] Direct-path degradation breaker manually reset.")
+
+
+# ---------- PROXY BOT-CHECK BREAKER (cost control) ----------
+# The proxy's entire job is to present a cleaner IP. When the proxy path
+# itself starts returning bot-checks, that job is currently failing, and
+# every further escalation is a PAID request with a known outcome.
+#
+# Distinct from the quota breaker above: that one means "out of money",
+# this one means "the money works but YouTube is challenging these
+# exits". Keeping them separate matters because the recovery is
+# different - a quota trip needs a top-up, this one usually resolves on
+# its own as the provider rotates to less-challenged exits.
+_proxy_botcheck_lock = threading.Lock()
+_proxy_botcheck_events: list = []
+_proxy_botcheck_until = 0.0
+
+
+def record_proxy_botcheck():
+    """Called when a PROXY attempt fails with a bot-check specifically."""
+    global _proxy_botcheck_until
+    now = time.time()
+    tripped = False
+
+    with _proxy_botcheck_lock:
+        _proxy_botcheck_events.append(now)
+        cutoff = now - PROXY_BOTCHECK_WINDOW_SECONDS
+        while _proxy_botcheck_events and _proxy_botcheck_events[0] < cutoff:
+            _proxy_botcheck_events.pop(0)
+        count = len(_proxy_botcheck_events)
+
+        if count >= PROXY_BOTCHECK_THRESHOLD and now >= _proxy_botcheck_until:
+            _proxy_botcheck_until = now + PROXY_BOTCHECK_COOLDOWN_SECONDS
+            _proxy_botcheck_events.clear()
+            tripped = True
+
+    if tripped:
+        logger.warning(
+            f"[PROXY] Bot-check breaker TRIPPED - {PROXY_BOTCHECK_THRESHOLD} "
+            f"bot-checks through the proxy within "
+            f"{PROXY_BOTCHECK_WINDOW_SECONDS // 60} min. The proxy's current exit "
+            f"pool is being challenged by YouTube, so further escalations are "
+            f"paid requests with a known outcome. Pausing proxy escalation for "
+            f"{PROXY_BOTCHECK_COOLDOWN_SECONDS // 60} min. If this trips "
+            f"repeatedly, the usual cause is a ROTATING residential exit "
+            f"presenting a cookie session from a different country each request "
+            f"- pin a sticky session and a fixed country in YT_PROXY_URL."
+        )
+
+
+def proxy_botcheck_degraded() -> bool:
+    """True while the proxy is in its post-bot-check cooldown."""
+    with _proxy_botcheck_lock:
+        return time.time() < _proxy_botcheck_until
+
+
+def reset_proxy_botcheck_breaker():
+    global _proxy_botcheck_until
+    with _proxy_botcheck_lock:
+        _proxy_botcheck_until = 0.0
+        _proxy_botcheck_events.clear()
+    logger.info("[PROXY] Bot-check breaker manually reset.")
+
+
+# ---------- PER-ACCOUNT COOKIE HEALTH ----------
+# Replaces "accounts_available: 3" - a single number that says nothing
+# about WHICH account is degrading, or why. Without this the only way to
+# answer "are my cookies actually bad?" was to paste logs somewhere and
+# have someone read message prefixes by eye.
+#
+# Records outcomes per account, tagged with the PHASE the failure
+# happened in (see failure_phase), because that's what separates
+# "cookies rejected" from "cookies fine, network broke".
+_account_health_lock = threading.Lock()
+_account_health: dict = {}
+
+
+def _health_entry(path: str) -> dict:
+    return _account_health.setdefault(path, {
+        "successes": 0,
+        "failures": 0,
+        "last_success_at": None,
+        "last_failure_at": None,
+        "last_failure_phase": None,
+        "last_failure_kind": None,
+        "last_used_via": None,   # "direct" or "proxy"
+    })
+
+
+def record_account_result(
+    path: Optional[str],
+    ok: bool,
+    via: str,
+    error_text: str = "",
+):
+    """
+    Records one attempt's outcome against a cookie account.
+
+    `via` ("direct" / "proxy") is recorded because the same account can
+    succeed on one path and be rejected on the other in the same minute -
+    which is exactly the pattern that proves the problem is the exit IP
+    rather than the cookie. Losing that distinction would flatten the
+    single most useful signal here back into an ambiguous failure count.
+    """
+    if not path:
+        return
+    now = time.time()
+    with _account_health_lock:
+        entry = _health_entry(path)
+        entry["last_used_via"] = via
+        if ok:
+            entry["successes"] += 1
+            entry["last_success_at"] = now
+        else:
+            entry["failures"] += 1
+            entry["last_failure_at"] = now
+            entry["last_failure_phase"] = failure_phase(error_text)
+            if is_bot_check_error(error_text):
+                kind = "bot_check"
+            elif is_cdn_connect_timeout_error(error_text):
+                kind = "cdn_timeout"
+            elif is_permanent_error(error_text):
+                kind = "video_unavailable"
+            else:
+                kind = "other"
+            entry["last_failure_kind"] = kind
+
+
+def get_account_health() -> list:
+    """
+    Snapshot for /admin/status. One row per configured account with
+    enough context to answer "is this account actually bad?" without
+    reading raw logs.
+    """
+    now = time.time()
+    _materialize_extra_cookie_accounts()
+    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
+    candidates = [p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH) if p]
+
+    out = []
+    with _cookie_accounts_lock:
+        disabled_map = dict(_cookie_account_disabled_until)
+    with _account_health_lock:
+        for path in candidates:
+            exists = os.path.exists(path)
+            disabled_until = disabled_map.get(path, 0)
+            entry = _account_health.get(path, {})
+            total = entry.get("successes", 0) + entry.get("failures", 0)
+            out.append({
+                "path": path,
+                "exists": exists,
+                "status": (
+                    "missing" if not exists
+                    else "disabled" if now < disabled_until
+                    else "active"
+                ),
+                "disabled_for_seconds": max(0, int(disabled_until - now)),
+                "successes": entry.get("successes", 0),
+                "failures": entry.get("failures", 0),
+                "success_rate": (
+                    round(entry.get("successes", 0) / total * 100, 1) if total else None
+                ),
+                "seconds_since_success": (
+                    int(now - entry["last_success_at"])
+                    if entry.get("last_success_at") else None
+                ),
+                "last_failure_phase": entry.get("last_failure_phase"),
+                "last_failure_kind": entry.get("last_failure_kind"),
+                "last_used_via": entry.get("last_used_via"),
+            })
+    return out
+
+
+# ---------- PATH-LEVEL OUTCOME COUNTERS ----------
+# Answers "what is my proxy success rate this week?" - previously
+# unanswerable from /admin/status, which meant there was no way to tell
+# whether a proxy change (sticky sessions, a new provider, a different
+# country pin) actually helped.
+_path_stats_lock = threading.Lock()
+_path_stats: dict = {
+    "direct": {"attempts": 0, "successes": 0},
+    "proxy": {"attempts": 0, "successes": 0},
+}
+
+
+def record_path_attempt(via: str, ok: bool):
+    with _path_stats_lock:
+        bucket = _path_stats.setdefault(via, {"attempts": 0, "successes": 0})
+        bucket["attempts"] += 1
+        if ok:
+            bucket["successes"] += 1
+
+
+def get_path_stats() -> dict:
+    with _path_stats_lock:
+        out = {}
+        for via, b in _path_stats.items():
+            out[via] = {
+                **b,
+                "success_rate": (
+                    round(b["successes"] / b["attempts"] * 100, 1)
+                    if b["attempts"] else None
+                ),
+            }
+        return out
 
 
 # ---------- COOKIE EXPIRY ALERTING (attributed to a specific account) ----------
@@ -1187,16 +1429,39 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         try:
             result = extract_info_with_retry(proxied_opts, url)
             logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
+            record_account_result(proxy_account, True, "proxy")
+            record_path_attempt("proxy", True)
             return result
         except Exception as proxy_error:
             proxy_error_text = str(proxy_error)
+            record_account_result(proxy_account, False, "proxy", proxy_error_text)
+            record_path_attempt("proxy", False)
+
             if is_proxy_quota_error(proxy_error_text):
                 _trip_proxy_circuit_breaker()
+            elif is_bot_check_error(proxy_error_text):
+                # Feed the cost-control breaker. Deliberately does NOT
+                # disable the cookie account: a bot-check here says the
+                # EXIT IP was challenged, not that the session is dead -
+                # and on 2026-08-08 the same account had authenticated
+                # successfully on the direct attempt seconds earlier.
+                # Disabling on this signal would recreate exactly the
+                # false-positive cascade that took all three accounts
+                # offline that morning.
+                record_proxy_botcheck()
+                logger.warning(
+                    f"[PROXY] Bot-check through proxy (phase="
+                    f"{failure_phase(proxy_error_text)}). The exit IP was "
+                    f"challenged - this does NOT mean the cookie is dead."
+                )
             elif proxy_account and _was_cookie_flagged():
                 _disable_cookie_account(proxy_account)
                 logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
             else:
-                logger.warning(f"[PROXY] Proxy attempt also failed (non-quota error): {proxy_error_text}")
+                logger.warning(
+                    f"[PROXY] Proxy attempt also failed (phase="
+                    f"{failure_phase(proxy_error_text)}): {proxy_error_text[:200]}"
+                )
             raise
 
     # DEGRADED-PATH SHORT CIRCUIT. When the direct-path breaker is
@@ -1208,7 +1473,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     # Guarded on the proxy being both configured AND not circuit-broken:
     # if there is no usable proxy, degraded or not, direct is still the
     # only path available and attempting it beats refusing outright.
-    if direct_path_degraded() and proxy_url and proxy_available():
+    if direct_path_degraded() and proxy_url and proxy_available() and not proxy_botcheck_degraded():
         logger.info(
             "[CDN] Direct path is degraded - going straight to proxy, "
             "skipping the direct attempt."
@@ -1247,10 +1512,14 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             result = extract_info_with_retry(opts, url)
             if account_path:
                 logger.info(f"[COOKIES] Download succeeded using account: {account_path}")
+            record_account_result(account_path, True, "direct")
+            record_path_attempt("direct", True)
             return result
         except Exception as e:
             last_error = e
             error_text = str(e)
+            record_account_result(account_path, False, "direct", error_text)
+            record_path_attempt("direct", False)
 
             if isinstance(e, VideoTooLongError) or is_permanent_error(error_text):
                 # No cookie swap, no proxy, no retry fixes a video that's
@@ -1380,7 +1649,24 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         )
         raise last_error
 
-    logger.warning(f"[PROXY] Direct attempt(s) failed ({first_error[:200]}) - retrying via proxy...")
+    if proxy_botcheck_degraded():
+        # Cost control. The proxy's exits are currently being challenged
+        # by YouTube (see record_proxy_botcheck), so this escalation is a
+        # paid request with a known outcome. Failing here costs the user
+        # nothing extra - they were going to get an error either way -
+        # and saves both the money and the ~5-15s the attempt would burn.
+        logger.warning(
+            f"[PROXY] Skipping escalation - proxy bot-check breaker is active "
+            f"(exits currently challenged). Failing fast instead of paying for "
+            f"a request that is very likely to bot-check too. Direct failure "
+            f"was phase={failure_phase(first_error)}: {first_error[:150]}"
+        )
+        raise last_error
+
+    logger.warning(
+        f"[PROXY] Direct attempt(s) failed "
+        f"(phase={failure_phase(first_error)}: {first_error[:200]}) - retrying via proxy..."
+    )
 
     # Whatever the proxy attempt raises propagates - it's the most
     # informative error to surface (routes.py still applies its own
