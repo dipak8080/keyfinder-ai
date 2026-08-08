@@ -141,6 +141,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -241,6 +242,10 @@ def _init_db():
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs(timestamp)")
+        # Supports get_endpoint_counts()'s GROUP BY path. Without it that
+        # becomes a full table scan every cache miss, which gets worse as
+        # request_logs grows.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_path ON request_logs(path)")
 
         # Migration for databases created before request_id was stored on
         # the HTTP side. system_logs has carried a request_id since
@@ -527,6 +532,84 @@ def _invalidate_counts() -> None:
     with _counts_lock:
         _counts_cache["at"] = 0.0
         _counts_cache["val"] = None
+    # Endpoint totals describe the same table, so a deletion invalidates
+    # both - otherwise the tool picker would keep showing pre-delete
+    # numbers for up to _ENDPOINT_COUNTS_TTL after logs were cleared.
+    with _endpoint_counts_lock:
+        _endpoint_counts_cache["at"] = 0.0
+        _endpoint_counts_cache["val"] = None
+
+
+# ---------- PER-ENDPOINT TOTALS ----------
+# The dashboard's tool picker used to count rows in whatever the browser
+# had LOADED, which meant the numbers visibly shrank as the in-memory
+# window trimmed older rows - "/download 967" quietly becoming "/download
+# 233" looked like requests had disappeared. These are the real totals
+# from the database, so the picker shows a number that doesn't move
+# depending on how far someone has scrolled.
+#
+# Grouping happens in Python, not SQL, deliberately: the family rule
+# (strip trailing action segments and job ids, keep namespaced tools
+# intact) has no clean SQL expression, and re-implementing it in SQL
+# would make a THIRD copy of that rule alongside routes.py's
+# admin_endpoints() and page.tsx's toolFamily(). Two already have to be
+# kept in agreement; a third in a different language would drift.
+#
+# One GROUP BY over an indexed column, then a pass over distinct paths -
+# not one query per endpoint. Cached on the same TTL as the status
+# counters for the same reason: several dashboard tabs polling shouldn't
+# each pay for their own scan.
+
+_ACTION_SEGMENTS = {"status", "preview", "download", "result"}
+_ID_LIKE = re.compile(r"^[0-9a-f]{6,}(-[0-9a-f]{4,}){0,4}$", re.IGNORECASE)
+
+
+def _tool_family(path: str) -> str:
+    """Mirrors toolFamily() in page.tsx and the family loop in
+    admin_endpoints(). The i > 0 guard is what keeps "/download" - a real
+    tool whose name collides with an action segment - from collapsing to
+    nothing."""
+    parts = []
+    for i, seg in enumerate([s for s in path.split("/") if s]):
+        if i > 0 and (seg in _ACTION_SEGMENTS or _ID_LIKE.match(seg)):
+            break
+        if _ID_LIKE.match(seg):
+            break
+        parts.append(seg)
+    return "/" + "/".join(parts) if parts else path
+
+
+_ENDPOINT_COUNTS_TTL = 10.0  # longer than status counts - this moves slowly
+_endpoint_counts_lock = threading.Lock()
+_endpoint_counts_cache: dict = {"at": 0.0, "val": None}
+
+
+def get_endpoint_counts() -> dict:
+    """
+    Returns {family_path: total_request_count} across the WHOLE table.
+
+    Noise is excluded using the same shared NOISE_PATH_MARKERS the
+    Client Errors count uses, so a scanner probing hundreds of junk
+    paths can't flood the picker with meaningless families.
+    """
+    now = time.monotonic()
+    cached = _endpoint_counts_cache["val"]
+    if cached is not None and (now - _endpoint_counts_cache["at"]) < _ENDPOINT_COUNTS_TTL:
+        return cached
+
+    counts: dict = {}
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT path, COUNT(*) AS c FROM request_logs WHERE {_NOISE_SQL} GROUP BY path"
+        ).fetchall()
+    for row in rows:
+        family = _tool_family(row["path"])
+        counts[family] = counts.get(family, 0) + row["c"]
+
+    with _endpoint_counts_lock:
+        _endpoint_counts_cache["at"] = now
+        _endpoint_counts_cache["val"] = counts
+    return counts
 
 
 def _status_counts(conn) -> dict:

@@ -319,6 +319,7 @@ from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 from admin_auth import guard_admin_request, verify_admin_key
+from log_stream import get_endpoint_counts
 
 router = APIRouter()
 
@@ -2904,8 +2905,21 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
             if method != "HEAD":  # implied by GET, not a distinct action
                 entry["methods"].add(method)
 
+    # Real totals from the database, not from whatever the browser
+    # happens to have loaded. The picker previously counted rows in the
+    # client's in-memory window, so its numbers visibly shrank as older
+    # rows were trimmed - "/download 967" becoming "/download 233" looked
+    # like requests had vanished. Cached server-side (see
+    # get_endpoint_counts), so this adds no per-request query cost.
+    counts = get_endpoint_counts()
+
     endpoints = [
-        {"path": f["path"], "label": f["label"], "methods": sorted(f["methods"])}
+        {
+            "path": f["path"],
+            "label": f["label"],
+            "methods": sorted(f["methods"]),
+            "total_requests": counts.get(f["path"], 0),
+        }
         for f in families.values()
     ]
     endpoints.sort(key=lambda e: e["label"].lower())
