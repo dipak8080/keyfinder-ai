@@ -667,8 +667,34 @@ def get_http_logs(
     limit: int = Query(200, le=2000),
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
+    family: str = Query(None, description="If set, return only rows belonging to this tool family, e.g. '/volume' also matches '/volume/status/<id>'."),
 ):
     _check_admin(request, key)
+
+    # Server-side family filtering. Without this the dashboard filtered
+    # client-side over only the rows already loaded in the browser, while
+    # the tool picker showed the REAL database total - so a tool with 6
+    # requests all older than the loaded window displayed "6" in the
+    # picker and "No requests match" in the list. Two sources of truth
+    # for the same question.
+    #
+    # Matches the family itself plus anything nested under it, which is
+    # exactly the definition _tool_family() collapses to: "/volume"
+    # matches "/volume" and "/volume/status/<id>", and cannot partially
+    # match an unrelated tool like "/volume-boost" because the LIKE
+    # requires a following slash.
+    where = []
+    params: list = []
+    if family:
+        where.append("(path = ? OR path LIKE ?)")
+        params.extend([family, family + "/%"])
+
+    def _clause(extra: str = "") -> str:
+        parts = list(where)
+        if extra:
+            parts.append(extra)
+        return (" WHERE " + " AND ".join(parts)) if parts else ""
+
     with get_db() as conn:
         if after_id is not None:
             # Delta mode: used by the dashboard's poll loop. Returns only
@@ -676,7 +702,8 @@ def get_http_logs(
             # quiet server this is an empty list instead of re-sending the
             # whole window every 3 seconds.
             rows = conn.execute(
-                "SELECT * FROM request_logs WHERE id > ? ORDER BY id ASC", (after_id,)
+                f"SELECT * FROM request_logs{_clause('id > ?')} ORDER BY id ASC",
+                (*params, after_id),
             ).fetchall()
         elif before_id is not None:
             # Cursor pagination: one fixed-size page of older rows,
@@ -684,12 +711,13 @@ def get_http_logs(
             # Returned in the SAME newest-first order as the default
             # branch below, so the client reverses both identically.
             rows = conn.execute(
-                "SELECT * FROM request_logs WHERE id < ? ORDER BY id DESC LIMIT ?",
-                (before_id, limit),
+                f"SELECT * FROM request_logs{_clause('id < ?')} ORDER BY id DESC LIMIT ?",
+                (*params, before_id, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM request_logs ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM request_logs{_clause()} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
         counts = _status_counts(conn)
     return JSONResponse({**counts, "logs": [dict(r) for r in rows]})
