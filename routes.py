@@ -2817,53 +2817,102 @@ async def admin_reset_cdn_breaker(request: Request, key: str = Query(...)):
 @router.get("/admin/endpoints")
 async def admin_endpoints(request: Request, key: str = Query(...)):
     """
-    Returns every user-facing endpoint this router actually serves, read
-    straight from FastAPI's own route table via router.routes - not a
-    hand-maintained list living in a second file that someone has to
-    remember to update every time a tool is added.
+    Returns the list of TOOLS this API exposes - one entry per tool, with
+    a human-readable label - read from FastAPI's own route table rather
+    than a hand-maintained list that goes stale every time a tool is
+    added.
 
-    This is what the admin dashboard's path-search typeahead calls to
-    build its suggestion list. Without this, suggestions could only be
-    derived from traffic already seen (see cdn_breaker_status-adjacent
-    reasoning elsewhere in this file about not trusting derived state
-    where a source of truth exists) - meaning a brand-new tool wouldn't
-    show up as a suggestion until someone had already called it once,
-    which defeats the actual purpose of a "did I forget the name of this
-    endpoint" search aid.
+    Collapsing is the whole point. Every tool registers four routes:
 
-    /admin/* paths are excluded - they're operator tooling, not "tools"
-    in the product sense, and listing them here would surface admin
-    routes (including this one) as search suggestions in the same list
-    as /convert and /pitch, which is confusing noise for what this is
-    actually for.
+        POST /convert
+        GET  /convert/status/{job_id}
+        GET  /convert/preview/{job_id}
+        GET  /convert/download/{job_id}
 
-    Static route paths only (FastAPI/Starlette route.path already uses
-    the {job_id}-style placeholder form, e.g. "/separate/status/{job_id}"
-    - never a real id), so this never leaks any live job id, IP, or other
-    per-request data. It is pure route metadata, identical for every
-    caller and every request.
+    Returning those raw gives ~100 entries for ~25 tools, and a filter
+    dropdown that long is worse than no dropdown at all. The sub-routes
+    are implementation detail: nobody wants to filter logs by "preview"
+    specifically, they want to see everything /convert did. So the
+    trailing action segment and its id are stripped, leaving one clean
+    "/convert" family. Method (GET/POST/DELETE) is already its own filter
+    in the dashboard, so families deliberately do not fork by method
+    either.
+
+    /admin/* is excluded: operator tooling, not a product tool, and
+    listing it would put this very endpoint in the same picker as
+    /convert and /pitch.
+
+    Returns only static route metadata - identical for every caller,
+    every request. No job ids, no IPs, nothing per-request.
     """
     client_ip = guard_admin_request(request)
     verify_admin_key(key, client_ip)
 
-    seen: set = set()
-    endpoints = []
+    # Trailing segments that mark an ACTION on a job rather than a
+    # distinct tool. Anything at/after one of these is stripped.
+    action_segments = {"status", "preview", "download", "result"}
+
+    families: dict = {}
     for route in router.routes:
         path = getattr(route, "path", None)
         methods = getattr(route, "methods", None)
-        if not path or not methods or path.startswith("/admin"):
+        if not path or not methods:
             continue
-        for method in sorted(methods):
-            if method == "HEAD":  # implied by GET, not a distinct action worth surfacing
-                continue
-            key_tuple = (method, path)
-            if key_tuple in seen:
-                continue
-            seen.add(key_tuple)
-            endpoints.append({"method": method, "path": path})
+        if path.startswith("/admin") or path in ("/", "/health", "/limits"):
+            continue
 
-    endpoints.sort(key=lambda e: (e["path"], e["method"]))
+        segments = [s for s in path.split("/") if s]
+        # Walk from the left, stopping at the first action segment or
+        # path parameter - what remains is the tool itself. Left-to-right
+        # (not trimming from the right) keeps namespaced tools intact:
+        # /youtube/analyze/result/{job_id} correctly yields
+        # /youtube/analyze, not /youtube.
+        family_parts = []
+        for seg in segments:
+            if seg in action_segments or seg.startswith("{"):
+                break
+            family_parts.append(seg)
+
+        if not family_parts:
+            continue
+
+        family = "/" + "/".join(family_parts)
+        entry = families.setdefault(
+            family,
+            {"path": family, "label": _humanize_endpoint(family_parts), "methods": set()},
+        )
+        for method in methods:
+            if method != "HEAD":  # implied by GET, not a distinct action
+                entry["methods"].add(method)
+
+    endpoints = [
+        {"path": f["path"], "label": f["label"], "methods": sorted(f["methods"])}
+        for f in families.values()
+    ]
+    endpoints.sort(key=lambda e: e["label"].lower())
     return {"endpoints": endpoints}
+
+
+def _humanize_endpoint(segments: list) -> str:
+    """
+    "/youtube/analyze" -> "YouTube Analyze", "/speech-to-text" ->
+    "Speech To Text", "/stems-hq" -> "Stems HQ".
+
+    Exists so the dashboard picker reads like a list of tools rather
+    than a list of URLs. Kept here rather than in the frontend because
+    the backend is the thing that actually knows what these routes are,
+    and duplicating the mapping client-side is exactly the kind of
+    quietly-drifting second source of truth this endpoint exists to
+    avoid.
+    """
+    special = {"hq": "HQ", "youtube": "YouTube", "url": "URL", "api": "API"}
+    words = []
+    for seg in segments:
+        for part in seg.replace("_", "-").split("-"):
+            if not part:
+                continue
+            words.append(special.get(part.lower(), part.capitalize()))
+    return " ".join(words)
 
 
 @router.get("/admin/status")
