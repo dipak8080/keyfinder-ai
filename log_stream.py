@@ -429,7 +429,16 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         duration_ms = (time.perf_counter() - start) * 1000
 
-        if not request.url.path.startswith("/admin/logs"):
+        # Was "/admin/logs" only - which meant every OTHER admin call
+        # (/admin/endpoints, /admin/status, /admin/clear-cache,
+        # /admin/cookies/status...) still got logged as ordinary traffic.
+        # That's the actual reason admin routes were showing up as fake
+        # "tools" in the endpoint picker: the picker's traffic-derived
+        # entries were built from real logged rows, and those rows should
+        # never have existed. Broadened to all of /admin - operator
+        # tooling isn't a product "tool" and was never meant to appear in
+        # a dashboard that's specifically ABOUT that traffic.
+        if not request.url.path.startswith("/admin"):
             try:
                 _enqueue(
                     _HTTP,

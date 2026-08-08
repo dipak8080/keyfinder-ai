@@ -45,9 +45,31 @@ NOISE_PATH_MARKERS = (
     "/mcp", "/jsonrpc", "/sse", "/containers/json",
     "eval-stdin.php", "/_ignition/", "/actuator/",
     "/+CSCOE+/", "/+webvpn+/", "phpunit",
-    # Joomla/WHM scanner probes, added 2026-08-07:
-    "/administrator", "/language/en-gb", "/media/system/",
-    "validate-sso", "whm-login",
+    # Joomla/WHM scanner probes.
+    "/administrator", "/language/en-", "/media/system/",
+    "validate-sso",
+    # Verified against a real day of traffic (2026-08-08): the earlier
+    # "whm-login" guess never matched anything, because the real path
+    # uses underscores with no hyphen at all -
+    # "/___proxy_subdomain_whm/login/". Fixed to match what's actually
+    # being sent instead of a plausible-looking guess.
+    "proxy_subdomain_whm",
+    # Broad, high-value markers added after that same traffic sample
+    # showed ~300 distinct scanner paths in a single day - far more than
+    # is worth enumerating individually here, and a hand-maintained list
+    # can never keep pace with new campaigns anyway. Each of these
+    # collapses a whole FAMILY of variants into one match: "credentials"
+    # alone covers aws/gcp/firebase/service-account probes in every path
+    # shape scanners send them in, "/@fs/" covers every Vite dev-server
+    # path-traversal attempt regardless of what file it's grabbing for.
+    # This list only feeds the Client Errors SQL exclusion now, not the
+    # endpoint picker - see toolFamily()'s "known families only, else
+    # bucket into Other" logic in page.tsx, which no longer depends on
+    # this list being complete for the UI to stay clean.
+    "/@fs/", "credentials", "service-account", "serviceaccount",
+    "/.aws/", "/.ssh/", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    "terraform.tf", "wp-login", "wp-config", "wp-json",
+    "firebase", "gcp-", "google-service",
 )
 
 # ---------- PATHS ----------
