@@ -153,6 +153,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from admin_auth import guard_admin_request, verify_admin_key
+from config import NOISE_PATH_MARKERS
 
 DB_PATH = os.environ.get("REQUEST_LOG_DB_PATH", "/app/data/logs.db")
 ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
@@ -476,40 +477,23 @@ def _check_admin(request: Request, key: str):
         raise
 
 
-# Same patterns the frontend's "Hide noise" checkbox already filters out
-# of the TABLE rows - this list is what applies that same exclusion to
-# the SUMMARY counts too. Kept as one shared list here (not duplicated
-# per query) so an addition to it can't accidentally cover the table view
-# without covering the numbers at the top, or vice versa.
-#
-# Every entry here is automated internet-wide vulnerability scanning -
-# bots sweeping IP ranges for exposed control panels, PHP/Laravel/Drupal
-# exploits, leaked .env files, exposed Docker sockets, MCP/JSON-RPC
-# probes, and known RCE payloads (e.g. the PHPUnit eval-stdin exploit).
-# This traffic hits every public server on the internet, this one
-# included, and none of it reflects a real visitor or a real problem
-# with this app - it inflated "Client Errors" without meaning anything,
-# which is exactly the confusion the success/client/server split above
-# was meant to remove.
-_NOISE_PATTERNS = (
-    "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
-    "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php",
-    "/mcp", "/jsonrpc", "/sse", "/containers/json",
-    "eval-stdin.php", "/_ignition/", "/actuator/",
-    "/+CSCOE+/", "/+webvpn+/", "phpunit",
-)
-
-
+# Same patterns the frontend's "Hide noise" checkbox filters out of the
+# TABLE rows - this applies that same exclusion to the SUMMARY counts.
+# Sourced from config.NOISE_PATH_MARKERS, the one canonical list every
+# consumer (this SQL exclusion, the fallback dashboard's embedded JS
+# below, and the Next.js dashboard via admin_endpoints()) reads from -
+# see that constant's docstring for why three independently-maintained
+# copies used to exist here and had already drifted out of sync.
 def _noise_exclusion_sql() -> str:
     """
     Builds the `path NOT LIKE ... AND path NOT LIKE ...` clause shared by
     every count query below. A single f-string fragment rather than
     parameterized placeholders is safe here specifically because
-    _NOISE_PATTERNS is a fixed, hardcoded tuple in this file - never
+    NOISE_PATH_MARKERS is a fixed, hardcoded tuple in config.py - never
     user input, never request data - so there is no injection surface;
     building it as literal SQL just keeps the call sites below readable.
     """
-    return " AND ".join(f"path NOT LIKE '%{p}%'" for p in _NOISE_PATTERNS)
+    return " AND ".join(f"path NOT LIKE '%{p}%'" for p in NOISE_PATH_MARKERS)
 
 
 # Built once at import instead of re-joining 17 strings on every request.
@@ -967,10 +951,11 @@ function renderCounters() {
   document.getElementById("serverErrors").innerText = serverErrorCount;
 }
 
-const NOISE_PATTERNS = [
-  "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
-  "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php"
-];
+// Injected from config.NOISE_PATH_MARKERS by logs_dashboard() below -
+// see that constant's docstring for why this is no longer a separately
+// maintained list. Same source the Client Errors SQL exclusion and the
+// Next.js dashboard both read.
+const NOISE_PATTERNS = PLACEHOLDER_NOISE_PATTERNS;
 function isNoise(path) {
   return NOISE_PATTERNS.some(p => path.includes(p));
 }
@@ -1268,4 +1253,5 @@ loadInitialSystem();
 </html>
     """
     html = html.replace("PLACEHOLDER_ADMIN_KEY", ADMIN_KEY)
+    html = html.replace("PLACEHOLDER_NOISE_PATTERNS", json.dumps(list(NOISE_PATH_MARKERS)))
     return HTMLResponse(content=html)

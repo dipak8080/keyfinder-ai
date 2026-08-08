@@ -145,6 +145,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Q
 from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
+    NOISE_PATH_MARKERS,
     logger,
     UPLOAD_DIR,
     MAX_UPLOAD_BYTES,
@@ -2890,7 +2891,12 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
         for f in families.values()
     ]
     endpoints.sort(key=lambda e: e["label"].lower())
-    return {"endpoints": endpoints}
+    # Served alongside the tool list so the Next.js dashboard's "Hide
+    # noise" checkbox reads the exact same definition the backend uses
+    # to exclude noise from the Client Errors count - see
+    # config.NOISE_PATH_MARKERS for why these two were previously
+    # separate, silently-drifted copies.
+    return {"endpoints": endpoints, "noise_patterns": list(NOISE_PATH_MARKERS)}
 
 
 def _humanize_endpoint(segments: list) -> str:

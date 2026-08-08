@@ -9,6 +9,47 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ---------- NOISE PATTERNS (automated scanner traffic) ----------
+# THE single canonical list. Previously this existed as three separately
+# maintained copies - log_stream.py's Python _NOISE_PATTERNS (used to
+# exclude noise from the Client Errors SQL count), log_stream.py's
+# embedded JS copy (the fallback HTML dashboard's own "Hide noise"
+# checkbox), and page.tsx's hardcoded TS array (the real Next.js
+# dashboard) - and they had already drifted: the SQL version had 17
+# entries, the dashboard only had 8. That meant the "Client Errors" stat
+# and the "Hide noise" checkbox were silently answering "is this noise?"
+# differently, which defeats the entire point of having a shared
+# definition. Fixing three files that were each right by construction
+# once is how this kind of drift creeps back in; one list every
+# consumer reads from is how it stays fixed.
+#
+# Every entry here is automated internet-wide vulnerability scanning -
+# bots sweeping IP ranges for exposed control panels, PHP/Joomla/Laravel/
+# Drupal/WHM exploits, leaked .env files, exposed Docker sockets,
+# MCP/JSON-RPC probes, and known RCE payloads (e.g. the PHPUnit
+# eval-stdin exploit). This traffic hits every public server on the
+# internet, this one included, and none of it reflects a real visitor or
+# a real problem with this app.
+#
+# Consumers, all reading this exact tuple:
+#   - log_stream.py's _noise_exclusion_sql() -> excludes noise from the
+#     Client Errors count
+#   - log_stream.py's logs_dashboard() -> injects it into the fallback
+#     HTML dashboard's embedded JS (no separate copy there any more)
+#   - routes.py's admin_endpoints() -> serves it to the Next.js
+#     dashboard as "noise_patterns" in the same response that already
+#     carries the tool list, so the browser never hardcodes its own copy
+NOISE_PATH_MARKERS = (
+    "/robots.txt", "/favicon.ico", "/.env", "/wp-", "/.git",
+    "/SDK/", "/phpmyadmin", "/.well-known", "/xmlrpc.php",
+    "/mcp", "/jsonrpc", "/sse", "/containers/json",
+    "eval-stdin.php", "/_ignition/", "/actuator/",
+    "/+CSCOE+/", "/+webvpn+/", "phpunit",
+    # Joomla/WHM scanner probes, added 2026-08-07:
+    "/administrator", "/language/en-gb", "/media/system/",
+    "validate-sso", "whm-login",
+)
+
 # ---------- PATHS ----------
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
