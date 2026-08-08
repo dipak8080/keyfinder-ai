@@ -22,6 +22,7 @@ from config import (
     MAX_AUDIO_TOOL_DURATION_SECONDS,
     AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS,
 )
+from utils import safe_extension
 
 
 class AudioToolError(Exception):
@@ -133,15 +134,49 @@ def validate_duration(file_path: str, max_seconds: int = MAX_AUDIO_TOOL_DURATION
 def build_output_path(job_id: str, output_format: str) -> str:
     """Deterministic output path for a job, e.g.
     audio_tools_output/<job_id>.mp3 - kept separate from the input
-    upload path so cleanup of one never risks touching the other."""
+    upload path so cleanup of one never risks touching the other.
+
+    Safe by construction already: output_format is never raw user input,
+    it comes from the validated conversion matrix or the source file's
+    validated extension.
+    """
     return os.path.join(AUDIO_TOOLS_DIR, f"{job_id}.{output_format}")
 
 
 def build_temp_input_path(job_id: str, original_filename: str) -> str:
-    """Deterministic input path for a job, mirrors the
-    f'{job_id}_{filename}' pattern already used in routes.py for
-    /analyze and /separate."""
-    return os.path.join(AUDIO_TOOLS_DIR, f"{job_id}_{original_filename}")
+    """
+    Deterministic input path for a job: <AUDIO_TOOLS_DIR>/<job_id>.<ext>
+
+    THIS FUNCTION CAUSED A PRODUCTION OUTAGE (2026-08-08). It previously
+    built f"{job_id}_{original_filename}", pasting the raw user-supplied
+    filename straight into a path. Linux caps a single filename at 255
+    BYTES - not characters - and UTF-8 encodes Hebrew at 2 bytes per
+    character and emoji at 4. A real user uploaded a ~180-character
+    Hebrew filename; with the 32-char job-id prefix it came to 390 bytes,
+    open() failed with [Errno 36] File name too long, and /separate,
+    /separate-hq and every other job tool returned a 500. The user
+    retried three times and failed every time.
+
+    The correct fix is not "truncate more carefully" - it's that the
+    user's filename never needed to be here at all:
+
+      - job_id already guarantees uniqueness
+      - the original name is preserved separately (routes.py passes
+        original_filename into mark_*_complete() for display), so
+        nothing user-visible is lost
+      - only the EXTENSION carries real meaning downstream, because
+        ffmpeg and Demucs use it to infer the container format
+
+    Dropping the rest also closes several other latent problems in one
+    move: path separators in a filename ("../../etc/passwd"), null
+    bytes, leading dashes that a subprocess would parse as flags, and
+    Windows-reserved names.
+
+    safe_extension() (utils.py) allows only ASCII alphanumerics and falls
+    back to "bin" on anything unexpected, so this path is bounded and
+    predictable regardless of what gets uploaded.
+    """
+    return os.path.join(AUDIO_TOOLS_DIR, f"{job_id}.{safe_extension(original_filename)}")
 
 
 # ========== SUBPROCESS EXECUTION ==========

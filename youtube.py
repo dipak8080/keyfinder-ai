@@ -974,7 +974,7 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
             # download_with_fallback's rotation/alerting logic (which
             # reads this same flag) is completely unchanged; this only
             # removes pointless retries BEFORE that logic ever runs.
-            if _was_cookie_flagged():
+            if _was_cookie_flagged() and not is_cdn_connect_timeout_error(error_text):
                 logger.warning(
                     f"Attempt {attempt}: this cookie account was confirmed dead "
                     f"by yt-dlp's own check - not retrying with the same "
@@ -1169,6 +1169,21 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 
         _reset_cookie_flag()
         _set_active_account(proxy_account)
+        if proxy_account:
+            logger.info(f"[PROXY] Using cookie account: {proxy_account}")
+        else:
+            # Worth a WARNING, not an info line: the proxy fixes IP
+            # reputation, not session identity. Without a cookie the
+            # bot-check is close to guaranteed, and during the
+            # 2026-08-08 incident this state was completely silent -
+            # the logs showed a bot-check with no hint that the real
+            # cause was every account having been disabled moments
+            # earlier by unrelated CDN timeouts.
+            logger.warning(
+                "[PROXY] No healthy cookie accounts available for the proxy "
+                "attempt - a bot-check is near-certain. Check whether accounts "
+                "were recently disabled (see [COOKIES] lines above)."
+            )
         try:
             result = extract_info_with_retry(proxied_opts, url)
             logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
@@ -1250,6 +1265,33 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # recorded here (direct path); the proxy attempt below
                 # deliberately doesn't count toward it.
                 record_cdn_timeout()
+
+                # DO NOT fall through to the cookie-disable check below.
+                #
+                # Observed in production 2026-08-08: three CDN timeouts
+                # in ~40 seconds disabled ALL THREE cookie accounts, and
+                # the proxy tier then ran with no session at all and got
+                # a guaranteed bot-check. The chain was:
+                #
+                #   direct attempt -> googlevideo connect timeout
+                #   -> yt-dlp ALSO emits its "cookies are no longer
+                #      valid" warning during the same run (that check is
+                #      a heuristic, and it fires on unrelated network
+                #      failures - see _maybe_alert_cookie_expiry's
+                #      comment on exactly this)
+                #   -> _was_cookie_flagged() is true
+                #   -> account disabled for 15 min, rotate to next
+                #   -> next account hits the SAME dead edge, same result
+                #   -> repeat until no accounts remain
+                #
+                # A network-level timeout says nothing about whether a
+                # cookie is valid. Breaking out here means: don't disable
+                # anything, don't rotate (a different account cannot
+                # reach a dead CDN edge either, and each rotation costs
+                # another ~10s), go straight to the proxy tier - which is
+                # the one thing that CAN fix this, and which now still
+                # has healthy cookies to use when it gets there.
+                break
 
             if account_path and _was_cookie_flagged():
                 _disable_cookie_account(account_path)

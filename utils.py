@@ -3,6 +3,7 @@ utils.py - Shared low-level helpers used across the app:
 - cookies.txt bootstrap from base64 env var
 - memory cleanup / temp file cleanup
 - thread pool + run_blocking() for offloading blocking calls
+- safe upload path construction (byte-bounded, no user-controlled bytes)
 - concurrency semaphores + acquire_slot_or_503()
 - Camelot wheel / key math
 """
@@ -13,6 +14,7 @@ import base64
 import gzip
 import asyncio
 import functools
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import HTTPException
@@ -130,10 +132,82 @@ _executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
 
 async def run_blocking(func, *args, **kwargs):
     """Runs a blocking/synchronous function in the thread pool instead of
-    on the event loop, so it doesn't freeze the whole server while it runs."""
+    on the event loop, so it doesn't freeze the whole server while it runs.
+
+    CONTEXTVARS: the current context is explicitly copied into the worker
+    thread. This is NOT automatic - asyncio.create_task() propagates
+    contextvars, but loop.run_in_executor() does not, and that gap had a
+    real, visible consequence: log_stream.py tags every log line with the
+    request id from a contextvar, so EVERY line emitted from inside a
+    blocking call (all of yt-dlp's output, download progress, ffmpeg
+    errors, Demucs failures) was silently recorded with request_id="-"
+    instead of the request that caused it.
+
+    The symptom was the admin dashboard's click-through correlation
+    showing only two lines for a request that had produced thirty: the
+    two logged on the event loop in routes.py survived, everything from
+    the worker thread was orphaned. Copying the context fixes the
+    correlation for every blocking call at once, in one place, rather
+    than threading a request id through dozens of function signatures.
+    """
     loop = asyncio.get_running_loop()
-    call = functools.partial(func, *args, **kwargs)
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, func, *args, **kwargs)
     return await loop.run_in_executor(_executor, call)
+
+
+# ========== SAFE UPLOAD PATHS ==========
+# Linux caps a single filename at 255 BYTES - not characters. That
+# distinction is the whole bug this exists to prevent: a Hebrew or emoji
+# filename is 2-4 bytes per character in UTF-8, so a perfectly ordinary
+# ~120-character name blows the limit once a 32-char job-id prefix is
+# added, and open() fails with [Errno 36] File name too long. Seen in
+# production 2026-08-08: a real user hit it three times in a row on
+# /separate and /separate-hq and got a 500 every time.
+#
+# The fix is not "truncate more carefully" - it's that the user's
+# filename has no business being in a temp path at all. The job id
+# already guarantees uniqueness, and the original name is captured
+# separately (routes.py passes original_filename into mark_*_complete
+# for display). Keeping it in the path bought nothing and cost a whole
+# class of failure: byte-length limits, path separators, null bytes,
+# leading dashes, reserved names.
+#
+# Only a sanitized extension survives, because ffmpeg/Demucs genuinely
+# do use it to infer container format.
+
+MAX_EXTENSION_LENGTH = 10
+
+
+def safe_extension(filename: str, fallback: str = "bin") -> str:
+    """
+    Extracts a conservative, filesystem-safe extension from a user
+    filename. ASCII alphanumerics only - anything else (path separators,
+    unicode, spaces, extra dots) is dropped rather than escaped, since no
+    legitimate audio/video extension needs them and every one of them is
+    a way to break out of an expected path shape.
+    """
+    if not filename:
+        return fallback
+    ext = os.path.splitext(filename)[1].lstrip(".")
+    cleaned = "".join(c for c in ext if c.isascii() and c.isalnum()).lower()
+    if not cleaned or len(cleaned) > MAX_EXTENSION_LENGTH:
+        return fallback
+    return cleaned
+
+
+def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: str = "") -> str:
+    """
+    Builds "<directory>/<job_id><suffix>.<ext>" - bounded length by
+    construction, with no user-controlled bytes outside a validated
+    extension.
+
+    `suffix` exists for the one caller that needs several files under a
+    single job (/join uploads N files at once), so they don't collide
+    with each other.
+    """
+    ext = safe_extension(filename)
+    return os.path.join(directory, f"{job_id}{suffix}.{ext}")
 
 
 # ========== CONCURRENCY SEMAPHORES ==========

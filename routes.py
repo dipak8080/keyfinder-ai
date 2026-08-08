@@ -244,6 +244,7 @@ from utils import (
     run_blocking,
     acquire_slot_or_503,
     get_camelot,
+    build_safe_upload_path,
     _analysis_semaphore,
     _download_semaphore,
 )
@@ -874,7 +875,7 @@ async def analyze_audio(file: UploadFile = File(...)):
     started = time.monotonic()
 
     file_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
+    file_path = build_safe_upload_path(UPLOAD_DIR, file_id, file.filename)
     analysis_path = file_path
 
     # The upload is streamed to disk BEFORE the semaphore is taken. The
@@ -2175,11 +2176,12 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
     original_filename = file.filename
     job_id = create_job(job_type="video_to_audio")
 
-    # Note the path is built directly rather than via
-    # build_temp_input_path(): that helper is for audio extensions, and
-    # ffmpeg needs the real container extension (.mp4/.mov/...) to
-    # demux a video correctly.
-    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    # build_safe_upload_path keeps the real container extension
+    # (.mp4/.mov/...), which ffmpeg genuinely needs to demux a video
+    # correctly, while dropping the rest of the user-supplied filename -
+    # see its docstring in utils.py for why any of that name in a path is
+    # a liability (255-BYTE filename limits, separators, null bytes).
+    input_path = build_safe_upload_path(UPLOAD_DIR, job_id, file.filename)
     output_path = build_output_path(job_id, target_format)
 
     try:
@@ -2263,7 +2265,7 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
     job_id = create_job(job_type="join")
 
     dest_paths = [
-        os.path.join(UPLOAD_DIR, f"{job_id}_{index}_{f.filename}")
+        build_safe_upload_path(UPLOAD_DIR, job_id, f.filename, suffix=f"_{index}")
         for index, f in enumerate(files)
     ]
 
@@ -2868,10 +2870,22 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
         # (not trimming from the right) keeps namespaced tools intact:
         # /youtube/analyze/result/{job_id} correctly yields
         # /youtube/analyze, not /youtube.
+        #
+        # The i > 0 guard matters and was missing initially: "/download"
+        # is itself a real tool (the YouTube downloader, the busiest
+        # endpoint on this API), but "download" is ALSO an action segment
+        # for every job tool's /<tool>/download/{job_id} route. Without
+        # this guard the loop broke on segment zero, family_parts came
+        # out empty, and the route was skipped entirely - so /download
+        # never appeared in the dashboard's tool picker and all of its
+        # traffic silently fell into the "Other" bucket. An action word
+        # only ends a family when something already precedes it.
         family_parts = []
-        for seg in segments:
-            if seg in action_segments or seg.startswith("{"):
+        for i, seg in enumerate(segments):
+            if i > 0 and (seg in action_segments or seg.startswith("{")):
                 break
+            if seg.startswith("{"):
+                break  # a parameter as the FIRST segment is never a tool
             family_parts.append(seg)
 
         if not family_parts:
