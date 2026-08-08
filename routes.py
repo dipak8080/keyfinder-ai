@@ -300,6 +300,7 @@ from audio_common import (
     AudioToolError,
     validate_duration,
     get_audio_mime_type,
+    assert_distinct_paths,
 )
 from audio_converter import convert_audio
 from audio_cutter import trim_audio
@@ -1311,6 +1312,20 @@ async def _submit_audio_tool(
     job_id = create_job(job_type=job_type)
     input_path, size = await _accept_upload(file, job_id, label=job_type)
     output_path = build_output_path(job_id, out_fmt)
+
+    # Fails loudly HERE if path construction ever produces the same file
+    # for input and output, instead of ten seconds later inside ffmpeg
+    # with an opaque exit code - and before the cleanup step can delete
+    # the output thinking it's the input. Every audio tool routes through
+    # this function, so this one line covers all of them, including any
+    # added later. See assert_distinct_paths() for the incident that
+    # motivated it.
+    try:
+        assert_distinct_paths(input_path, output_path)
+    except AudioToolError as e:
+        cleanup_file(input_path)
+        mark_failed(job_id, str(e))
+        raise HTTPException(500, str(e))
 
     if check_duration:
         await _validate_duration_or_reject(job_id, input_path, max_duration_seconds)

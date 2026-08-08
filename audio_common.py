@@ -18,6 +18,7 @@ from config import (
     FFMPEG_PATH,
     FFPROBE_PATH,
     AUDIO_TOOLS_DIR,
+    UPLOAD_DIR,
     ALLOWED_AUDIO_INPUT_FORMATS,
     MAX_AUDIO_TOOL_DURATION_SECONDS,
     AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS,
@@ -35,6 +36,26 @@ class AudioToolError(Exception):
     surface as an unexpected 500 / job failure with a generic message.
     """
     pass
+
+
+# ========== STARTUP INVARIANT ==========
+# Uploads and outputs MUST live in different directories. If they don't,
+# every tool that preserves the file extension (volume, trim, pitch,
+# tempo, reverse, noise-remove, voice-clean, echo-remove,
+# silence-remove) silently breaks: input and output resolve to the same
+# path, ffmpeg refuses to edit in place, and the cleanup step deletes
+# the output. That exact failure shipped on 2026-08-09.
+#
+# Checked at import, not at request time, so a bad config kills startup
+# with a clear message instead of producing a confusing per-request
+# failure that looks like corrupt user uploads.
+if os.path.abspath(UPLOAD_DIR) == os.path.abspath(AUDIO_TOOLS_DIR):
+    raise RuntimeError(
+        f"UPLOAD_DIR and AUDIO_TOOLS_DIR must be different directories "
+        f"(both are '{UPLOAD_DIR}'). Job inputs and outputs share the same "
+        f"<job_id>.<ext> naming, so pointing them at the same directory makes "
+        f"input and output the same file for every format-preserving tool."
+    )
 
 
 # ========== FORMAT VALIDATION ==========
@@ -145,38 +166,75 @@ def build_output_path(job_id: str, output_format: str) -> str:
 
 def build_temp_input_path(job_id: str, original_filename: str) -> str:
     """
-    Deterministic input path for a job: <AUDIO_TOOLS_DIR>/<job_id>.<ext>
+    Deterministic input path for a job: <UPLOAD_DIR>/<job_id>.<ext>
 
-    THIS FUNCTION CAUSED A PRODUCTION OUTAGE (2026-08-08). It previously
-    built f"{job_id}_{original_filename}", pasting the raw user-supplied
-    filename straight into a path. Linux caps a single filename at 255
-    BYTES - not characters - and UTF-8 encodes Hebrew at 2 bytes per
-    character and emoji at 4. A real user uploaded a ~180-character
-    Hebrew filename; with the 32-char job-id prefix it came to 390 bytes,
-    open() failed with [Errno 36] File name too long, and /separate,
-    /separate-hq and every other job tool returned a 500. The user
-    retried three times and failed every time.
+    THIS FUNCTION CAUSED A PRODUCTION OUTAGE (2026-08-08), and a SECOND
+    ONE FROM ITS OWN FIX (2026-08-09) - documenting both so the next
+    change doesn't reintroduce either.
 
-    The correct fix is not "truncate more carefully" - it's that the
-    user's filename never needed to be here at all:
+    Bug #1 (2026-08-08): built f"{job_id}_{original_filename}", pasting
+    the raw user-supplied filename straight into a path. Linux caps a
+    filename at 255 BYTES - not characters - and UTF-8 encodes Hebrew at
+    2 bytes/char, emoji at 4. A ~180-character Hebrew filename came to
+    390 bytes with the job-id prefix, open() failed with [Errno 36] File
+    name too long, and every job tool 500'd for that upload.
 
-      - job_id already guarantees uniqueness
-      - the original name is preserved separately (routes.py passes
-        original_filename into mark_*_complete() for display), so
-        nothing user-visible is lost
-      - only the EXTENSION carries real meaning downstream, because
-        ffmpeg and Demucs use it to infer the container format
+    Bug #2 (2026-08-09), introduced BY the fix for bug #1: the corrected
+    version built the path as AUDIO_TOOLS_DIR/<job_id>.<ext> - the exact
+    same directory build_output_path() uses for the OUTPUT file, with the
+    exact same naming shape. For any tool that doesn't change the file's
+    extension (volume, trim, pitch, tempo, reverse, noise-remove, voice-
+    clean, echo-remove, silence-remove - i.e. most of them; only /convert
+    and a handful of others change format), input_path and output_path
+    became IDENTICAL. ffmpeg correctly refuses to edit a file in place:
+    "Output ... same as Input #0 - exiting FFmpeg cannot edit existing
+    files in-place." Every /volume, /trim, /pitch etc. call started
+    failing with exit 234.
 
-    Dropping the rest also closes several other latent problems in one
-    move: path separators in a filename ("../../etc/passwd"), null
-    bytes, leading dashes that a subprocess would parse as flags, and
-    Windows-reserved names.
-
-    safe_extension() (utils.py) allows only ASCII alphanumerics and falls
-    back to "bin" on anything unexpected, so this path is bounded and
-    predictable regardless of what gets uploaded.
+    The actual fix, addressing both at once: input goes in UPLOAD_DIR,
+    output stays in AUDIO_TOOLS_DIR - two physically separate
+    directories, so job_id-based filenames can never collide regardless
+    of whether the tool changes the extension. This was the ORIGINAL
+    design before bug #1's fix accidentally merged them into one
+    directory. safe_extension() (utils.py) still keeps the filename
+    itself bounded and ASCII-only, so bug #1 stays fixed.
     """
-    return os.path.join(AUDIO_TOOLS_DIR, f"{job_id}.{safe_extension(original_filename)}")
+    return os.path.join(UPLOAD_DIR, f"{job_id}.{safe_extension(original_filename)}")
+
+
+def assert_distinct_paths(input_path: str, output_path: str) -> None:
+    """
+    Guards the single bug class that has now caused two production
+    incidents in two days - both from path construction, both silent
+    until a user hit them.
+
+    On 2026-08-09 build_temp_input_path() and build_output_path() briefly
+    produced IDENTICAL paths for every tool that doesn't change the file
+    extension (volume, trim, pitch, tempo, reverse, noise-remove,
+    voice-clean, echo-remove, silence-remove - i.e. most of them). The
+    symptoms were awful to diagnose from the outside: ffmpeg exited 234
+    with "Output ... same as Input #0", the user saw a generic "file may
+    be corrupt" message, and the cleanup step then DELETED the output
+    because input_path and output_path were the same file.
+
+    An audit proves the path builders are correct today. This proves it
+    at every invocation, forever - including for any tool added later by
+    someone who hasn't read this file. Failing loudly here, at submit
+    time, with the actual paths in the message, is worth far more than
+    the microsecond it costs: the alternative is failing opaquely deep
+    inside a subprocess ten seconds later.
+
+    Raises AudioToolError (not a bare assert) so it can't be compiled
+    out with python -O, and so it lands in the same handling path as
+    every other expected failure rather than surfacing as a 500.
+    """
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        logger.error(
+            f"[AUDIO_TOOLS] PATH COLLISION - input and output are the same file: "
+            f"{input_path}. This is a bug in path construction, not a bad upload. "
+            f"See assert_distinct_paths() in audio_common.py."
+        )
+        raise AudioToolError("Internal path configuration error. Please report this.")
 
 
 # ========== SUBPROCESS EXECUTION ==========
