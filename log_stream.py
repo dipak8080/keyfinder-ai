@@ -246,6 +246,8 @@ def _init_db():
         # becomes a full table scan every cache miss, which gets worse as
         # request_logs grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_path ON request_logs(path)")
+        # Supports the server-side status-class filter (4xx/5xx chips).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_status ON request_logs(status_code)")
 
         # Migration for databases created before request_id was stored on
         # the HTTP side. system_logs has carried a request_id since
@@ -276,6 +278,8 @@ def _init_db():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_timestamp ON system_logs(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_request_id ON system_logs(request_id)")
+        # Supports the server-side level filter on the System tab.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_level ON system_logs(level)")
 
         # Migration for databases created before request_id existed -
         # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table,
@@ -667,27 +671,69 @@ def get_http_logs(
     limit: int = Query(200, le=2000),
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
-    family: str = Query(None, description="If set, return only rows belonging to this tool family, e.g. '/volume' also matches '/volume/status/<id>'."),
+    family: str = Query(None, description="Tool family, e.g. '/volume' also matches '/volume/status/<id>'."),
+    method: str = Query(None, description="HTTP method filter, e.g. 'POST'."),
+    q: str = Query(None, description="Substring match on path."),
+    status_class: str = Query(None, description="'4xx' or '5xx'."),
+    hide_noise: bool = Query(False, description="Exclude known bot/scanner paths."),
+    since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
+    until: str = Query(None, description="ISO UTC timestamp, exclusive upper bound."),
 ):
+    """
+    ALL filtering happens here, in SQL, deliberately.
+
+    It used to happen in the browser over whatever rows were already
+    loaded, which meant every filter silently under-reported the moment
+    the real result set was bigger than the loaded window: a tool with 6
+    requests older than the window showed "No requests match", and the
+    4xx/5xx chips, method dropdown, date filter and path search all had
+    the same flaw. The stat boxes at the top were computed over the whole
+    table, so they disagreed with the list below them - two answers to
+    the same question, which is exactly what makes a dashboard
+    untrustworthy.
+
+    Filtering in SQL means the answer doesn't depend on how far someone
+    has scrolled. `filtered_total` is returned alongside so the UI can
+    say how many rows actually match, rather than how many happen to be
+    in memory.
+
+    Date filtering takes explicit `since`/`until` UTC timestamps rather
+    than a "today"/"yesterday" keyword: the dashboard displays Nepal
+    time (UTC+5:45), and computing that boundary here would duplicate
+    timezone logic that the frontend already has to own for rendering.
+    The client sends the exact window it means.
+    """
     _check_admin(request, key)
 
-    # Server-side family filtering. Without this the dashboard filtered
-    # client-side over only the rows already loaded in the browser, while
-    # the tool picker showed the REAL database total - so a tool with 6
-    # requests all older than the loaded window displayed "6" in the
-    # picker and "No requests match" in the list. Two sources of truth
-    # for the same question.
-    #
-    # Matches the family itself plus anything nested under it, which is
-    # exactly the definition _tool_family() collapses to: "/volume"
-    # matches "/volume" and "/volume/status/<id>", and cannot partially
-    # match an unrelated tool like "/volume-boost" because the LIKE
-    # requires a following slash.
-    where = []
+    where: list = []
     params: list = []
+
     if family:
+        # Matches the family itself plus anything nested under it. The
+        # trailing slash in the LIKE is what stops '/separate' from also
+        # matching '/separate-hq'.
         where.append("(path = ? OR path LIKE ?)")
         params.extend([family, family + "/%"])
+    if method:
+        where.append("method = ?")
+        params.append(method)
+    if q:
+        # SQLite LIKE is case-insensitive for ASCII by default, matching
+        # the case-insensitive behaviour the frontend search had.
+        where.append("path LIKE ?")
+        params.append(f"%{q}%")
+    if status_class == "4xx":
+        where.append("status_code >= 400 AND status_code < 500")
+    elif status_class == "5xx":
+        where.append("status_code >= 500")
+    if hide_noise:
+        where.append(f"({_NOISE_SQL})")
+    if since:
+        where.append("timestamp >= ?")
+        params.append(since)
+    if until:
+        where.append("timestamp < ?")
+        params.append(until)
 
     def _clause(extra: str = "") -> str:
         parts = list(where)
@@ -697,19 +743,11 @@ def get_http_logs(
 
     with get_db() as conn:
         if after_id is not None:
-            # Delta mode: used by the dashboard's poll loop. Returns only
-            # genuinely new rows since the client's last known id - on a
-            # quiet server this is an empty list instead of re-sending the
-            # whole window every 3 seconds.
             rows = conn.execute(
                 f"SELECT * FROM request_logs{_clause('id > ?')} ORDER BY id ASC",
                 (*params, after_id),
             ).fetchall()
         elif before_id is not None:
-            # Cursor pagination: one fixed-size page of older rows,
-            # walking backwards from what the client already holds.
-            # Returned in the SAME newest-first order as the default
-            # branch below, so the client reverses both identically.
             rows = conn.execute(
                 f"SELECT * FROM request_logs{_clause('id < ?')} ORDER BY id DESC LIMIT ?",
                 (*params, before_id, limit),
@@ -719,8 +757,22 @@ def get_http_logs(
                 f"SELECT * FROM request_logs{_clause()} ORDER BY id DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
+
+        # How many rows match the CURRENT filters across the whole table.
+        # Without this the UI can only report "showing N of what's
+        # loaded", which is the number that was misleading in the first
+        # place.
+        filtered_total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM request_logs{_clause()}", tuple(params)
+        ).fetchone()["c"]
+
         counts = _status_counts(conn)
-    return JSONResponse({**counts, "logs": [dict(r) for r in rows]})
+
+    return JSONResponse({
+        **counts,
+        "filtered_total": filtered_total,
+        "logs": [dict(r) for r in rows],
+    })
 
 
 async def _http_log_event_generator():
@@ -792,6 +844,8 @@ def get_system_logs(
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
     request_id: str = Query(None, description="If set, return EVERY system_logs row carrying this request_id, ignoring limit/before_id/after_id entirely."),
+    level: str = Query(None, description="Log level filter, e.g. 'ERROR'."),
+    q: str = Query(None, description="Substring match on logger or message."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
@@ -810,28 +864,52 @@ def get_system_logs(
                 (request_id,),
             ).fetchall()
             logs = [dict(r) for r in rows]
-            return JSONResponse({"total": len(logs), "logs": logs})
+            return JSONResponse({"total": len(logs), "filtered_total": len(logs), "logs": logs})
+
+        # Filtering in SQL for the same reason as get_http_logs: doing it
+        # in the browser could only ever search the rows already loaded,
+        # so searching for an error that scrolled out of the window
+        # returned nothing even though it was sitting in the database.
+        where: list = []
+        params: list = []
+        if level:
+            where.append("level = ?")
+            params.append(level)
+        if q:
+            where.append("(message LIKE ? OR logger LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+
+        def _clause(extra: str = "") -> str:
+            parts = list(where)
+            if extra:
+                parts.append(extra)
+            return (" WHERE " + " AND ".join(parts)) if parts else ""
 
         if after_id is not None:
-            # Delta mode - see get_http_logs() for the reasoning. Already
-            # ASC (oldest -> newest), so no reversal needed here.
             rows = conn.execute(
-                "SELECT * FROM system_logs WHERE id > ? ORDER BY id ASC", (after_id,)
+                f"SELECT * FROM system_logs{_clause('id > ?')} ORDER BY id ASC",
+                (*params, after_id),
             ).fetchall()
             logs = [dict(r) for r in rows]
         elif before_id is not None:
             rows = conn.execute(
-                "SELECT * FROM system_logs WHERE id < ? ORDER BY id DESC LIMIT ?",
-                (before_id, limit),
+                f"SELECT * FROM system_logs{_clause('id < ?')} ORDER BY id DESC LIMIT ?",
+                (*params, before_id, limit),
             ).fetchall()
             logs = [dict(r) for r in rows][::-1]  # oldest -> newest, same shape as default
         else:
             rows = conn.execute(
-                "SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM system_logs{_clause()} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
             logs = [dict(r) for r in rows][::-1]  # oldest -> newest, for chronological display
+
         total = conn.execute("SELECT COUNT(*) as c FROM system_logs").fetchone()["c"]
-    return JSONResponse({"total": total, "logs": logs})
+        filtered_total = conn.execute(
+            f"SELECT COUNT(*) as c FROM system_logs{_clause()}", tuple(params)
+        ).fetchone()["c"]
+
+    return JSONResponse({"total": total, "filtered_total": filtered_total, "logs": logs})
 
 
 async def _system_log_event_generator():
