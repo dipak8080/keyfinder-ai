@@ -394,7 +394,7 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # single-slot resource one person may claim. See MAX_QUEUED_SEPARATIONS
 # below - that, not this, is what actually protects the server. This
 # number only decides how often one IP may join the queue.
-SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "10"))
+SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "3"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # Stricter still for HQ: one job can hold the single separation slot for
@@ -409,7 +409,7 @@ SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE
 # on path: one IP can spend its /separate budget AND its /stems budget in
 # the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS
 # regardless, so the practical cap is wait time, not throughput.
-STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "10"))
+STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "3"))
 STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
@@ -734,13 +734,33 @@ LOUDNORM_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOUDNORM_RATE_LIMIT_WIN
 # BOTH the download semaphore and the separation semaphore in sequence,
 # so this is the one tool whose abuse potential touches almost every
 # other subsystem at once.
-YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "2"))
-YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS", "600"))  # 10 min
+YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "3"))
+YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # TTL for /youtube/analyze jobs specifically - result is inline JSON, not
 # a file, so this can be short. Mirrors TRANSCRIPTION_JOB_TTL_SECONDS'
 # reasoning.
 YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SECONDS", str(60 * 60)))  # 1 hour
+
+# ---------- GPU BUDGET BREAKER (global spend ceiling) ----------
+# Protects against a threat per-IP rate limits structurally cannot stop:
+# a patient single user, or many rotating IPs, each staying under their
+# own per-IP limit while collectively burning the whole monthly budget.
+# On a per-second-billed GPU this is real money, not just fairness - see
+# gpu_budget.py's module docstring for the full reasoning and the worst-
+# case math that motivated this (2026-08-09, RunPod $0.24/hr).
+#
+# These are ESTIMATES pending real per-job timing from RunPod. Correct
+# them once actual GPU-minutes-per-job are known - this is an env var
+# specifically so that correction doesn't require a code change.
+GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.24"))
+
+# Soft: Studio Quality (HQ) is disabled, standard keeps running. Hard:
+# everything stops. Sized so hard ~= $14/month at the default hourly
+# rate, leaving buffer under a $15 target; soft trips at 80% of that so
+# there's a warning window before the harder cut.
+GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "2800"))
+GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "3500"))
 
 # High-quality YouTube chain routes (/youtube/separate-hq,
 # /youtube/stems-hq). Much stricter than the standard chain limit above

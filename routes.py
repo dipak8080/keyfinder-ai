@@ -322,6 +322,13 @@ from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 from admin_auth import guard_admin_request, verify_admin_key
+from gpu_budget import (
+    record_gpu_seconds,
+    hq_blocked,
+    all_separation_blocked,
+    budget_status,
+    reset_budget,
+)
 from log_stream import get_endpoint_counts
 
 router = APIRouter()
@@ -383,6 +390,7 @@ async def _run_tool_job(
     generic_error: str,
     cleanup_paths: Sequence[str] = (),
     success_detail: Optional[Callable] = None,
+    gpu_billed: bool = False,
 ):
     """
     The single background runner shared by every job-based audio tool.
@@ -409,6 +417,12 @@ async def _run_tool_job(
                        or lose
       success_detail - optional callable(result) -> str, appended to the
                        COMPLETE log line (e.g. "4 stems", "182.3s total")
+      gpu_billed     - True for Demucs separation jobs once running on a
+                       metered GPU. Feeds gpu_budget.record_gpu_seconds()
+                       with the ACTUAL elapsed run time, counted whether
+                       the job succeeded, failed, or was cancelled - the
+                       GPU provider bills for the compute either way, so
+                       the budget tracker has to too. See gpu_budget.py.
 
     The `finally` block runs in a fixed order that matters:
       fail_if_unfinished() FIRST, so a job is guaranteed terminal even if
@@ -416,7 +430,7 @@ async def _run_tool_job(
       or_503-inside-a-background-task case, which no `except AudioTool
       Error` or `except Exception` here would catch if it were raised
       before the try). Then file cleanup, then memory release, then the
-      metric - each independent of the others.
+      metric, then GPU billing - each independent of the others.
     """
     started = time.monotonic()
     succeeded = False
@@ -484,6 +498,14 @@ async def _run_tool_job(
                 cleanup_file(path)
             release_memory_to_os()
             record_result(metric, succeeded)
+            if gpu_billed:
+                # run_started is set right after the semaphore is
+                # acquired, so this is actual compute time - it does NOT
+                # include time spent waiting in the queue behind another
+                # job, which correctly shouldn't count against the GPU
+                # spend budget since no GPU-second was consumed while
+                # waiting.
+                record_gpu_seconds(time.monotonic() - run_started)
 
 
 async def _accept_upload(
@@ -543,6 +565,35 @@ async def _validate_duration_or_reject(
         cleanup_file(input_path)
         mark_failed(job_id, str(e))
         raise HTTPException(400, str(e))
+
+
+def _reject_if_gpu_budget_exceeded(hq: bool):
+    """
+    The cost-ceiling gate, checked at every separation entry point
+    (upload and YouTube-chained, standard and HQ) before a job is ever
+    queued. See gpu_budget.py for the full reasoning - this is what
+    caps TOTAL monthly spend regardless of how many different IPs or how
+    patiently the per-IP rate limits are worked around.
+
+    hard-blocked (all_separation_blocked): every tier rejected.
+    soft-blocked (hq_blocked) applies ONLY when hq=True: standard keeps
+    running even after HQ is cut, since standard is the cheaper tier and
+    most legitimate usage shouldn't be interrupted by one expensive
+    minority of requests exhausting the budget.
+    """
+    if all_separation_blocked():
+        raise HTTPException(
+            503,
+            "Separation is temporarily unavailable - this month's processing budget "
+            "has been reached. Please try again next month, or contact support."
+        )
+    if hq and hq_blocked():
+        raise HTTPException(
+            503,
+            "Studio Quality is temporarily unavailable - this month's processing "
+            "budget for high-quality separation has been reached. Standard quality "
+            "is still available."
+        )
 
 
 def _reject_if_separation_queue_full():
@@ -974,6 +1025,7 @@ async def _queue_separation(
     timeout_seconds: int,
     max_duration_seconds: int,
     metric_label: str,
+    hq: bool = False,
 ) -> JSONResponse:
     """
     Shared submit path for all four separation routes. They differ only
@@ -984,7 +1036,12 @@ async def _queue_separation(
     a config change (or the HQ kill switch flipping) can never alter a
     job that is already queued - it runs with the settings it was
     accepted under.
+
+    `hq` is explicit rather than inferred from the model name because the
+    GPU budget gate and billing need a reliable tier signal that survives
+    someone adding a differently-named model later.
     """
+    _reject_if_gpu_budget_exceeded(hq)
     _reject_if_separation_queue_full()
 
     original_filename = file.filename
@@ -1021,6 +1078,7 @@ async def _queue_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
+        gpu_billed=True,
     ))
 
     depth = count_processing(SEPARATION_JOB_TYPES)
@@ -1052,6 +1110,7 @@ async def separate_audio(file: UploadFile = File(...)):
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
         metric_label="/separate",
+        hq=False,
     )
 
 
@@ -1090,6 +1149,7 @@ async def separate_audio_hq(file: UploadFile = File(...)):
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
         metric_label="/separate-hq",
+        hq=True,
     )
 
 
@@ -1161,6 +1221,7 @@ async def stems_route(file: UploadFile = File(...)):
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
         metric_label="/stems",
+        hq=False,
     )
 
 
@@ -1191,6 +1252,7 @@ async def stems_route_hq(file: UploadFile = File(...)):
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
         metric_label="/stems-hq",
+        hq=True,
     )
 
 
@@ -2645,6 +2707,7 @@ async def _run_youtube_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
+        gpu_billed=True,
     )
 
 
@@ -2702,6 +2765,7 @@ async def youtube_separate_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
+    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
@@ -2753,6 +2817,7 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
+    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
@@ -2816,6 +2881,7 @@ async def youtube_stems_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
+    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
@@ -2857,6 +2923,7 @@ async def youtube_stems_hq_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
+    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
@@ -2948,6 +3015,20 @@ async def admin_reset_proxy(request: Request, key: str = Query(...)):
     verify_admin_key(key, client_ip)
     reset_proxy_circuit_breaker()
     return {"status": "proxy circuit breaker reset"}
+
+
+@router.post("/admin/reset-gpu-budget")
+async def admin_reset_gpu_budget(request: Request, key: str = Query(...)):
+    """
+    Resets the monthly GPU spend counter immediately, rather than waiting
+    for the calendar month to roll over. Use after correcting the
+    threshold with real RunPod timing data, or after topping up mid-
+    month.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    reset_budget()
+    return {"status": "GPU budget reset - all separation tiers re-enabled"}
 
 
 @router.post("/admin/reset-cdn-breaker")
@@ -3142,6 +3223,10 @@ async def admin_status(request: Request, key: str = Query(...)):
         # one.
         "accounts": get_account_health(),
     }
+    # GPU spend this month. The number to watch once separation runs on
+    # a metered GPU - see gpu_budget.py for the full reasoning on why
+    # this exists alongside (not instead of) the per-IP rate limits.
+    snapshot["gpu_budget"] = budget_status()
     snapshot["cache"] = {
         "enabled": True,
         "backend": "local-disk",
