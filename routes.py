@@ -223,6 +223,8 @@ from config import (
     SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_ANALYZE_JOB_TTL_SECONDS,
     FADE_MAX_SECONDS,
     FADE_RATE_LIMIT_MAX_REQUESTS,
@@ -2583,12 +2585,31 @@ async def _run_youtube_analyze(job_id: str, url: str):
         record_result("/youtube/analyze", succeeded)
 
 
-async def _run_youtube_separation(job_id: str, url: str, *, stems: bool):
-    """Download, then Demucs. One function for both /youtube/separate and
-    /youtube/stems - they differ only in which worker runs and how the
-    result is stored."""
-    tool = "YOUTUBE_STEMS" if stems else "YOUTUBE_SEPARATE"
-    metric = "/youtube/stems" if stems else "/youtube/separate"
+async def _run_youtube_separation(
+    job_id: str,
+    url: str,
+    *,
+    stems: bool,
+    model: str,
+    overlap: float,
+    timeout_seconds: int,
+    max_duration_seconds: int,
+    hq: bool = False,
+):
+    """Download, then Demucs. One function for all four YouTube
+    separation routes (/youtube/separate, /youtube/separate-hq,
+    /youtube/stems, /youtube/stems-hq) - they differ only in which worker
+    runs, how the result is stored, and which quality knobs are used.
+
+    The knobs are passed in rather than read from config here, matching
+    _queue_separation() above: they're resolved by the caller at
+    SUBMISSION time, so a config change (or the HQ kill switch being
+    flipped off) can never retroactively alter a job that's already
+    queued. It runs with the settings it was accepted under.
+    """
+    suffix = "_HQ" if hq else ""
+    tool = ("YOUTUBE_STEMS" if stems else "YOUTUBE_SEPARATE") + suffix
+    metric = ("/youtube/stems" if stems else "/youtube/separate") + ("-hq" if hq else "")
 
     downloaded = await _chain_download(job_id, url, tool, metric)
     if downloaded is None:
@@ -2600,8 +2621,7 @@ async def _run_youtube_separation(job_id: str, url: str, *, stems: bool):
     if stems:
         work = lambda: run_blocking(
             run_stem_separation, file_path, job_id,
-            SEPARATION_MODEL, SEPARATION_OVERLAP,
-            DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda result: mark_stems_complete(job_id, title, result)
         success_detail = lambda result: f"{len(result)} stems"
@@ -2609,8 +2629,7 @@ async def _run_youtube_separation(job_id: str, url: str, *, stems: bool):
     else:
         work = lambda: run_blocking(
             run_separation, file_path, job_id,
-            SEPARATION_MODEL, SEPARATION_OVERLAP,
-            DEMUCS_TIMEOUT_SECONDS, MAX_SEPARATION_DURATION_SECONDS,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda paths: mark_complete(job_id, title, paths[0], paths[1])
         success_detail = None
@@ -2686,9 +2705,68 @@ async def youtube_separate_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
-    asyncio.create_task(_run_youtube_separation(job_id, url, stems=False))
+    asyncio.create_task(_run_youtube_separation(
+        job_id, url,
+        stems=False,
+        model=SEPARATION_MODEL,
+        overlap=SEPARATION_OVERLAP,
+        timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
+        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
+    ))
 
     logger.info(f"[YOUTUBE_SEPARATE] job={job_id} queued for {url}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.post(
+    "/youtube/separate-hq",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def youtube_separate_hq_route(url: str = Form(...)):
+    """
+    High-quality YouTube vocal/instrumental separation - htdemucs_ft at
+    raised overlap, same knobs as /separate-hq, with a download bolted
+    on the front.
+
+    Deliberately uses job_type="youtube_separate" (not a separate type):
+    /separate and /separate-hq already share job_type="separation" for
+    the same reason, so every existing status/preview/download route
+    works for HQ jobs without a single change. The tier affects HOW the
+    job runs, not what shape the result is.
+
+    A separate route rather than a `quality` form field because
+    rate-limit dependencies are evaluated before the request body is
+    read - a Depends() cannot see a Form value, so per-tier limits need
+    per-tier routes.
+    """
+    if not SEPARATION_HQ_ENABLED:
+        raise HTTPException(
+            503,
+            "High quality separation is temporarily unavailable due to server load. "
+            "Please use standard separation."
+        )
+
+    if not is_valid_youtube_url(url):
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    _reject_if_separation_queue_full()
+
+    job_id = create_job(job_type="youtube_separate")
+    asyncio.create_task(_run_youtube_separation(
+        job_id, url,
+        stems=False,
+        model=SEPARATION_MODEL_HQ,
+        overlap=SEPARATION_OVERLAP_HQ,
+        timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+        hq=True,
+    ))
+
+    logger.info(f"[YOUTUBE_SEPARATE_HQ] job={job_id} queued for {url}")
     return JSONResponse({"job_id": job_id, "status": "processing"})
 
 
@@ -2741,9 +2819,58 @@ async def youtube_stems_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
-    asyncio.create_task(_run_youtube_separation(job_id, url, stems=True))
+    asyncio.create_task(_run_youtube_separation(
+        job_id, url,
+        stems=True,
+        model=SEPARATION_MODEL,
+        overlap=SEPARATION_OVERLAP,
+        timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
+        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
+    ))
 
     logger.info(f"[YOUTUBE_STEMS] job={job_id} queued for {url}")
+    return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+@router.post(
+    "/youtube/stems-hq",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def youtube_stems_hq_route(url: str = Form(...)):
+    """
+    High-quality YouTube 4-stem separation - same knobs and kill switch
+    as /stems-hq. Shares job_type="youtube_stems" with the standard
+    tier so the existing status/preview/download routes need no changes;
+    see youtube_separate_hq_route() for the full reasoning.
+    """
+    if not SEPARATION_HQ_ENABLED:
+        raise HTTPException(
+            503,
+            "High quality separation is temporarily unavailable due to server load. "
+            "Please use standard stem separation."
+        )
+
+    if not is_valid_youtube_url(url):
+        raise HTTPException(400, "Please provide a valid YouTube video URL.")
+
+    _reject_if_separation_queue_full()
+
+    job_id = create_job(job_type="youtube_stems")
+    asyncio.create_task(_run_youtube_separation(
+        job_id, url,
+        stems=True,
+        model=SEPARATION_MODEL_HQ,
+        overlap=SEPARATION_OVERLAP_HQ,
+        timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+        hq=True,
+    ))
+
+    logger.info(f"[YOUTUBE_STEMS_HQ] job={job_id} queued for {url}")
     return JSONResponse({"job_id": job_id, "status": "processing"})
 
 
@@ -3065,6 +3192,8 @@ async def limits():
             "separate_hq": SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
             "stems": STEMS_RATE_LIMIT_MAX_REQUESTS,
             "stems_hq": STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_chain": YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_chain_hq": YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
             "window_seconds": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
         },
         "features": {

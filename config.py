@@ -98,7 +98,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 )
 
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2700"))  # 45 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))  # 30 min
 
 # ---------- ANALYSIS TUNING ----------
 ANALYSIS_MAX_SECONDS: Optional[int] = 180
@@ -741,6 +741,27 @@ YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE
 # a file, so this can be short. Mirrors TRANSCRIPTION_JOB_TTL_SECONDS'
 # reasoning.
 YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SECONDS", str(60 * 60)))  # 1 hour
+
+# High-quality YouTube chain routes (/youtube/separate-hq,
+# /youtube/stems-hq). Much stricter than the standard chain limit above
+# for the same reason SEPARATION_HQ_RATE_LIMIT is stricter than
+# SEPARATION_RATE_LIMIT: the standard chain holds the single separation
+# slot for roughly 5 minutes, HQ holds it for 15-20. At the standard
+# chain's 2-per-10-min allowance, one IP could keep that slot occupied
+# for most of an hour and starve every other user's job behind it.
+#
+# Matched to SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS (1/hour) because the
+# cost profile is nearly identical - it's the same Demucs work with a
+# download bolted on the front.
+#
+# NOTE these are SEPARATE per-IP buckets from /separate-hq's and
+# /stems-hq's, since the rate limiter keys on path. One IP can spend its
+# budget on each. All four still queue behind the same single
+# MAX_CONCURRENT_SEPARATIONS slot and the same MAX_QUEUED_SEPARATIONS
+# depth check, so the practical ceiling remains wait time, not
+# throughput.
+YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
+YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 
 # ---------- AUDIO EFFECTS: FADE / CHANNELS / RESAMPLE / RINGTONE ----------
