@@ -668,6 +668,7 @@ def _tool_status(job_id: str, expected_type: str) -> dict:
         "status": job["status"],
         "title": job.get("title"),
         "error": job.get("error"),
+        "elapsed_seconds": round(time.time() - job["created_at"], 1),
     }
 
 
@@ -1163,6 +1164,7 @@ async def separation_status(job_id: str):
         "status": job["status"],
         "title": job.get("title"),
         "error": job.get("error"),
+        "elapsed_seconds": round(time.time() - job["created_at"], 1),
     }
 
 
@@ -1272,6 +1274,7 @@ async def stems_status(job_id: str):
         "title": job.get("title"),
         "error": job.get("error"),
         "stems": sorted(stems.keys()),
+        "elapsed_seconds": round(time.time() - job["created_at"], 1),
     }
 
 
@@ -2953,6 +2956,7 @@ async def youtube_stems_status(job_id: str):
         "title": job.get("title"),
         "error": job.get("error"),
         "stems": sorted(stems.keys()),
+        "elapsed_seconds": round(time.time() - job["created_at"], 1),
     }
 
 
