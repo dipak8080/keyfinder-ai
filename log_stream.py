@@ -678,6 +678,7 @@ def get_http_logs(
     hide_noise: bool = Query(False, description="Exclude known bot/scanner paths."),
     since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
     until: str = Query(None, description="ISO UTC timestamp, exclusive upper bound."),
+    job_id: str = Query(None, description="Every row whose path contains this job id, across all routes and methods."),
 ):
     """
     ALL filtering happens here, in SQL, deliberately.
@@ -734,6 +735,23 @@ def get_http_logs(
     if until:
         where.append("timestamp < ?")
         params.append(until)
+    if job_id:
+        # A job's lifecycle spans several DIFFERENT routes and methods:
+        #   POST /youtube/stems-hq              (submit - the only row
+        #                                        that touches the -hq path)
+        #   GET  /youtube/stems/status/<id>     (~40 polls)
+        #   GET  /youtube/stems/preview/<id>
+        #   GET  /youtube/stems/download/<id>
+        #
+        # Filtering by tool family splits those apart - an HQ job shows
+        # exactly ONE row under "YouTube Stems HQ" because every
+        # subsequent request legitimately goes to the shared standard
+        # route (HQ deliberately reuses those endpoints, see
+        # youtube_separate_hq_route in routes.py). The job id is the only
+        # thing common to all of them, so it's what actually answers
+        # "show me everything this one job did".
+        where.append("path LIKE ?")
+        params.append(f"%{job_id}%")
 
     def _clause(extra: str = "") -> str:
         parts = list(where)
@@ -844,11 +862,34 @@ def get_system_logs(
     after_id: int = Query(None, description="If set, return only rows with id > after_id (delta/poll mode), ignoring `limit`."),
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
     request_id: str = Query(None, description="If set, return EVERY system_logs row carrying this request_id, ignoring limit/before_id/after_id entirely."),
+    job_id: str = Query(None, description="If set, return every system_logs row mentioning this job id, ignoring pagination. Use when a request produced no logs of its own (e.g. a status poll) but its JOB did."),
     level: str = Query(None, description="Log level filter, e.g. 'ERROR'."),
     q: str = Query(None, description="Substring match on logger or message."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
+        if job_id is not None:
+            # Job-scoped lookup. Deliberately separate from request_id
+            # correlation because they answer different questions:
+            #
+            #   request_id -> "what did THIS ONE http request log?"
+            #   job_id     -> "what did this whole JOB do, start to finish?"
+            #
+            # The distinction matters because a job's ~40 status-poll
+            # GETs each have their own request_id but log NOTHING (the
+            # handler is a dict lookup - nothing worth logging every 20
+            # seconds per active job). So clicking a status-poll row and
+            # correlating by request_id correctly returns an empty list,
+            # which reads as broken even though it's accurate. Matching
+            # on the job id in the message text surfaces the real story
+            # instead: queued -> downloaded -> Demucs started -> complete.
+            rows = conn.execute(
+                "SELECT * FROM system_logs WHERE message LIKE ? ORDER BY id ASC",
+                (f"%{job_id}%",),
+            ).fetchall()
+            logs = [dict(r) for r in rows]
+            return JSONResponse({"total": len(logs), "filtered_total": len(logs), "logs": logs})
+
         if request_id is not None:
             # Correlation lookup, not pagination. A request's log lines
             # can span a background task that keeps running well after
