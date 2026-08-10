@@ -132,6 +132,34 @@ PERFORMANCE PASS (2026-08-07):
      button was clicked. Paging backwards from a cursor has no ceiling
      and, unlike a growing limit, each page costs the same regardless
      of how far back you have scrolled.
+
+SCHEMA CHANGE (2026-08-10): TOOL / TIER IDENTITY
+ 14. Path-based filtering (the "family" picker) breaks down whenever one
+     variant of a tool reuses another's routes after the initial submit -
+     HQ separation is the concrete case: /youtube/stems-hq is hit ONCE
+     (the POST), then every one of that job's ~40 status polls, its
+     preview and its download all go through the exact same SHARED
+     routes the standard tier uses. Filtering the picker to "YouTube
+     Stems HQ" therefore showed exactly one row (the submit) - the other
+     40+ lines belonging to that same job were indistinguishable, by
+     path alone, from a standard-tier job's polls sitting right next to
+     them. The only place the real tier existed was as free text inside
+     a system log message ("[YOUTUBE_STEMS_HQ] job=... COMPLETE").
+
+     request_logs and system_logs both gain two new columns: `tool` and
+     `tier`. Neither is derived from the path. Both are set ONCE by the
+     route handler, as soon as it knows what kind of job this actually
+     is (see set_job_context() below), and from that point on every log
+     line the job produces - regardless of which shared route it hits -
+     carries the same tag. This is the exact same mechanism request_id
+     already uses (a contextvar, inherited automatically by any
+     background task the request spawns), just carrying two more fields.
+
+     Callers (routes.py) are the next step, not this file - this file
+     only adds the mechanism and the places that read/write/filter by
+     it. Until routes.py calls set_job_context(), tool/tier will simply
+     be "-" on every row, same as request_id defaults to "-" for lines
+     with no request in flight.
 --------------------------------------------------------------------------
 """
 
@@ -171,6 +199,99 @@ router = APIRouter()
 _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default="-"
 )
+
+# Tool/tier identity for THIS request - deliberately structured
+# differently from _request_id_ctx above, because it becomes known at a
+# DIFFERENT TIME and therefore has to cross a task boundary the other
+# direction.
+#
+# THE PROBLEM THIS SOLVES (subtle, and it silently produces wrong data if
+# you get it wrong):
+#
+#   RequestLoggerMiddleware extends Starlette's BaseHTTPMiddleware, whose
+#   call_next() runs the downstream app - including the route handler -
+#   in a SEPARATE anyio task. contextvars propagate parent -> child (the
+#   child task gets a copy of the context at spawn time), but NEVER child
+#   -> parent. request_id works fine because it's .set() BEFORE
+#   call_next, so the handler inherits it. Tool/tier is the opposite
+#   case: only the handler knows it, and the middleware needs to read it
+#   AFTER call_next returns, to stamp the HTTP row. A plain
+#   ContextVar.set() inside the handler would be invisible up there -
+#   every request_logs row would silently record "-".
+#
+# So the contextvar holds a MUTABLE DICT rather than a string. The
+# middleware installs a fresh one per request before call_next; the
+# handler's set_job_context() mutates that same dict in place. Both tasks
+# hold a reference to the identical object, so the mutation is visible
+# from both sides - no propagation required, because nothing needs to
+# propagate.
+#
+# Background tasks spawned by the handler (asyncio.create_task) inherit
+# the reference too, which is exactly right: a job's later log lines
+# belong to the same job and should carry the same tag. Each request gets
+# its own dict, so two concurrent requests can never see each other's.
+_job_ctx: contextvars.ContextVar = contextvars.ContextVar("log_job_tags", default=None)
+
+# Used when nothing has been tagged: a plain page hit, an admin call, a
+# log line emitted at import/startup with no request in flight, or a
+# handler that raised before reaching its set_job_context() call. "-"
+# matches request_id's own default so an untagged value reads
+# unambiguously as "not applicable" rather than as a blank/broken field.
+_UNTAGGED = ("-", "-")
+
+
+def _current_tags() -> tuple:
+    """(tool, tier) for whatever request/job owns the current context."""
+    tags = _job_ctx.get()
+    if not tags:
+        return _UNTAGGED
+    return (tags.get("tool") or "-", tags.get("tier") or "-")
+
+
+def new_job_context() -> dict:
+    """
+    Installs a fresh, empty tag holder for this request. Called by
+    RequestLoggerMiddleware at the very top of dispatch(), BEFORE
+    call_next - see the long comment above for why the object has to
+    exist before the handler task is spawned rather than being created
+    lazily by set_job_context().
+    """
+    tags = {"tool": "-", "tier": "-"}
+    _job_ctx.set(tags)
+    return tags
+
+
+def set_job_context(tool: str, tier: str = "standard") -> None:
+    """
+    The ONE sanctioned way to tag the current request/job with what it
+    actually is. Call this once, as early as possible in the route
+    handler, as soon as tool/tier is known - e.g.:
+
+        set_job_context("STEMS", "hq" if hq else "standard")
+
+    From that point on, every log line emitted for the rest of this
+    request - AND from any background task it spawns via
+    asyncio.create_task(), since asyncio copies the current contextvars
+    context into new tasks automatically - carries this tag. That's what
+    lets a job's ~40 status polls, which all hit a route SHARED with
+    every other tier of the same tool, still report which tool and tier
+    actually produced them: the tag travels with the JOB, not with
+    whichever path a given line happened to hit.
+
+    Mutates in place rather than calling .set() - that's load-bearing,
+    not stylistic. See the _job_ctx comment above: .set() here would be
+    invisible to RequestLoggerMiddleware, which reads these values from a
+    DIFFERENT task after call_next returns.
+
+    Falls back to installing a holder if none exists, so this is safe to
+    call from a context with no middleware above it (a test, a startup
+    task, a worker script) instead of silently doing nothing.
+    """
+    tags = _job_ctx.get()
+    if tags is None:
+        tags = new_job_context()
+    tags["tool"] = tool
+    tags["tier"] = tier
 
 
 # ============================================================
@@ -261,6 +382,24 @@ def _init_db():
             conn.execute("ALTER TABLE request_logs ADD COLUMN request_id TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # Migration for tool/tier identity (see the SCHEMA CHANGE note at
+        # the top of this file). Same ALTER-and-swallow pattern as
+        # request_id just above - safe to run unconditionally, since
+        # SQLite only errors when the column already exists.
+        try:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN tool TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN tier TEXT")
+        except sqlite3.OperationalError:
+            pass
+        # Supports the new tool/tier filters in get_http_logs(). Without
+        # this, "show me every HQ job" is a full scan of request_logs.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_tool ON request_logs(tool)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_request_tier ON request_logs(tier)")
+
         # System logs now share this same SQLite file (and volume mount) as
         # request_logs, so they survive container restarts/redeploys instead
         # of vanishing every time deploy.yml recreates the container.
@@ -292,6 +431,19 @@ def _init_db():
             conn.execute("ALTER TABLE system_logs ADD COLUMN request_id TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+        # Same tool/tier migration as request_logs above - see the SCHEMA
+        # CHANGE note at the top of this file.
+        try:
+            conn.execute("ALTER TABLE system_logs ADD COLUMN tool TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE system_logs ADD COLUMN tier TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_tool ON system_logs(tool)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_system_tier ON system_logs(tier)")
 
         conn.commit()
     finally:
@@ -357,15 +509,16 @@ def _writer_loop() -> None:
             if http_rows:
                 conn.executemany(
                     "INSERT INTO request_logs "
-                    "(timestamp, method, path, status_code, duration_ms, client_ip, request_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(timestamp, method, path, status_code, duration_ms, client_ip, "
+                    "request_id, tool, tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     http_rows,
                 )
             if sys_rows:
                 conn.executemany(
                     "INSERT INTO system_logs "
-                    "(timestamp, level, logger, message, request_id) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(timestamp, level, logger, message, request_id, tool, tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     sys_rows,
                 )
             conn.commit()
@@ -434,9 +587,30 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         # "-" and splitting into a separate orphan group in the dashboard.
         _request_id_ctx.set(request_id)
 
+        # Install the tool/tier holder BEFORE call_next. This ordering is
+        # required, not incidental: call_next runs the route handler in a
+        # separate anyio task that inherits a COPY of the context as it
+        # exists right now. The handler's set_job_context() then mutates
+        # this same dict object, which is how its value gets back here
+        # despite child->parent context propagation not existing. See the
+        # _job_ctx comment near the top of this file for the full
+        # explanation - creating this holder after call_next, or letting
+        # set_job_context() create it lazily, would both silently record
+        # "-" on every single HTTP row.
+        tags = new_job_context()
+
         start = time.perf_counter()
         response = await call_next(request)
         duration_ms = (time.perf_counter() - start) * 1000
+
+        # Read AFTER the handler has run, so a handler that called
+        # set_job_context() is reflected here. Reading `tags` directly
+        # rather than _current_tags() because this task's own contextvar
+        # holds the identical object either way, and being explicit about
+        # which dict is being read makes the mutation contract above
+        # visible at the point it matters.
+        tool = tags.get("tool") or "-"
+        tier = tags.get("tier") or "-"
 
         # Was "/admin/logs" only - which meant every OTHER admin call
         # (/admin/endpoints, /admin/status, /admin/clear-cache,
@@ -459,6 +633,8 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                         round(duration_ms, 2),
                         _get_real_client_ip(request),
                         request_id,
+                        tool,
+                        tier,
                     ),
                 )
             except Exception:
@@ -542,6 +718,10 @@ def _invalidate_counts() -> None:
     with _endpoint_counts_lock:
         _endpoint_counts_cache["at"] = 0.0
         _endpoint_counts_cache["val"] = None
+    # Same reasoning, same table, for the tool/tier counts.
+    with _tool_counts_lock:
+        _tool_counts_cache["at"] = 0.0
+        _tool_counts_cache["val"] = None
 
 
 # ---------- PER-ENDPOINT TOTALS ----------
@@ -563,6 +743,12 @@ def _invalidate_counts() -> None:
 # not one query per endpoint. Cached on the same TTL as the status
 # counters for the same reason: several dashboard tabs polling shouldn't
 # each pay for their own scan.
+#
+# NOTE: this stays PATH-based (family), same as before. It is a separate
+# question from tool/tier - "which URL shape got hit" vs "which tool/tier
+# actually ran" - and conflating them is exactly the bug tool/tier exists
+# to fix. A parallel tool/tier aggregate (for a future picker) is a
+# follow-up, not part of this change.
 
 _ACTION_SEGMENTS = {"status", "preview", "download", "result"}
 _ID_LIKE = re.compile(r"^[0-9a-f]{6,}(-[0-9a-f]{4,}){0,4}$", re.IGNORECASE)
@@ -613,6 +799,69 @@ def get_endpoint_counts() -> dict:
     with _endpoint_counts_lock:
         _endpoint_counts_cache["at"] = now
         _endpoint_counts_cache["val"] = counts
+    return counts
+
+
+_TOOL_COUNTS_TTL = 10.0  # same cadence as endpoint counts - this moves slowly too
+_tool_counts_lock = threading.Lock()
+_tool_counts_cache: dict = {"at": 0.0, "val": None}
+
+
+def get_tool_counts() -> dict:
+    """
+    Returns {tool_tag: {"standard": n, "hq": n, "total": n}, ...} across
+    the WHOLE table - the tool/tier equivalent of get_endpoint_counts()
+    above, except grouped by the tags set_job_context() actually WROTE
+    (see routes.py) instead of derived by guessing from the path.
+
+    This is what makes the frontend's tool/tier filter dropdown dynamic:
+    it lists only tags that have genuinely appeared in the data, with
+    real counts, and needs no hand-maintained list on either side that
+    could drift out of sync with what routes.py actually tags things as.
+
+    Rows where tool is NULL, "-", or "" are excluded - those are rows
+    from before this migration, or from a request whose handler never
+    called set_job_context() (a stray internal call, a request that
+    errored before reaching that line) - there's nothing meaningful to
+    offer as a filter option for "unknown".
+
+    NOTE: unlike get_endpoint_counts()/admin_endpoints(), which can show
+    a registered tool with zero traffic (sourced from FastAPI's own route
+    table), a tool tag only appears here once at least one real request
+    has carried it. There is no equivalent "table of every tag that
+    could ever be set" to merge in zero-traffic entries against - tags
+    are just contextvar values, not a registered structure - so a
+    brand-new tool genuinely won't show up in the filter until it has
+    been used at least once. Acceptable: the filter's whole job is
+    describing what's IN the data, and an unused tool has nothing to
+    filter for yet anyway.
+    """
+    now = time.monotonic()
+    cached = _tool_counts_cache["val"]
+    if cached is not None and (now - _tool_counts_cache["at"]) < _TOOL_COUNTS_TTL:
+        return cached
+
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT tool, tier, COUNT(*) AS c FROM request_logs "
+            "WHERE tool IS NOT NULL AND tool != '-' AND tool != '' "
+            "GROUP BY tool, tier"
+        ).fetchall()
+
+    counts: dict = {}
+    for r in rows:
+        tool = r["tool"]
+        # Anything that isn't literally "hq" buckets as "standard" -
+        # defensive against a future tier value nobody anticipated
+        # rather than silently dropping the count.
+        tier = r["tier"] if r["tier"] == "hq" else "standard"
+        entry = counts.setdefault(tool, {"standard": 0, "hq": 0, "total": 0})
+        entry[tier] += r["c"]
+        entry["total"] += r["c"]
+
+    with _tool_counts_lock:
+        _tool_counts_cache["at"] = now
+        _tool_counts_cache["val"] = counts
     return counts
 
 
@@ -679,6 +928,8 @@ def get_http_logs(
     since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
     until: str = Query(None, description="ISO UTC timestamp, exclusive upper bound."),
     job_id: str = Query(None, description="Every row whose path contains this job id, across all routes and methods."),
+    tool: str = Query(None, description="Exact tool tag set via set_job_context(), e.g. 'STEMS'. Independent of path/family - see set_job_context()'s docstring."),
+    tier: str = Query(None, description="'standard' or 'hq', set alongside tool via set_job_context()."),
 ):
     """
     ALL filtering happens here, in SQL, deliberately.
@@ -703,6 +954,12 @@ def get_http_logs(
     time (UTC+5:45), and computing that boundary here would duplicate
     timezone logic that the frontend already has to own for rendering.
     The client sends the exact window it means.
+
+    `tool`/`tier` are a SEPARATE axis from `family`: family groups by URL
+    shape (useful for "how much /convert traffic"), tool/tier reports
+    what the handler actually decided this request/job IS, which stays
+    correct even when several tiers share the same polling routes. See
+    set_job_context()'s docstring for the full reasoning.
     """
     _check_admin(request, key)
 
@@ -752,6 +1009,14 @@ def get_http_logs(
         # "show me everything this one job did".
         where.append("path LIKE ?")
         params.append(f"%{job_id}%")
+    if tool:
+        # Exact match, not LIKE - tool is a fixed vocabulary set by
+        # set_job_context() (e.g. "STEMS", "CONVERT"), not free text.
+        where.append("tool = ?")
+        params.append(tool)
+    if tier:
+        where.append("tier = ?")
+        params.append(tier)
 
     def _clause(extra: str = "") -> str:
         parts = list(where)
@@ -834,6 +1099,7 @@ class BufferLogHandler(logging.Handler):
 
     def emit(self, record):
         try:
+            tool, tier = _current_tags()
             _enqueue(
                 _SYS,
                 (
@@ -842,6 +1108,8 @@ class BufferLogHandler(logging.Handler):
                     record.name,
                     record.getMessage(),
                     _request_id_ctx.get(),
+                    tool,
+                    tier,
                 ),
             )
         except Exception:
@@ -865,6 +1133,8 @@ def get_system_logs(
     job_id: str = Query(None, description="If set, return every system_logs row mentioning this job id, ignoring pagination. Use when a request produced no logs of its own (e.g. a status poll) but its JOB did."),
     level: str = Query(None, description="Log level filter, e.g. 'ERROR'."),
     q: str = Query(None, description="Substring match on logger or message."),
+    tool: str = Query(None, description="Exact tool tag set via set_job_context(), e.g. 'STEMS'."),
+    tier: str = Query(None, description="'standard' or 'hq'."),
 ):
     _check_admin(request, key)
     with get_db() as conn:
@@ -919,6 +1189,12 @@ def get_system_logs(
         if q:
             where.append("(message LIKE ? OR logger LIKE ?)")
             params.extend([f"%{q}%", f"%{q}%"])
+        if tool:
+            where.append("tool = ?")
+            params.append(tool)
+        if tier:
+            where.append("tier = ?")
+            params.append(tier)
 
         def _clause(extra: str = "") -> str:
             parts = list(where)
