@@ -766,6 +766,18 @@ GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOL
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_DEMUCS_ENDPOINT_ID = os.environ.get("RUNPOD_DEMUCS_ENDPOINT_ID", "")
 
+# ---------- GPU WORKER INTERNAL AUTH ----------
+# Shared secret both sides check for the direct HTTP file transfer
+# between this VPS and the RunPod GPU worker - audio bytes never travel
+# through RunPod's own job payload (10MB limit), they move directly
+# between VPS and worker instead. Must match GPU_SHARED_SECRET set on
+# the RunPod endpoint's own environment variables.
+GPU_WORKER_SHARED_SECRET = os.environ.get("GPU_WORKER_SHARED_SECRET", "")
+
+# This VPS's own public HTTPS base URL - used to build the URLs the GPU
+# worker fetches input from / uploads results to.
+VPS_PUBLIC_BASE_URL = os.environ.get("VPS_PUBLIC_BASE_URL", "")
+
 # High-quality YouTube chain routes (/youtube/separate-hq,
 # /youtube/stems-hq). Much stricter than the standard chain limit above
 # for the same reason SEPARATION_HQ_RATE_LIMIT is stricter than

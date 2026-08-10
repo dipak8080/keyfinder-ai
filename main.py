@@ -70,6 +70,7 @@ from routes import router
 from jobs import cleanup_expired_jobs, get_job_stats
 from log_stream import RequestLoggerMiddleware, router as logs_router, attach_system_log_capture
 from cookie_upload import router as cookie_upload_router
+from gpu_internal_routes import router as gpu_internal_router
 
 
 # How often the background sweep runs. Jobs are removed based on their
@@ -174,3 +175,4 @@ app.add_middleware(
 app.include_router(router)
 app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)
 app.include_router(cookie_upload_router)  # /admin/upload-cookies - upload cookies.txt directly, no base64
+app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file transfer, shared-secret auth
