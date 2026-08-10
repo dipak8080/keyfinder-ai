@@ -753,14 +753,18 @@ YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SE
 # These are ESTIMATES pending real per-job timing from RunPod. Correct
 # them once actual GPU-minutes-per-job are known - this is an env var
 # specifically so that correction doesn't require a code change.
-GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.24"))
+GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.69"))
 
 # Soft: Studio Quality (HQ) is disabled, standard keeps running. Hard:
 # everything stops. Sized so hard ~= $14/month at the default hourly
 # rate, leaving buffer under a $15 target; soft trips at 80% of that so
 # there's a warning window before the harder cut.
-GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "2800"))
-GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "3500"))
+GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "400"))   # ~77% of hard
+GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "520"))   # ~$10 at $0.69/hr
+
+
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_DEMUCS_ENDPOINT_ID = os.environ.get("RUNPOD_DEMUCS_ENDPOINT_ID", "")
 
 # High-quality YouTube chain routes (/youtube/separate-hq,
 # /youtube/stems-hq). Much stricter than the standard chain limit above

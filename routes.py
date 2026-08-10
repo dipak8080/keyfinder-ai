@@ -1146,17 +1146,22 @@ async def _queue_separation(
     is_stems = job_type in ("stems",)
 
     if is_stems:
-        work = lambda: run_blocking(
-            run_stem_separation, file_path, job_id,
-            model, overlap, timeout_seconds, max_duration_seconds,
+        # No run_blocking() here - run_stem_separation() is now `async
+        # def` (it awaits an HTTP call to the RunPod GPU worker, not a
+        # blocking local subprocess). run_blocking() exists specifically
+        # to offload BLOCKING calls off the event loop; wrapping an
+        # already-async function in it would be a real bug, not a style
+        # choice - see separation.py's own module docstring for the full
+        # "why this changed" reasoning.
+        work = lambda: run_stem_separation(
+            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda stems: mark_stems_complete(job_id, original_filename, stems)
         success_detail = lambda stems: f"{len(stems)} stems"
         generic_error = "Stem separation failed unexpectedly."
     else:
-        work = lambda: run_blocking(
-            run_separation, file_path, job_id,
-            model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_separation(
+            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda paths: mark_complete(job_id, original_filename, paths[0], paths[1])
         success_detail = None
@@ -2831,17 +2836,19 @@ async def _run_youtube_separation(
     file_path, title = downloaded
 
     if stems:
-        work = lambda: run_blocking(
-            run_stem_separation, file_path, job_id,
-            model, overlap, timeout_seconds, max_duration_seconds,
+        # No run_blocking() - same reasoning as _queue_separation() above:
+        # run_stem_separation()/run_separation() are now async (they
+        # await an HTTP call to the RunPod GPU worker), not blocking
+        # local subprocess calls.
+        work = lambda: run_stem_separation(
+            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda result: mark_stems_complete(job_id, title, result)
         success_detail = lambda result: f"{len(result)} stems"
         generic_error = "Stem separation failed unexpectedly."
     else:
-        work = lambda: run_blocking(
-            run_separation, file_path, job_id,
-            model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_separation(
+            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda paths: mark_complete(job_id, title, paths[0], paths[1])
         success_detail = None
