@@ -376,7 +376,13 @@ from gpu_budget import (
     budget_status,
     reset_budget,
 )
-from log_stream import get_endpoint_counts, get_tool_counts, set_job_context
+from log_stream import (
+    get_endpoint_counts,
+    get_tool_counts,
+    remember_job_tags,
+    set_job_context,
+    tag_from_job,
+)
 
 router = APIRouter()
 
@@ -691,6 +697,11 @@ def _resolve_tool_output_path(job_id: str, expected_type: str) -> tuple:
     Shared lookup behind every audio tool's preview and download route.
     Returns (path, output_format).
 
+    Re-applies this job's tool/tier tag to the current request (see
+    tag_from_job in log_stream.py). Every preview/download route funnels
+    through here, so this one line is what stops them logging as
+    untagged rows despite plainly belonging to a tagged job.
+
     Checking job_type is what stops a job id from one tool being used to
     read another tool's output - the id alone is not a capability, the
     pairing of id and tool is.
@@ -712,10 +723,15 @@ def _tool_status(job_id: str, expected_type: str) -> dict:
     """
     Shared status response for every single-output tool.
 
+    Re-applies this job's tool/tier tag - see _resolve_tool_output_path
+    above. Status polls are the highest-volume rows a job produces and
+    were the most conspicuously untagged before this.
+
     job_type is validated here too, so polling with an id that belongs to
     a different tool returns 404 rather than a confusing "complete" for
     something the caller never submitted.
     """
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != expected_type:
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1123,6 +1139,8 @@ async def _queue_separation(
     original_filename = file.filename
 
     job_id = create_job(job_type=job_type)
+
+    remember_job_tags(job_id)
     file_path, size = await _accept_upload(file, job_id, label=tool.lower())
 
     is_stems = job_type in ("stems",)
@@ -1231,6 +1249,7 @@ async def separate_audio_hq(file: UploadFile = File(...)):
 
 @router.get("/separate/status/{job_id}")
 async def separation_status(job_id: str):
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1244,6 +1263,7 @@ async def separation_status(job_id: str):
 
 
 def _resolve_stem_path(job_id: str, stem: str) -> str:
+    tag_from_job(job_id)
     if stem not in ("vocals", "instrumental"):
         raise HTTPException(400, "stem must be 'vocals' or 'instrumental'")
     job = get_job(job_id)
@@ -1339,6 +1359,7 @@ async def stems_status(job_id: str):
     available, so the frontend renders download buttons from the response
     instead of hardcoding names that would break if a different model
     were ever configured."""
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1357,6 +1378,7 @@ def _resolve_stems_file(job_id: str, stem: str) -> str:
     """Validates the requested stem against the job's OWN stem dict rather
     than a hardcoded tuple, so the valid set always follows whatever model
     produced the job."""
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1464,6 +1486,8 @@ async def _submit_audio_tool(
     original_filename = file.filename
 
     job_id = create_job(job_type=job_type)
+
+    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label=job_type)
     output_path = build_output_path(job_id, out_fmt)
 
@@ -1585,6 +1609,8 @@ async def trim_audio_route(
     original_filename = file.filename
 
     job_id = create_job(job_type="trim")
+
+    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="trim")
     output_path = build_output_path(job_id, source_format)
 
@@ -2281,6 +2307,8 @@ async def speech_to_text_route(file: UploadFile = File(...)):
     original_filename = file.filename
 
     job_id = create_job(job_type="transcribe", ttl_seconds=TRANSCRIPTION_JOB_TTL_SECONDS)
+
+    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="transcribe")
 
     # Its own, tighter duration cap - transcription time scales with
@@ -2313,6 +2341,7 @@ async def speech_to_text_status(job_id: str):
 async def speech_to_text_result(job_id: str):
     """Returns transcript JSON directly - no file involved, unlike every
     other tool's /download route."""
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "transcribe":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2358,6 +2387,7 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
 
     original_filename = file.filename
     job_id = create_job(job_type="video_to_audio")
+    remember_job_tags(job_id)
 
     # build_safe_upload_path keeps the real container extension
     # (.mp4/.mov/...), which ffmpeg genuinely needs to demux a video
@@ -2448,6 +2478,8 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
     first_filename = files[0].filename
 
     job_id = create_job(job_type="join")
+
+    remember_job_tags(job_id)
 
     dest_paths = [
         build_safe_upload_path(UPLOAD_DIR, job_id, f.filename, suffix=f"_{index}")
@@ -2549,6 +2581,8 @@ async def silence_split_route(
     original_filename = file.filename
 
     job_id = create_job(job_type="silence_split")
+
+    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="silence_split")
     await _validate_duration_or_reject(job_id, input_path)
 
@@ -2572,6 +2606,7 @@ async def silence_split_route(
 
 @router.get("/silence-split/status/{job_id}")
 async def silence_split_status(job_id: str):
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "silence_split":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2586,6 +2621,7 @@ async def silence_split_status(job_id: str):
 
 
 def _resolve_silence_split_file(job_id: str, segment: str) -> str:
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "silence_split":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2845,6 +2881,8 @@ async def youtube_analyze_route(url: str = Form(...)):
     set_job_context(tool="YOUTUBE_ANALYZE", tier="standard")
 
     job_id = create_job(job_type="youtube_analyze", ttl_seconds=YOUTUBE_ANALYZE_JOB_TTL_SECONDS)
+
+    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_analyze(job_id, url))
 
     logger.info(f"[YOUTUBE_ANALYZE] job={job_id} queued for {url}")
@@ -2858,6 +2896,7 @@ async def youtube_analyze_status(job_id: str):
 
 @router.get("/youtube/analyze/result/{job_id}")
 async def youtube_analyze_result(job_id: str):
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_analyze":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2891,6 +2930,8 @@ async def youtube_separate_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
+
+    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -2947,6 +2988,8 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
+
+    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -2967,6 +3010,7 @@ async def youtube_separate_status(job_id: str):
 
 
 def _resolve_youtube_separate_path(job_id: str, stem: str) -> str:
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_separate":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -3013,6 +3057,8 @@ async def youtube_stems_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
+
+    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=True,
@@ -3057,6 +3103,8 @@ async def youtube_stems_hq_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
+
+    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=True,
@@ -3073,6 +3121,7 @@ async def youtube_stems_hq_route(url: str = Form(...)):
 
 @router.get("/youtube/stems/status/{job_id}")
 async def youtube_stems_status(job_id: str):
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -3088,6 +3137,7 @@ async def youtube_stems_status(job_id: str):
 
 
 def _resolve_youtube_stems_file(job_id: str, stem: str) -> str:
+    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_stems":
         raise HTTPException(404, "Job not found (it may have expired).")

@@ -174,6 +174,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -292,6 +293,78 @@ def set_job_context(tool: str, tier: str = "standard") -> None:
         tags = new_job_context()
     tags["tool"] = tool
     tags["tier"] = tier
+
+
+# ---------- JOB TAG REGISTRY ----------
+# The problem this solves, which the contextvar alone cannot:
+#
+#   A job's lifecycle spans MANY separate HTTP requests. The submit POST
+#   knows what it is and tags itself. But each of the ~40 status polls,
+#   plus preview and download, is its OWN request with its OWN fresh
+#   context - none of them inherit anything from the POST, because they
+#   are not descendants of it in any task sense. They're separate
+#   connections, often minutes later. So without this, exactly the rows
+#   the feature exists to explain (the shared /youtube/stems/status/<id>
+#   polls that look identical between HQ and standard) stayed untagged.
+#
+# The only thing those requests carry that ties them back is the job id
+# in their path. So: when a job is created, remember what its creator
+# tagged it as; when a later request handles that same job id, look it
+# back up and re-apply the same tag.
+#
+# In-process dict rather than a DB column on the jobs table: this is
+# logging metadata, not job state, and it must never be able to fail or
+# slow down a real request. Bounded and FIFO-evicted - a job that fell
+# out of the window just logs "-" again, which is the same as the old
+# behaviour and strictly better than unbounded growth. Lost on restart
+# for the same reason and with the same consequence.
+_JOB_TAGS_MAX = 5000
+_job_tags: "OrderedDict[str, tuple]" = OrderedDict()
+_job_tags_lock = threading.Lock()
+
+
+def remember_job_tags(job_id: str) -> None:
+    """
+    Records whatever the CURRENT context is tagged as against this job
+    id. Called from routes.py right after create_job(), where
+    set_job_context() has already run - so it takes no tool/tier
+    arguments, deliberately: re-passing them would create a second place
+    that decides what a job is, and the two could disagree.
+    """
+    if not job_id:
+        return
+    tool, tier = _current_tags()
+    if tool == "-":
+        return  # nothing worth remembering
+    with _job_tags_lock:
+        _job_tags[job_id] = (tool, tier)
+        _job_tags.move_to_end(job_id)
+        while len(_job_tags) > _JOB_TAGS_MAX:
+            _job_tags.popitem(last=False)  # evict oldest
+
+
+def tag_from_job(job_id: str) -> bool:
+    """
+    Re-applies a known job's tag to the CURRENT request. Called at the
+    top of every status/preview/download handler, which is what finally
+    makes a job's whole request lifecycle carry one consistent tool/tier
+    instead of only its submit POST.
+
+    Returns whether a tag was found, for callers that want to know;
+    everything in routes.py currently ignores it, since "this job
+    predates the registry" is a perfectly normal outcome that needs no
+    handling - the row just logs "-" like it always used to.
+    """
+    if not job_id:
+        return False
+    with _job_tags_lock:
+        hit = _job_tags.get(job_id)
+        if hit is not None:
+            _job_tags.move_to_end(job_id)  # keep active jobs from aging out mid-run
+    if hit is None:
+        return False
+    set_job_context(hit[0], hit[1])
+    return True
 
 
 # ============================================================
