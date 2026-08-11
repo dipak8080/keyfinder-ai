@@ -369,13 +369,6 @@ from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 from admin_auth import guard_admin_request, verify_admin_key
-from gpu_budget import (
-    record_gpu_seconds,
-    hq_blocked,
-    all_separation_blocked,
-    budget_status,
-    reset_budget,
-)
 from log_stream import (
     get_endpoint_counts,
     get_tool_counts,
@@ -577,13 +570,17 @@ async def _run_tool_job(
             release_memory_to_os()
             record_result(metric, succeeded)
             if gpu_billed:
-                # run_started is set right after the semaphore is
-                # acquired, so this is actual compute time - it does NOT
-                # include time spent waiting in the queue behind another
-                # job, which correctly shouldn't count against the GPU
-                # spend budget since no GPU-second was consumed while
-                # waiting.
-                record_gpu_seconds(time.monotonic() - run_started)
+                # RESERVED, currently unused by any caller (both
+                # separation call sites pass gpu_billed=False - the
+                # GPU spend ceiling is now RunPod's own account balance,
+                # not a self-tracked counter; see the removal note at
+                # the top of gpu-worker/handler.py's docstring for the
+                # full reasoning). Kept as a real, working parameter
+                # rather than deleted, in case a future GPU-backed tool
+                # without its own worker-reported timing wants a local
+                # wall-clock fallback for logging/observability - it
+                # just doesn't feed a budget breaker any more.
+                pass
 
 
 async def _accept_upload(
@@ -643,35 +640,6 @@ async def _validate_duration_or_reject(
         cleanup_file(input_path)
         mark_failed(job_id, str(e))
         raise HTTPException(400, str(e))
-
-
-def _reject_if_gpu_budget_exceeded(hq: bool):
-    """
-    The cost-ceiling gate, checked at every separation entry point
-    (upload and YouTube-chained, standard and HQ) before a job is ever
-    queued. See gpu_budget.py for the full reasoning - this is what
-    caps TOTAL monthly spend regardless of how many different IPs or how
-    patiently the per-IP rate limits are worked around.
-
-    hard-blocked (all_separation_blocked): every tier rejected.
-    soft-blocked (hq_blocked) applies ONLY when hq=True: standard keeps
-    running even after HQ is cut, since standard is the cheaper tier and
-    most legitimate usage shouldn't be interrupted by one expensive
-    minority of requests exhausting the budget.
-    """
-    if all_separation_blocked():
-        raise HTTPException(
-            503,
-            "Separation is temporarily unavailable - this month's processing budget "
-            "has been reached. Please try again next month, or contact support."
-        )
-    if hq and hq_blocked():
-        raise HTTPException(
-            503,
-            "Studio Quality is temporarily unavailable - this month's processing "
-            "budget for high-quality separation has been reached. Standard quality "
-            "is still available."
-        )
 
 
 def _reject_if_separation_queue_full():
@@ -1149,7 +1117,6 @@ async def _queue_separation(
     base_tool = tool[:-3] if tool.endswith("_HQ") else tool
     set_job_context(tool=base_tool, tier="hq" if hq else "standard")
 
-    _reject_if_gpu_budget_exceeded(hq)
     _reject_if_separation_queue_full()
 
     original_filename = file.filename
@@ -2954,7 +2921,6 @@ async def youtube_separate_route(url: str = Form(...)):
 
     set_job_context(tool="YOUTUBE_SEPARATE", tier="standard")
 
-    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
@@ -3012,7 +2978,6 @@ async def youtube_separate_hq_route(url: str = Form(...)):
 
     set_job_context(tool="YOUTUBE_SEPARATE", tier="hq")
 
-    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
@@ -3081,7 +3046,6 @@ async def youtube_stems_route(url: str = Form(...)):
 
     set_job_context(tool="YOUTUBE_STEMS", tier="standard")
 
-    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
@@ -3127,7 +3091,6 @@ async def youtube_stems_hq_route(url: str = Form(...)):
 
     set_job_context(tool="YOUTUBE_STEMS", tier="hq")
 
-    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
@@ -3224,20 +3187,6 @@ async def admin_reset_proxy(request: Request, key: str = Query(...)):
     verify_admin_key(key, client_ip)
     reset_proxy_circuit_breaker()
     return {"status": "proxy circuit breaker reset"}
-
-
-@router.post("/admin/reset-gpu-budget")
-async def admin_reset_gpu_budget(request: Request, key: str = Query(...)):
-    """
-    Resets the monthly GPU spend counter immediately, rather than waiting
-    for the calendar month to roll over. Use after correcting the
-    threshold with real RunPod timing data, or after topping up mid-
-    month.
-    """
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    reset_budget()
-    return {"status": "GPU budget reset - all separation tiers re-enabled"}
 
 
 @router.post("/admin/reset-cdn-breaker")
@@ -3488,10 +3437,11 @@ async def admin_status(request: Request, key: str = Query(...)):
         # one.
         "accounts": get_account_health(),
     }
-    # GPU spend this month. The number to watch once separation runs on
-    # a metered GPU - see gpu_budget.py for the full reasoning on why
-    # this exists alongside (not instead of) the per-IP rate limits.
-    snapshot["gpu_budget"] = budget_status()
+    # GPU spend is no longer tracked as a separate in-app counter - the
+    # ceiling is RunPod's own account balance, checked directly at
+    # https://runpod.io (Billing), not estimated here. See
+    # separation.py's insufficient-balance handling for what happens
+    # when that balance actually runs out mid-request.
     snapshot["cache"] = {
         "enabled": True,
         "backend": "local-disk",

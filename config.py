@@ -742,26 +742,7 @@ YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE
 # reasoning.
 YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SECONDS", str(60 * 60)))  # 1 hour
 
-# ---------- GPU BUDGET BREAKER (global spend ceiling) ----------
-# Protects against a threat per-IP rate limits structurally cannot stop:
-# a patient single user, or many rotating IPs, each staying under their
-# own per-IP limit while collectively burning the whole monthly budget.
-# On a per-second-billed GPU this is real money, not just fairness - see
-# gpu_budget.py's module docstring for the full reasoning and the worst-
-# case math that motivated this (2026-08-09, RunPod $0.24/hr).
-#
-# Confirmed against RunPod's actual Serverless pricing (24GB tier:
-# L4/A5000/3090) - not an estimate. Real per-job billed seconds now
-# come from the GPU worker itself (see separation.py's
-# record_gpu_seconds call) rather than a wall-clock guess.
-GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.69"))
 
-# Soft: Studio Quality (HQ) is disabled, standard keeps running. Hard:
-# everything stops. Sized for a real $10/month ceiling at $0.69/hr;
-# soft trips at ~77% of hard so there's a warning window before the
-# harder cut.
-GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "1004"))   # ~77% of hard, ~$11.55
-GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "1304"))   # ~$15.00 at $0.69/hr
 
 
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")

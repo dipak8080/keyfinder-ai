@@ -7,45 +7,63 @@ shapes:
   run_stem_separation() -> {"vocals": path, "drums": path, ...}
 
 Powers /separate, /separate-hq, /stems, /stems-hq and their YouTube-
-chained equivalents. The public contract is unchanged from the original
-local-subprocess version and unchanged from the first GPU-migration pass
-too: same return shapes, same SeparationError.
+chained equivalents. The public contract has not changed once across
+the entire GPU migration: same return shapes, same SeparationError.
 
 --------------------------------------------------------------------------
-WHAT CHANGED (v2 of the GPU migration): NO MORE BASE64-IN-JSON
+HOW SEPARATION ACTUALLY RUNS NOW
 
-The first GPU pass sent the input file as base64 inside the RunPod job
-payload and expected base64-encoded stems back the same way. That broke
-on real audio: RunPod's Serverless /run response has a hard 10MB limit
-(see gpu-worker/handler.py's own docstring for the full story and the
-doc citation) - a real track's separated stems, base64-encoded, blow
-past that easily, and the job would sit "stuck" with no visible error
-because the worker finished fine but couldn't hand the result back
-through RunPod's own payload channel.
+Demucs no longer runs on this VPS. Jobs are submitted to a RunPod
+Serverless GPU worker (gpu-worker/handler.py, a separate repo and
+deploy target) via runpod_client.py.
 
-The fix: audio bytes now travel DIRECTLY between this VPS and the GPU
-worker over plain HTTP, completely bypassing RunPod's payload limit.
-RunPod's job queue is used only for orchestration (submit, poll status,
-a small confirmation dict).
+Audio bytes never travel through RunPod's job payload - that has a 10MB
+limit real audio blows straight past. Instead:
 
   INPUT:  this file registers the input file's path (in-process, via
-          gpu_internal_routes.register_gpu_input) and passes the WORKER
-          a job_id, not the file itself. The worker then GETs the file
-          from this VPS at /internal/gpu/input/{job_id} - see that
-          module's own docstring for the receiving end.
+          gpu_internal_routes.register_gpu_input) and sends the WORKER
+          a job_id, not the file. The worker then GETs the file from
+          this VPS at /internal/gpu/input/{job_id}.
   OUTPUT: the worker POSTs each finished stem straight to
-          /internal/gpu/upload/{job_id}/{name} as it produces them,
-          landing directly at the SAME final path this file has always
-          used (SEPARATION_DIR/{job_id}_{name}.wav). By the time
-          run_worker_job() returns success, the files are ALREADY on
-          disk - this file's job on the output side is now just
-          verifying they landed, not decoding/writing them itself.
+          /internal/gpu/upload/{job_id}/{name}, landing at the SAME
+          final path this file has always used. By the time
+          run_worker_job() returns, the files are ALREADY on disk -
+          this file's job on the output side is just verifying they
+          landed.
 
-This is a genuine simplification on the output side (no more
-b64_to_file() calls here at all), and the ONE new piece of bookkeeping
-is the register/unregister pair around the RunPod call, done in a
-try/finally so a registered input path can never leak past the request
-that created it.
+--------------------------------------------------------------------------
+REMOVED: THE SELF-TRACKED SPEND BREAKER (and why)
+
+An earlier version fed every job's GPU seconds into gpu_budget.py, which
+enforced a self-tracked monthly dollar ceiling. That has been removed
+entirely, deliberately, after it turned out to be measuring something it
+could never measure accurately:
+
+  1. RunPod bills for the FULL time a worker is active - cold start,
+     container init, model load, and both file transfers - not just the
+     Demucs subprocess this side was timing. The counter structurally
+     undercounted, which is the dangerous direction to be wrong in: it
+     implied more remaining budget than actually existed.
+  2. The counter reset on every container restart, and a restart happens
+     on EVERY code deploy. For an actively developed app that turned a
+     "monthly cap" into something closer to "a cap since the last
+     deploy".
+  3. It tracked SPENDING, never BALANCE - so topping up RunPod mid-month
+     did nothing to it, and hitting the cap stayed hit even with money
+     in the account. That mismatch confused far more than it protected.
+
+The ceiling is now RunPod's own account balance: load what you're willing
+to spend, and when it runs out, RunPod itself refuses the work. That is
+100% accurate by definition, needs no code, and cannot drift. The one
+thing worth building on this side is what happens WHEN it runs out -
+see _is_insufficient_balance_error below, which turns RunPod's raw
+billing rejection into a clean message a user can actually read.
+
+For deliberately pausing spend BEFORE the money runs out, the existing
+SEPARATION_HQ_ENABLED kill switch in config.py is the control - a manual
+lever, doing one obvious thing, rather than an estimate pretending to be
+a ledger.
+--------------------------------------------------------------------------
 """
 import os
 from typing import Dict, Tuple
@@ -66,14 +84,38 @@ from config import (
 from utils import run_blocking
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
-from gpu_budget import record_gpu_seconds
+
+
+# Wording RunPod and payment providers actually use for "this account is
+# out of money". Broad and marker-based on purpose, same reasoning as
+# youtube.py's PROXY_QUOTA_ERROR_MARKERS: a false positive here just
+# means some other failure gets the SAME friendly message (harmless),
+# while a false negative leaks a raw billing error straight to a user -
+# the exact thing this exists to prevent. Broad-matching is the safe
+# direction to be wrong in.
+_INSUFFICIENT_BALANCE_MARKERS = (
+    "insufficient balance",
+    "insufficient funds",
+    "insufficient credit",
+    "out of credit",
+    "no credit",
+    "payment required",
+    "account balance",
+    "spending limit",
+    "402",  # HTTP 402 Payment Required
+)
+
+
+def _is_insufficient_balance_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return any(marker in lowered for marker in _INSUFFICIENT_BALANCE_MARKERS)
 
 
 class SeparationError(Exception):
     """Raised for any separation failure that should surface as a clean
-    error to the caller (routes.py). Unchanged across both GPU-migration
-    passes - every existing `except SeparationError` in routes.py keeps
-    working exactly as it did before any of this started."""
+    error to the caller (routes.py). Unchanged across the whole GPU
+    migration - every existing `except SeparationError` in routes.py
+    keeps working exactly as it did before any of this started."""
     pass
 
 
@@ -82,8 +124,8 @@ def get_audio_duration_seconds(file_path: str) -> float:
     Uses ffprobe to read a file's duration WITHOUT decoding the audio.
     Still runs LOCALLY on the VPS, deliberately - rejecting an oversized
     file here costs a fast local ffprobe call, versus registering it,
-    submitting a job, and paying for a round trip only to have the GPU
-    worker reject it after actually fetching the file.
+    submitting a job, and paying real GPU money for a round trip only to
+    have the worker reject it after fetching the whole file.
     """
     ffprobe_path = FFMPEG_PATH.replace("ffmpeg", "ffprobe")
     try:
@@ -117,7 +159,7 @@ async def _run_demucs_on_gpu(
     """
     Shared engine for both public entry points below. Validates, makes
     the input fetchable by the worker, submits the job, waits for it,
-    and returns the worker's (now small) output dict.
+    and returns the worker's (small) output dict.
     """
     if model not in ALLOWED_SEPARATION_MODELS:
         logger.error(f"[SEPARATION] Job {job_id} rejected - disallowed model '{model}'")
@@ -137,10 +179,10 @@ async def _run_demucs_on_gpu(
         )
 
     # Makes input_path fetchable by the worker at
-    # /internal/gpu/input/{job_id} - see gpu_internal_routes.py. The
-    # try/finally below guarantees this is always cleaned up, whether
-    # the job succeeds, fails, or raises unexpectedly, so a registration
-    # can never outlive the request that created it.
+    # /internal/gpu/input/{job_id}, and simultaneously AUTHORISES the
+    # worker's upload for this job id (see gpu_internal_routes'
+    # is_job_in_flight check). The try/finally guarantees the
+    # registration can never outlive the request that created it.
     register_gpu_input(job_id, input_path)
     try:
         input_payload = {
@@ -161,40 +203,34 @@ async def _run_demucs_on_gpu(
                 RUNPOD_DEMUCS_ENDPOINT_ID, RUNPOD_API_KEY, input_payload, timeout_seconds,
             )
         except RunPodJobError as e:
-            logger.error(f"[SEPARATION] Job {job_id} failed on the GPU worker: {e}")
-            raise SeparationError(str(e))
+            error_text = str(e)
+            if _is_insufficient_balance_error(error_text):
+                # This is the ACTUAL ceiling on GPU spend - RunPod's own
+                # account genuinely out of money, not a self-tracked
+                # estimate. Caught specifically so the user sees a clean
+                # message instead of a raw billing rejection, and logged
+                # at CRITICAL because it needs an operator (a top-up),
+                # not a retry.
+                logger.critical(
+                    f"[SEPARATION] Job {job_id} rejected - RunPod balance appears "
+                    f"exhausted. Top up at runpod.io to restore separation. "
+                    f"Raw error: {error_text}"
+                )
+                raise SeparationError(
+                    "Separation is temporarily unavailable. Please try again later."
+                )
+            logger.error(f"[SEPARATION] Job {job_id} failed on the GPU worker: {error_text}")
+            raise SeparationError(error_text)
     finally:
         unregister_gpu_input(job_id)
 
     gpu_seconds = output.get("gpu_seconds")
     if gpu_seconds is not None:
-        # This is the number that actually matters for the spend
-        # breaker, and it is NOT the same as this side's wall-clock
-        # measurement. _run_tool_job's own timer also counts RunPod
-        # queue wait, cold start, and the two file transfers - real
-        # latency, but not GPU-seconds anyone is billed for. Feeding it
-        # to gpu_budget would over-count spend and trip the HQ cutoff
-        # early, disabling a working feature for a bill that was never
-        # incurred. record_gpu_seconds() is called HERE, with the
-        # worker's own measurement of just the Demucs run.
-        try:
-            record_gpu_seconds(gpu_seconds)
-        except Exception as e:
-            # Budget accounting must never fail a job that actually
-            # succeeded - the user's stems are already on disk by now.
-            logger.error(f"[SEPARATION] Job {job_id}: failed to record GPU seconds: {e}")
-        logger.info(
-            f"[SEPARATION] Job {job_id}: billed {gpu_seconds:.1f}s of GPU compute "
-            f"(recorded against the monthly budget)."
-        )
-    else:
-        # A worker that returns no timing is a real gap in cost
-        # tracking, not a cosmetic one - flag it loudly rather than
-        # silently under-counting spend.
-        logger.warning(
-            f"[SEPARATION] Job {job_id}: GPU worker returned no gpu_seconds - "
-            f"this job's compute time is NOT counted against the monthly budget."
-        )
+        # Logged for visibility only - NOT tracked against any in-app
+        # spend counter. See this module's REMOVED section for why.
+        # Still genuinely useful: grepping these lines is how you learn
+        # what a real job actually costs in GPU time.
+        logger.info(f"[SEPARATION] Job {job_id}: {gpu_seconds:.1f}s of GPU compute.")
 
     return output
 
@@ -202,13 +238,11 @@ async def _run_demucs_on_gpu(
 def _verify_output_files(job_id: str, expected_paths: dict) -> None:
     """
     By the time run_worker_job() returns success, the worker has already
-    POSTed every stem straight to its final on-disk path (see
-    gpu_internal_routes.upload_gpu_result). This just confirms they're
-    actually there before this function hands the paths back to its
-    caller - the worker's own {"error": ...} contract should already
-    catch an upload failure, but verifying on this side too means a
-    caller of run_separation()/run_stem_separation() can trust the
-    returned paths are real without a second round of network calls.
+    POSTed every stem straight to its final on-disk path. This confirms
+    they're actually there before handing the paths back - the worker's
+    own error contract should already catch an upload failure, but
+    verifying here too means a caller can trust the returned paths are
+    real without a second round of network calls.
     """
     missing = [name for name, path in expected_paths.items() if not os.path.exists(path)]
     if missing:
@@ -229,8 +263,7 @@ async def run_separation(
 ) -> Tuple[str, str]:
     """
     Two-stem (vocal remover) mode. Returns (vocals_path,
-    instrumental_path) - identical shape to every prior version of this
-    function.
+    instrumental_path) - identical shape to every prior version.
     """
     final_vocals_path = os.path.join(SEPARATION_DIR, f"{job_id}_vocals.wav")
     final_instrumental_path = os.path.join(SEPARATION_DIR, f"{job_id}_instrumental.wav")
@@ -261,7 +294,7 @@ async def run_stem_separation(
 ) -> Dict[str, str]:
     """
     Full multi-stem mode. Returns a {stem_name: path} dict - identical
-    shape to every prior version of this function.
+    shape to every prior version.
     """
     expected_stems = MODEL_STEM_NAMES.get(model)
     if not expected_stems:
