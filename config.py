@@ -760,8 +760,8 @@ GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.69"))
 # everything stops. Sized for a real $10/month ceiling at $0.69/hr;
 # soft trips at ~77% of hard so there's a warning window before the
 # harder cut.
-GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "400"))   # ~77% of hard
-GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "520"))   # ~$10 at $0.69/hr
+GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "1004"))   # ~77% of hard, ~$11.55
+GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "1304"))   # ~$15.00 at $0.69/hr
 
 
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
