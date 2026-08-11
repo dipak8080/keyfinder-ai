@@ -750,15 +750,16 @@ YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SE
 # gpu_budget.py's module docstring for the full reasoning and the worst-
 # case math that motivated this (2026-08-09, RunPod $0.24/hr).
 #
-# These are ESTIMATES pending real per-job timing from RunPod. Correct
-# them once actual GPU-minutes-per-job are known - this is an env var
-# specifically so that correction doesn't require a code change.
+# Confirmed against RunPod's actual Serverless pricing (24GB tier:
+# L4/A5000/3090) - not an estimate. Real per-job billed seconds now
+# come from the GPU worker itself (see separation.py's
+# record_gpu_seconds call) rather than a wall-clock guess.
 GPU_HOURLY_COST_USD = float(os.environ.get("GPU_HOURLY_COST_USD", "0.69"))
 
 # Soft: Studio Quality (HQ) is disabled, standard keeps running. Hard:
-# everything stops. Sized so hard ~= $14/month at the default hourly
-# rate, leaving buffer under a $15 target; soft trips at 80% of that so
-# there's a warning window before the harder cut.
+# everything stops. Sized for a real $10/month ceiling at $0.69/hr;
+# soft trips at ~77% of hard so there's a warning window before the
+# harder cut.
 GPU_BUDGET_SOFT_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_SOFT_THRESHOLD_MINUTES", "400"))   # ~77% of hard
 GPU_BUDGET_HARD_THRESHOLD_MINUTES = int(os.environ.get("GPU_BUDGET_HARD_THRESHOLD_MINUTES", "520"))   # ~$10 at $0.69/hr
 

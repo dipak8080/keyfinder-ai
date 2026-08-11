@@ -66,6 +66,7 @@ from config import (
 from utils import run_blocking
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
+from gpu_budget import record_gpu_seconds
 
 
 class SeparationError(Exception):
@@ -167,13 +168,32 @@ async def _run_demucs_on_gpu(
 
     gpu_seconds = output.get("gpu_seconds")
     if gpu_seconds is not None:
-        # Logged for visibility; not yet wired into
-        # gpu_budget.record_gpu_seconds() - see the note left in
-        # routes.py's own follow-up list. That local timer still runs
-        # off _run_tool_job's own wall-clock measurement today.
+        # This is the number that actually matters for the spend
+        # breaker, and it is NOT the same as this side's wall-clock
+        # measurement. _run_tool_job's own timer also counts RunPod
+        # queue wait, cold start, and the two file transfers - real
+        # latency, but not GPU-seconds anyone is billed for. Feeding it
+        # to gpu_budget would over-count spend and trip the HQ cutoff
+        # early, disabling a working feature for a bill that was never
+        # incurred. record_gpu_seconds() is called HERE, with the
+        # worker's own measurement of just the Demucs run.
+        try:
+            record_gpu_seconds(gpu_seconds)
+        except Exception as e:
+            # Budget accounting must never fail a job that actually
+            # succeeded - the user's stems are already on disk by now.
+            logger.error(f"[SEPARATION] Job {job_id}: failed to record GPU seconds: {e}")
         logger.info(
-            f"[SEPARATION] Job {job_id}: GPU worker reports {gpu_seconds:.1f}s of "
-            f"actual compute time."
+            f"[SEPARATION] Job {job_id}: billed {gpu_seconds:.1f}s of GPU compute "
+            f"(recorded against the monthly budget)."
+        )
+    else:
+        # A worker that returns no timing is a real gap in cost
+        # tracking, not a cosmetic one - flag it loudly rather than
+        # silently under-counting spend.
+        logger.warning(
+            f"[SEPARATION] Job {job_id}: GPU worker returned no gpu_seconds - "
+            f"this job's compute time is NOT counted against the monthly budget."
         )
 
     return output

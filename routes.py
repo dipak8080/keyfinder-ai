@@ -470,12 +470,28 @@ async def _run_tool_job(
                        or lose
       success_detail - optional callable(result) -> str, appended to the
                        COMPLETE log line (e.g. "4 stems", "182.3s total")
-      gpu_billed     - True for Demucs separation jobs once running on a
-                       metered GPU. Feeds gpu_budget.record_gpu_seconds()
-                       with the ACTUAL elapsed run time, counted whether
-                       the job succeeded, failed, or was cancelled - the
-                       GPU provider bills for the compute either way, so
-                       the budget tracker has to too. See gpu_budget.py.
+      gpu_billed     - Records this task's own wall-clock time against
+                       the GPU spend budget.
+
+                       NOW FALSE FOR SEPARATION, and that is deliberate,
+                       not an oversight. Since the GPU migration,
+                       separation.py records the REAL billed number - the
+                       one the RunPod worker itself reports for just the
+                       Demucs run - and does it from inside
+                       _run_demucs_on_gpu(). This timer, by contrast,
+                       also spans RunPod queue wait, cold start, and two
+                       file transfers: real latency the user experiences,
+                       but not GPU-seconds anyone is billed for. Leaving
+                       both enabled would DOUBLE-COUNT every separation
+                       job and trip the HQ cutoff at roughly half the
+                       real spend, disabling a working feature over a
+                       bill that was never incurred.
+
+                       Kept as a parameter rather than deleted because a
+                       FUTURE GPU-backed tool whose worker does not
+                       report its own timing would legitimately want this
+                       fallback - it is the right mechanism, just no
+                       longer the right source for this particular tool.
 
     NOTE ON tool/tier: this function does NOT call set_job_context()
     itself, deliberately. By the time this runs (inside a task spawned
@@ -1177,7 +1193,10 @@ async def _queue_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
-        gpu_billed=True,
+        # False: separation.py records the worker's own reported
+        # gpu_seconds instead - see this function's gpu_billed docstring
+        # for why counting both would double-bill the budget.
+        gpu_billed=False,
     ))
 
     depth = count_processing(SEPARATION_JOB_TYPES)
@@ -2864,7 +2883,9 @@ async def _run_youtube_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
-        gpu_billed=True,
+        # False: see _queue_separation's equivalent comment - the real
+        # billed figure is recorded inside separation.py.
+        gpu_billed=False,
     )
 
 
