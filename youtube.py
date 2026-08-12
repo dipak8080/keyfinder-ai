@@ -18,6 +18,7 @@ from config import (
     YT_DLP_MAX_ATTEMPTS,
     YT_DLP_BASE_BACKOFF_SECONDS,
     YT_BOT_CHECK_MARKERS,
+    FORMAT_UNAVAILABLE_MARKERS,
     IP_BLOCK_MARKERS,
     MAX_VIDEO_DURATION_SECONDS,
     PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
@@ -344,6 +345,38 @@ def is_bot_check_error(error_text: str) -> bool:
     return any(marker in normalized for marker in YT_BOT_CHECK_MARKERS)
 
 
+def is_format_unavailable_error(error_text: str) -> bool:
+    """
+    True if yt-dlp reached YouTube successfully and got a real manifest
+    back, but none of the formats in it matched the player_client list
+    that was active for THIS attempt - most commonly because cookies were
+    attached, which drops android/android_vr from the client list (see
+    _apply_player_clients above) and leaves only web-family clients,
+    which don't always expose a usable audio format for every video.
+
+    NOT an IP-reputation problem. Confirmed in production 2026-08-12: the
+    SAME cookie account produced this IDENTICAL error on the direct
+    attempt AND through the proxy, seconds apart, across 100+ occurrences
+    in one evening. A different exit IP producing an identical failure is
+    proof a different exit IP was never going to fix it - this marker
+    used to live in YT_BOT_CHECK_MARKERS/IP_BLOCK_MARKERS, which is what
+    caused every occurrence to pay for a wasted proxy round-trip and then
+    trip the proxy bot-check breaker as a side effect (see
+    FORMAT_UNAVAILABLE_MARKERS in config.py for the fuller incident note).
+
+    Used the same way its age-restricted/members-only/Music-Premium
+    siblings are: fails fast within extract_info_with_retry (retrying the
+    same client/cookie combo can't change which formats exist), and skips
+    the proxy tier entirely in download_with_fallback (a different exit
+    IP doesn't change the manifest either) - but still allows account
+    rotation to continue, since a different account may have different
+    client eligibility (e.g. no cookies at all, unlocking
+    android/android_vr).
+    """
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in FORMAT_UNAVAILABLE_MARKERS)
+
+
 def is_geo_restricted_error(error_text: str) -> bool:
     """
     True if the uploader/rights holder has geo-blocked this video for the
@@ -501,6 +534,12 @@ def is_ip_block_error(error_text: str) -> bool:
     tried overall. That decision is exclude-list based (see
     download_with_fallback) so error text NOT in this list still gets a
     proxy attempt, it just doesn't get the fail-fast speed-up.
+
+    NOTE: "requested format is not available" deliberately does NOT match
+    anything in IP_BLOCK_MARKERS as of 2026-08-12 - see
+    is_format_unavailable_error() above for why that's a client/cookie
+    mismatch, not an IP-reputation signal, and why conflating the two was
+    burning proxy spend on a failure proxy could never fix.
     """
     normalized = _normalize_error_text(error_text)
     return (
@@ -561,12 +600,12 @@ def should_use_proxy(error_text: str) -> bool:
     outbound path, which no proxy exit IP changes.
 
     Also does not escalate age-restriction, members-only, Music Premium,
-    or not-yet-live errors - those are account-identity/timing problems,
-    not IP-reputation problems, and are excluded upstream in
-    download_with_fallback before this function is even consulted (see
-    the age/members/premium/not-yet-live skip-proxy block there); this
-    function's own marker lists never match those error shapes in the
-    first place, so this note is here only so a future reader doesn't
+    not-yet-live, or format-unavailable errors - those are account-
+    identity/timing/client-eligibility problems, not IP-reputation
+    problems, and are excluded upstream in download_with_fallback before
+    this function is even consulted (see the skip-proxy block there);
+    this function's own marker lists never match those error shapes in
+    the first place, so this note is here only so a future reader doesn't
     wonder why they're absent from this list.
 
     Trade-off worth knowing: like every other classifier in this file,
@@ -851,6 +890,8 @@ def record_account_result(
                 kind = "bot_check"
             elif is_cdn_connect_timeout_error(error_text):
                 kind = "cdn_timeout"
+            elif is_format_unavailable_error(error_text):
+                kind = "format_unavailable"
             elif is_permanent_error(error_text):
                 kind = "video_unavailable"
             else:
@@ -1309,6 +1350,22 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            if is_format_unavailable_error(error_text):
+                # No format in the manifest matched the player_client list
+                # active for THIS attempt - retrying with the IDENTICAL
+                # client/cookie combo 2 more times produces the identical
+                # empty format list every time. Only a DIFFERENT client
+                # list (i.e. a different cookie state, handled by account
+                # rotation in the caller) has any chance - a proxy exit IP
+                # does not. See is_format_unavailable_error()'s docstring
+                # for the 2026-08-12 production evidence that ruled out
+                # this being an IP-reputation problem.
+                logger.warning(
+                    f"Attempt {attempt}: no format available for this "
+                    f"client/cookie combo - not retrying on the same combo: {error_text}"
+                )
+                raise
+
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
                 # a proxy-tier call) was never going to produce a different
@@ -1387,29 +1444,45 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     """
     Multi-layer download strategy, cheapest/most-specific fix first:
 
-      Layer 1 - COOKIE ACCOUNT ROTATION (free). Tries each currently
-                available cookie account in turn (up to 3: primary + 2
-                optional extras). If an attempt fails AND the thread-local
-                flag confirms yt-dlp specifically flagged THIS cookie
-                session as dead ("cookies are no longer valid" /
-                LOGIN_REQUIRED), that account is disabled for a cooldown
-                and the NEXT account is tried immediately - no point
-                retrying the same dead session (this is now enforced
-                doubly: extract_info_with_retry already stops retrying
-                that account's own backoff loop the instant it's flagged,
-                and this loop then moves on to the next account rather
-                than trying the dead one again). If an attempt fails with
-                an age-restriction, members-only, Music Premium, or
-                not-yet-live error, rotation also continues to the next
-                account (a different account might genuinely be
-                verified/a member/subscribed), WITHOUT disabling the
-                current one (it isn't dead, just not privileged for this
-                specific video). If an attempt fails for ANY OTHER reason
-                (IP-block, permanent, unknown), rotation stops
-                immediately - swapping cookie accounts won't fix an
-                IP-reputation or availability problem, so we fall through
-                to Layer 2 instead of wasting the remaining accounts on a
-                failure they can't fix either.
+      Layer 1 - COOKIE ACCOUNT ROTATION (free). ANON-FIRST as of
+                2026-08-12: the first entry in `accounts` is always None
+                (no cookiefile), tried before any cookie account, because
+                android/android_vr - the client set that actually exposes
+                usable audio formats for most public videos - are only
+                available when NO cookiefile is attached (see
+                _apply_player_clients above). Attaching a cookie account
+                on attempt 1, as this used to do, silently drops to the
+                tv/web/web_safari client set and frequently returns no
+                usable format at all - which is exactly the failure that
+                triggered this reordering (100+ "Requested format is not
+                available" errors in one evening, previously misrouted to
+                the proxy tier - see is_format_unavailable_error()).
+
+                After the anon attempt, tries each currently available
+                cookie account in turn (up to 3: primary + 2 optional
+                extras) - these are still needed for age/members/premium-
+                gated videos the anon attempt can't reach. If an attempt
+                fails AND the thread-local flag confirms yt-dlp
+                specifically flagged THIS cookie session as dead ("cookies
+                are no longer valid" / LOGIN_REQUIRED), that account is
+                disabled for a cooldown and the NEXT account is tried
+                immediately - no point retrying the same dead session
+                (this is now enforced doubly: extract_info_with_retry
+                already stops retrying that account's own backoff loop the
+                instant it's flagged, and this loop then moves on to the
+                next account rather than trying the dead one again). If an
+                attempt fails with an age-restriction, members-only, Music
+                Premium, not-yet-live, or format-unavailable error,
+                rotation also continues to the next account (a different
+                account might genuinely be verified/a member/subscribed,
+                or simply carry no cookies and unlock android/android_vr),
+                WITHOUT disabling the current one (it isn't dead, just not
+                privileged/client-eligible for this specific video). If an
+                attempt fails for ANY OTHER reason (IP-block, permanent,
+                unknown), rotation stops immediately - swapping cookie
+                accounts won't fix an IP-reputation or availability
+                problem, so we fall through to Layer 2 instead of wasting
+                the remaining accounts on a failure they can't fix either.
 
       Layer 2 - PROXY, tried only when should_use_proxy() confirms the
                 failure actually LOOKS like an IP-reputation problem (a
@@ -1417,14 +1490,15 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 timeout to a specific googlevideo CDN edge, or another
                 IP_BLOCK_MARKERS/YT_BOT_CHECK_MARKERS match) - AND it
                 isn't a confirmed permanent error, age-restriction,
-                members-only, Music Premium, or not-yet-live error (see
-                is_permanent_error and the account-identity/timing checks
-                below), since a different IP fixes IP-reputation
-                problems, not account privilege, subscription status,
-                stream timing, or a truly generic/unrecognized failure
-                with no evidence a different IP would help. Uses
-                whichever cookie account is STILL available (not yet
-                disabled) at this point, if any - proxy fixes IP
+                members-only, Music Premium, not-yet-live, or format-
+                unavailable error (see is_permanent_error and the
+                account-identity/timing/client-eligibility checks below),
+                since a different IP fixes IP-reputation problems, not
+                account privilege, subscription status, stream timing,
+                which formats a manifest contains, or a truly generic/
+                unrecognized failure with no evidence a different IP would
+                help. Uses whichever cookie account is STILL available
+                (not yet disabled) at this point, if any - proxy fixes IP
                 reputation, cookies fix session identity, the two are
                 independent problems that can combine (e.g. an IP-blocked
                 request might still benefit from a valid cookie session
@@ -1550,13 +1624,14 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 f"to a direct attempt anyway: {str(e)[:200]}"
             )
 
-    accounts = get_cookie_accounts()
-    if not accounts:
-        # Every configured account is currently disabled (or none are
-        # configured at all) - proceed cookie-less, same as the
-        # historical no-cookies behavior. A single None entry means "one
-        # attempt, no cookiefile".
-        accounts = [None]
+    # ANON-FIRST (2026-08-12): None (no cookiefile) always goes first,
+    # ahead of every cookie account - see this function's own docstring
+    # above for the full incident/reasoning. Previously this was
+    # `accounts = get_cookie_accounts()` with a fallback to `[None]` only
+    # when every account was disabled, which put a cookie account on
+    # attempt 1 whenever any account was healthy - exactly backwards from
+    # what testing showed actually works for public videos.
+    accounts = [None] + get_cookie_accounts()
 
     last_error = None
     for account_path in accounts:
@@ -1632,13 +1707,17 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 or is_members_only_error(error_text)
                 or is_music_premium_error(error_text)
                 or is_not_yet_live_error(error_text)
+                or is_format_unavailable_error(error_text)
             ):
                 # This account isn't privileged for this specific video
                 # (not age-verified, not a member, not a Music Premium
-                # subscriber) or the video simply hasn't started - a
-                # DIFFERENT account might still work, so keep rotating
-                # WITHOUT disabling this one (it's not dead, just
-                # unprivileged/early for this particular video).
+                # subscriber), the video simply hasn't started, or this
+                # attempt's client/cookie combo exposed no usable format -
+                # a DIFFERENT account might still work (different
+                # privilege, or simply no cookies at all, unlocking
+                # android/android_vr), so keep rotating WITHOUT disabling
+                # this one (it's not dead, just unprivileged/early/
+                # client-mismatched for this particular video).
                 continue
 
             # Failure wasn't confirmed as THIS account's identity being
@@ -1657,16 +1736,21 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         or is_members_only_error(first_error)
         or is_music_premium_error(first_error)
         or is_not_yet_live_error(first_error)
+        or is_format_unavailable_error(first_error)
     ):
-        # Every available cookie account hit the same account-privilege
-        # or timing wall. A different IP (the proxy) does nothing for
-        # these, so skip that tier entirely rather than burning proxy
-        # bandwidth and ~30s on a guaranteed repeat failure.
+        # Every available cookie/no-cookie combination hit the same
+        # account-privilege/timing wall, or the same client/cookie combo
+        # exposed no usable format. A different IP (the proxy) does
+        # nothing for any of these, so skip that tier entirely rather
+        # than burning proxy bandwidth and ~30s on a guaranteed repeat
+        # failure. See is_format_unavailable_error()'s docstring for the
+        # 2026-08-12 production evidence (identical failure through the
+        # proxy) that proved this specific addition.
         logger.warning(
             "[PROXY] Skipping proxy tier - failure is an age-restriction/"
-            "members-only/Music-Premium/not-yet-live requirement, not an "
-            "IP/bot-check problem: no available cookie account satisfies it "
-            "for this video."
+            "members-only/Music-Premium/not-yet-live/format-unavailable "
+            "requirement, not an IP/bot-check problem: no available "
+            "client/cookie combination satisfies it for this video."
         )
         raise last_error
 

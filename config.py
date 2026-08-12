@@ -85,9 +85,37 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024))
 YT_DLP_MAX_ATTEMPTS = 3
 YT_DLP_BASE_BACKOFF_SECONDS = 1.5  # 1.5s, 3s, 6s (exponential)
 
+# ADDED 2026-08-12: "requested format is not available" used to live in
+# this tuple (and therefore in IP_BLOCK_MARKERS, since that tuple is
+# built from this one). Confirmed in production the same day this was
+# split out: the SAME cookie account produced the IDENTICAL
+# "Requested format is not available" error on the direct attempt AND
+# through the proxy, seconds apart (see FORMAT_UNAVAILABLE_MARKERS
+# below). A different exit IP producing an identical failure is proof
+# this is not an IP-reputation/bot-check problem - it was misclassified,
+# which meant every occurrence (100+ in one evening) paid for a proxy
+# round-trip that could never have fixed it, then tripped the proxy
+# bot-check breaker as a side effect, alerting on a non-incident.
 YT_BOT_CHECK_MARKERS = (
     "sign in to confirm you're not a bot",
     "sign in to confirm you are not a bot",
+)
+
+# ---------- FORMAT-UNAVAILABLE (client/cookie mismatch, NOT IP-reputation) ----------
+# yt-dlp successfully reached YouTube and got a real response, but none
+# of the formats in the manifest matched the player_client list that was
+# active for THIS attempt (most commonly: cookies were attached, which
+# drops android/android_vr from the client list per _apply_player_clients
+# in youtube.py, leaving only web-family clients - and some videos simply
+# don't expose a usable audio format to those clients).
+#
+# Deliberately its OWN marker tuple, separate from IP_BLOCK_MARKERS /
+# YT_BOT_CHECK_MARKERS - see is_format_unavailable_error() in youtube.py
+# for how it's used: fail-fast on the same client/cookie combo, allow
+# account rotation (a different account may carry different client
+# eligibility), but SKIP the proxy tier entirely, since a different exit
+# IP has no effect on which formats a manifest contains.
+FORMAT_UNAVAILABLE_MARKERS = (
     "requested format is not available",
 )
 
