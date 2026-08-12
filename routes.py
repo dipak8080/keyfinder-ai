@@ -132,53 +132,6 @@ doomed ~10s direct attempt entirely and go straight to proxy for a
 cooldown window, surfaced via GET /admin/status's "cdn" block and
 resettable via POST /admin/reset-cdn-breaker below.
 --------------------------------------------------------------------------
-
-WHAT CHANGED (2026-08-10): TOOL / TIER TAGGING
-
-Every route that creates a job (or, for the two synchronous tools, does
-real work at all) now calls log_stream.set_job_context(tool, tier) before
-kicking off any background task. This is the write-side half of the
-change described in log_stream.py's own "SCHEMA CHANGE" note - that file
-added the contextvar, the columns, and the query filters; this file is
-where tool/tier actually becomes KNOWN, since only a route handler knows
-what kind of job it's creating.
-
-Call sites, and why each one is placed where it is:
-
-  - _submit_audio_tool() - the shared path for 13 of the ffmpeg/rubberband
-    tools (convert, volume, pitch, tempo, reverse, noise-remove,
-    voice-clean, echo-remove, silence-remove, fade, channels, resample,
-    ringtone). One call here covers all thirteen; none of them have a
-    tier, so tier is always "standard".
-  - _queue_separation() - the shared path for /separate, /separate-hq,
-    /stems, /stems-hq. `tool` here is already the tier-suffixed log
-    prefix ("STEMS_HQ") for historical reasons (see the log message
-    strings elsewhere in this file); tool/tier are set as SEPARATE values
-    (base tool "STEMS" + tier "hq") specifically so a filter for
-    tool=STEMS catches both tiers and tier=hq further narrows - the two
-    axes shouldn't be collapsed back into one string the way the log
-    prefix is.
-  - trim_audio_route, speech_to_text_route, video_to_audio_route,
-    join_route, silence_split_route - each has its own custom submit flow
-    (different validation, different upload handling), so each gets its
-    own one-line call rather than being folded into _submit_audio_tool.
-  - youtube_analyze_route, youtube_separate_route,
-    youtube_separate_hq_route, youtube_stems_route, youtube_stems_hq_route
-    - set BEFORE asyncio.create_task(), not inside the spawned
-    _run_youtube_*() function. asyncio.create_task() copies whatever
-    context exists AT THE MOMENT it's called into the new task - the same
-    mechanism request_id already relies on - so calling it earlier here
-    is what makes the tag visible on the initial POST's own HTTP log row,
-    not just on the background job's later lines.
-  - download_audio() and analyze_audio() - the two synchronous tools with
-    no job/background task at all. Tagged for consistency, so "which
-    tool" is answerable the same way for every row in request_logs, not
-    just the tiered/backgrounded ones.
-
-Nothing here changes behaviour, status codes, or response shapes - every
-added line is a single set_job_context(...) call with no side effects
-beyond what gets written to the log tables.
---------------------------------------------------------------------------
 """
 import os
 import time
@@ -369,13 +322,14 @@ from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 from admin_auth import guard_admin_request, verify_admin_key
-from log_stream import (
-    get_endpoint_counts,
-    get_tool_counts,
-    remember_job_tags,
-    set_job_context,
-    tag_from_job,
+from gpu_budget import (
+    record_gpu_seconds,
+    hq_blocked,
+    all_separation_blocked,
+    budget_status,
+    reset_budget,
 )
+from log_stream import get_endpoint_counts
 
 router = APIRouter()
 
@@ -463,37 +417,12 @@ async def _run_tool_job(
                        or lose
       success_detail - optional callable(result) -> str, appended to the
                        COMPLETE log line (e.g. "4 stems", "182.3s total")
-      gpu_billed     - Records this task's own wall-clock time against
-                       the GPU spend budget.
-
-                       NOW FALSE FOR SEPARATION, and that is deliberate,
-                       not an oversight. Since the GPU migration,
-                       separation.py records the REAL billed number - the
-                       one the RunPod worker itself reports for just the
-                       Demucs run - and does it from inside
-                       _run_demucs_on_gpu(). This timer, by contrast,
-                       also spans RunPod queue wait, cold start, and two
-                       file transfers: real latency the user experiences,
-                       but not GPU-seconds anyone is billed for. Leaving
-                       both enabled would DOUBLE-COUNT every separation
-                       job and trip the HQ cutoff at roughly half the
-                       real spend, disabling a working feature over a
-                       bill that was never incurred.
-
-                       Kept as a parameter rather than deleted because a
-                       FUTURE GPU-backed tool whose worker does not
-                       report its own timing would legitimately want this
-                       fallback - it is the right mechanism, just no
-                       longer the right source for this particular tool.
-
-    NOTE ON tool/tier: this function does NOT call set_job_context()
-    itself, deliberately. By the time this runs (inside a task spawned
-    via asyncio.create_task()), the calling route handler has already
-    set tool/tier on the contextvar - and since create_task() copies the
-    context at the moment it's called, this task already inherited it.
-    Setting it again here would be redundant at best; the single call
-    site per route is what keeps "what tagged this job" traceable to one
-    place instead of two.
+      gpu_billed     - True for Demucs separation jobs once running on a
+                       metered GPU. Feeds gpu_budget.record_gpu_seconds()
+                       with the ACTUAL elapsed run time, counted whether
+                       the job succeeded, failed, or was cancelled - the
+                       GPU provider bills for the compute either way, so
+                       the budget tracker has to too. See gpu_budget.py.
 
     The `finally` block runs in a fixed order that matters:
       fail_if_unfinished() FIRST, so a job is guaranteed terminal even if
@@ -570,17 +499,13 @@ async def _run_tool_job(
             release_memory_to_os()
             record_result(metric, succeeded)
             if gpu_billed:
-                # RESERVED, currently unused by any caller (both
-                # separation call sites pass gpu_billed=False - the
-                # GPU spend ceiling is now RunPod's own account balance,
-                # not a self-tracked counter; see the removal note at
-                # the top of gpu-worker/handler.py's docstring for the
-                # full reasoning). Kept as a real, working parameter
-                # rather than deleted, in case a future GPU-backed tool
-                # without its own worker-reported timing wants a local
-                # wall-clock fallback for logging/observability - it
-                # just doesn't feed a budget breaker any more.
-                pass
+                # run_started is set right after the semaphore is
+                # acquired, so this is actual compute time - it does NOT
+                # include time spent waiting in the queue behind another
+                # job, which correctly shouldn't count against the GPU
+                # spend budget since no GPU-second was consumed while
+                # waiting.
+                record_gpu_seconds(time.monotonic() - run_started)
 
 
 async def _accept_upload(
@@ -642,6 +567,35 @@ async def _validate_duration_or_reject(
         raise HTTPException(400, str(e))
 
 
+def _reject_if_gpu_budget_exceeded(hq: bool):
+    """
+    The cost-ceiling gate, checked at every separation entry point
+    (upload and YouTube-chained, standard and HQ) before a job is ever
+    queued. See gpu_budget.py for the full reasoning - this is what
+    caps TOTAL monthly spend regardless of how many different IPs or how
+    patiently the per-IP rate limits are worked around.
+
+    hard-blocked (all_separation_blocked): every tier rejected.
+    soft-blocked (hq_blocked) applies ONLY when hq=True: standard keeps
+    running even after HQ is cut, since standard is the cheaper tier and
+    most legitimate usage shouldn't be interrupted by one expensive
+    minority of requests exhausting the budget.
+    """
+    if all_separation_blocked():
+        raise HTTPException(
+            503,
+            "Separation is temporarily unavailable - this month's processing budget "
+            "has been reached. Please try again next month, or contact support."
+        )
+    if hq and hq_blocked():
+        raise HTTPException(
+            503,
+            "Studio Quality is temporarily unavailable - this month's processing "
+            "budget for high-quality separation has been reached. Standard quality "
+            "is still available."
+        )
+
+
 def _reject_if_separation_queue_full():
     """
     The bounded queue for every Demucs-backed route.
@@ -681,11 +635,6 @@ def _resolve_tool_output_path(job_id: str, expected_type: str) -> tuple:
     Shared lookup behind every audio tool's preview and download route.
     Returns (path, output_format).
 
-    Re-applies this job's tool/tier tag to the current request (see
-    tag_from_job in log_stream.py). Every preview/download route funnels
-    through here, so this one line is what stops them logging as
-    untagged rows despite plainly belonging to a tagged job.
-
     Checking job_type is what stops a job id from one tool being used to
     read another tool's output - the id alone is not a capability, the
     pairing of id and tool is.
@@ -707,15 +656,10 @@ def _tool_status(job_id: str, expected_type: str) -> dict:
     """
     Shared status response for every single-output tool.
 
-    Re-applies this job's tool/tier tag - see _resolve_tool_output_path
-    above. Status polls are the highest-volume rows a job produces and
-    were the most conspicuously untagged before this.
-
     job_type is validated here too, so polling with an id that belongs to
     a different tool returns 404 rather than a confusing "complete" for
     something the caller never submitted.
     """
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != expected_type:
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -738,12 +682,6 @@ def _tool_status(job_id: str, expected_type: str) -> dict:
 
 @router.post("/download", dependencies=[Depends(check_rate_limit)])
 async def download_audio(url: str = Form(...), format: str = Form("mp3")):
-    # Synchronous tool, no job - tagged anyway so its row in request_logs
-    # reports "DOWNLOAD" the same consistent way every other tool's rows
-    # do, instead of being the one row type where "which tool" has to be
-    # inferred from the path.
-    set_job_context(tool="DOWNLOAD", tier="standard")
-
     if format not in ["mp3", "wav"]:
         raise HTTPException(400, "Format must be 'mp3' or 'wav'")
 
@@ -813,6 +751,26 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
             },
+            # Pinned after 2026-08-12 testing. android_vr is the only
+            # client observed returning real audio formats on this VPS -
+            # yt-dlp picked it by default and produced a full clean
+            # format list. Every forced alternative failed:
+            #   web / mweb  -> need a JS-challenge solver (deno) that
+            #                  isn't installed in this image
+            #   ios         -> needs a GVS PO token this setup can't provide
+            #   android     -> caught in YouTube's SABR-only streaming
+            #                  experiment (yt-dlp issue #12482)
+            #   tv_embedded -> rejected outright: "unsupported client"
+            #
+            # Listed as an ordered fallback rather than a single pin so a
+            # shift in which client YouTube currently allows degrades to
+            # the next option instead of hard-failing.
+            #
+            # NOTE: yt-dlp already selects android_vr on its own here, so
+            # this makes existing behaviour explicit rather than changing
+            # it. If 403s persist after this, the cause is NOT client
+            # selection - look at per-video availability or token/session
+            # state instead of tuning this list further.
             'youtube': {
                 'player_client': ['android_vr', 'android', 'web'],
             },
@@ -997,10 +955,6 @@ def _read_file_bytes(path: str) -> bytes:
 
 @router.post("/analyze", dependencies=[Depends(check_rate_limit)])
 async def analyze_audio(file: UploadFile = File(...)):
-    # Same reasoning as /download above: no job, tagged anyway so this
-    # row reports "ANALYZE" consistently.
-    set_job_context(tool="ANALYZE", tier="standard")
-
     started = time.monotonic()
 
     file_id = str(uuid.uuid4())
@@ -1111,43 +1065,28 @@ async def _queue_separation(
     GPU budget gate and billing need a reliable tier signal that survives
     someone adding a differently-named model later.
     """
-    # `tool` here is the log-prefix string ("STEMS", "STEMS_HQ", ...),
-    # which already encodes tier for historical reasons - but tool/tier
-    # in the DATABASE are kept as two SEPARATE columns, deliberately, so
-    # a filter for tool=STEMS matches BOTH tiers and tier=hq narrows
-    # further. Stripping the suffix here is what keeps those two axes
-    # from collapsing back into the single log-prefix string.
-    base_tool = tool[:-3] if tool.endswith("_HQ") else tool
-    set_job_context(tool=base_tool, tier="hq" if hq else "standard")
-
+    _reject_if_gpu_budget_exceeded(hq)
     _reject_if_separation_queue_full()
 
     original_filename = file.filename
 
     job_id = create_job(job_type=job_type)
-
-    remember_job_tags(job_id)
     file_path, size = await _accept_upload(file, job_id, label=tool.lower())
 
     is_stems = job_type in ("stems",)
 
     if is_stems:
-        # No run_blocking() here - run_stem_separation() is now `async
-        # def` (it awaits an HTTP call to the RunPod GPU worker, not a
-        # blocking local subprocess). run_blocking() exists specifically
-        # to offload BLOCKING calls off the event loop; wrapping an
-        # already-async function in it would be a real bug, not a style
-        # choice - see separation.py's own module docstring for the full
-        # "why this changed" reasoning.
-        work = lambda: run_stem_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_blocking(
+            run_stem_separation, file_path, job_id,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda stems: mark_stems_complete(job_id, original_filename, stems)
         success_detail = lambda stems: f"{len(stems)} stems"
         generic_error = "Stem separation failed unexpectedly."
     else:
-        work = lambda: run_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_blocking(
+            run_separation, file_path, job_id,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda paths: mark_complete(job_id, original_filename, paths[0], paths[1])
         success_detail = None
@@ -1163,10 +1102,7 @@ async def _queue_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
-        # False: separation.py records the worker's own reported
-        # gpu_seconds instead - see this function's gpu_billed docstring
-        # for why counting both would double-bill the budget.
-        gpu_billed=False,
+        gpu_billed=True,
     ))
 
     depth = count_processing(SEPARATION_JOB_TYPES)
@@ -1243,7 +1179,6 @@ async def separate_audio_hq(file: UploadFile = File(...)):
 
 @router.get("/separate/status/{job_id}")
 async def separation_status(job_id: str):
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None:
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1257,7 +1192,6 @@ async def separation_status(job_id: str):
 
 
 def _resolve_stem_path(job_id: str, stem: str) -> str:
-    tag_from_job(job_id)
     if stem not in ("vocals", "instrumental"):
         raise HTTPException(400, "stem must be 'vocals' or 'instrumental'")
     job = get_job(job_id)
@@ -1353,7 +1287,6 @@ async def stems_status(job_id: str):
     available, so the frontend renders download buttons from the response
     instead of hardcoding names that would break if a different model
     were ever configured."""
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1372,7 +1305,6 @@ def _resolve_stems_file(job_id: str, stem: str) -> str:
     """Validates the requested stem against the job's OWN stem dict rather
     than a hardcoded tuple, so the valid set always follows whatever model
     produced the job."""
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -1457,19 +1389,7 @@ async def _submit_audio_tool(
     the runner awaits. Passing a builder rather than the paths themselves
     keeps every tool's actual worker call visible at its own route, which
     is the part worth reading.
-
-    Tagged with set_job_context(tool, "standard") right at the top - this
-    one call covers all thirteen tools that funnel through this shared
-    function (convert, volume, pitch, tempo, reverse, noise-remove,
-    voice-clean, echo-remove, silence-remove, fade, channels, resample,
-    ringtone), since none of them have a tier. It runs before the job is
-    even created, so it's set on the contextvar before
-    asyncio.create_task() below copies the context into the background
-    task - and before the HTTP response is returned, so the request's own
-    row in request_logs picks it up too.
     """
-    set_job_context(tool=tool, tier="standard")
-
     source_format = _validated_input_format(file.filename)
     out_fmt = output_format or source_format
 
@@ -1480,8 +1400,6 @@ async def _submit_audio_tool(
     original_filename = file.filename
 
     job_id = create_job(job_type=job_type)
-
-    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label=job_type)
     output_path = build_output_path(job_id, out_fmt)
 
@@ -1587,11 +1505,6 @@ async def trim_audio_route(
     end_seconds: float = Form(...),
 ):
     """Cut to a start-end range. Poll GET /trim/status/{job_id}."""
-    # /trim doesn't go through _submit_audio_tool (it needs the real
-    # duration for its own range validation, not just the shared
-    # cap-and-reject check), so it gets its own tag here.
-    set_job_context(tool="TRIM", tier="standard")
-
     if start_seconds < 0 or end_seconds <= start_seconds:
         raise HTTPException(
             400,
@@ -1603,8 +1516,6 @@ async def trim_audio_route(
     original_filename = file.filename
 
     job_id = create_job(job_type="trim")
-
-    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="trim")
     output_path = build_output_path(job_id, source_format)
 
@@ -2295,14 +2206,10 @@ async def ringtone_download(job_id: str):
 async def speech_to_text_route(file: UploadFile = File(...)):
     """Poll GET /speech-to-text/status/{job_id}, then
     GET /speech-to-text/result/{job_id} once complete."""
-    set_job_context(tool="SPEECH_TO_TEXT", tier="standard")
-
     _validated_input_format(file.filename)
     original_filename = file.filename
 
     job_id = create_job(job_type="transcribe", ttl_seconds=TRANSCRIPTION_JOB_TTL_SECONDS)
-
-    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="transcribe")
 
     # Its own, tighter duration cap - transcription time scales with
@@ -2335,7 +2242,6 @@ async def speech_to_text_status(job_id: str):
 async def speech_to_text_result(job_id: str):
     """Returns transcript JSON directly - no file involved, unlike every
     other tool's /download route."""
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "transcribe":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2366,8 +2272,6 @@ async def speech_to_text_result(job_id: str):
 )
 async def video_to_audio_route(file: UploadFile = File(...), target_format: str = Form("mp3")):
     """Poll GET /video-to-audio/status/{job_id}."""
-    set_job_context(tool="VIDEO_TO_AUDIO", tier="standard")
-
     target_format = target_format.strip().lower()
     if target_format not in ALLOWED_AUDIO_INPUT_FORMATS:
         raise HTTPException(
@@ -2381,7 +2285,6 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
 
     original_filename = file.filename
     job_id = create_job(job_type="video_to_audio")
-    remember_job_tags(job_id)
 
     # build_safe_upload_path keeps the real container extension
     # (.mp4/.mov/...), which ffmpeg genuinely needs to demux a video
@@ -2450,8 +2353,6 @@ async def video_to_audio_download(job_id: str):
 )
 async def join_route(files: List[UploadFile] = File(...), target_format: str = Form("mp3")):
     """Poll GET /join/status/{job_id}. Output order matches upload order."""
-    set_job_context(tool="JOIN", tier="standard")
-
     target_format = target_format.strip().lower()
     if target_format not in ALLOWED_AUDIO_INPUT_FORMATS:
         raise HTTPException(
@@ -2472,8 +2373,6 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
     first_filename = files[0].filename
 
     job_id = create_job(job_type="join")
-
-    remember_job_tags(job_id)
 
     dest_paths = [
         build_safe_upload_path(UPLOAD_DIR, job_id, f.filename, suffix=f"_{index}")
@@ -2551,8 +2450,6 @@ async def silence_split_route(
 ):
     """Poll GET /silence-split/status/{job_id} - the response lists the
     available segment names once complete."""
-    set_job_context(tool="SILENCE_SPLIT", tier="standard")
-
     _validated_input_format(file.filename)
 
     target_format = target_format.strip().lower()
@@ -2575,8 +2472,6 @@ async def silence_split_route(
     original_filename = file.filename
 
     job_id = create_job(job_type="silence_split")
-
-    remember_job_tags(job_id)
     input_path, size = await _accept_upload(file, job_id, label="silence_split")
     await _validate_duration_or_reject(job_id, input_path)
 
@@ -2600,7 +2495,6 @@ async def silence_split_route(
 
 @router.get("/silence-split/status/{job_id}")
 async def silence_split_status(job_id: str):
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "silence_split":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2615,7 +2509,6 @@ async def silence_split_status(job_id: str):
 
 
 def _resolve_silence_split_file(job_id: str, segment: str) -> str:
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "silence_split":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2674,12 +2567,6 @@ async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Opti
     The release lives in `finally` guarded by a flag, so the slot is
     returned exactly once whether the download succeeded, failed, or the
     acquire itself blew up.
-
-    tool/tier are NOT set here - by the time this runs, the calling route
-    (youtube_separate_route, youtube_analyze_route, etc.) has already
-    called set_job_context() before spawning this task, so the tag is
-    already inherited. Setting it again here would just be a second call
-    site for the same information.
     """
     acquired = False
     try:
@@ -2807,11 +2694,6 @@ async def _run_youtube_separation(
     SUBMISSION time, so a config change (or the HQ kill switch being
     flipped off) can never retroactively alter a job that's already
     queued. It runs with the settings it was accepted under.
-
-    tool/tier: not set here either, same reasoning as _chain_download's
-    docstring above - the calling route already set it before
-    asyncio.create_task() spawned this function, so it's already
-    inherited by the time this runs.
     """
     suffix = "_HQ" if hq else ""
     tool = ("YOUTUBE_STEMS" if stems else "YOUTUBE_SEPARATE") + suffix
@@ -2825,19 +2707,17 @@ async def _run_youtube_separation(
     file_path, title = downloaded
 
     if stems:
-        # No run_blocking() - same reasoning as _queue_separation() above:
-        # run_stem_separation()/run_separation() are now async (they
-        # await an HTTP call to the RunPod GPU worker), not blocking
-        # local subprocess calls.
-        work = lambda: run_stem_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_blocking(
+            run_stem_separation, file_path, job_id,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda result: mark_stems_complete(job_id, title, result)
         success_detail = lambda result: f"{len(result)} stems"
         generic_error = "Stem separation failed unexpectedly."
     else:
-        work = lambda: run_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+        work = lambda: run_blocking(
+            run_separation, file_path, job_id,
+            model, overlap, timeout_seconds, max_duration_seconds,
         )
         on_success = lambda paths: mark_complete(job_id, title, paths[0], paths[1])
         success_detail = None
@@ -2853,9 +2733,7 @@ async def _run_youtube_separation(
         generic_error=generic_error,
         cleanup_paths=[file_path],
         success_detail=success_detail,
-        # False: see _queue_separation's equivalent comment - the real
-        # billed figure is recorded inside separation.py.
-        gpu_billed=False,
+        gpu_billed=True,
     )
 
 
@@ -2872,15 +2750,7 @@ async def youtube_analyze_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
-    # Set BEFORE create_task(), not inside _run_youtube_analyze - see the
-    # WHAT CHANGED note at the top of this file for why the timing here
-    # matters: create_task() copies the context at the moment it's
-    # called, and this is also what tags the POST's own HTTP log row.
-    set_job_context(tool="YOUTUBE_ANALYZE", tier="standard")
-
     job_id = create_job(job_type="youtube_analyze", ttl_seconds=YOUTUBE_ANALYZE_JOB_TTL_SECONDS)
-
-    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_analyze(job_id, url))
 
     logger.info(f"[YOUTUBE_ANALYZE] job={job_id} queued for {url}")
@@ -2894,7 +2764,6 @@ async def youtube_analyze_status(job_id: str):
 
 @router.get("/youtube/analyze/result/{job_id}")
 async def youtube_analyze_result(job_id: str):
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_analyze":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -2922,13 +2791,10 @@ async def youtube_separate_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
-    set_job_context(tool="YOUTUBE_SEPARATE", tier="standard")
-
+    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
-
-    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -2960,9 +2826,7 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     /separate and /separate-hq already share job_type="separation" for
     the same reason, so every existing status/preview/download route
     works for HQ jobs without a single change. The tier affects HOW the
-    job runs, not what shape the result is - and now that the DB has a
-    real `tier` column, that same distinction is queryable directly
-    instead of needing to be reconstructed from job_type.
+    job runs, not what shape the result is.
 
     A separate route rather than a `quality` form field because
     rate-limit dependencies are evaluated before the request body is
@@ -2979,13 +2843,10 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
-    set_job_context(tool="YOUTUBE_SEPARATE", tier="hq")
-
+    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
-
-    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -3006,7 +2867,6 @@ async def youtube_separate_status(job_id: str):
 
 
 def _resolve_youtube_separate_path(job_id: str, stem: str) -> str:
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_separate":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -3047,13 +2907,10 @@ async def youtube_stems_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
-    set_job_context(tool="YOUTUBE_STEMS", tier="standard")
-
+    _reject_if_gpu_budget_exceeded(hq=False)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
-
-    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=True,
@@ -3092,13 +2949,10 @@ async def youtube_stems_hq_route(url: str = Form(...)):
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
-    set_job_context(tool="YOUTUBE_STEMS", tier="hq")
-
+    _reject_if_gpu_budget_exceeded(hq=True)
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
-
-    remember_job_tags(job_id)
     asyncio.create_task(_run_youtube_separation(
         job_id, url,
         stems=True,
@@ -3115,7 +2969,6 @@ async def youtube_stems_hq_route(url: str = Form(...)):
 
 @router.get("/youtube/stems/status/{job_id}")
 async def youtube_stems_status(job_id: str):
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -3131,7 +2984,6 @@ async def youtube_stems_status(job_id: str):
 
 
 def _resolve_youtube_stems_file(job_id: str, stem: str) -> str:
-    tag_from_job(job_id)
     job = get_job(job_id)
     if job is None or job["job_type"] != "youtube_stems":
         raise HTTPException(404, "Job not found (it may have expired).")
@@ -3192,6 +3044,20 @@ async def admin_reset_proxy(request: Request, key: str = Query(...)):
     return {"status": "proxy circuit breaker reset"}
 
 
+@router.post("/admin/reset-gpu-budget")
+async def admin_reset_gpu_budget(request: Request, key: str = Query(...)):
+    """
+    Resets the monthly GPU spend counter immediately, rather than waiting
+    for the calendar month to roll over. Use after correcting the
+    threshold with real RunPod timing data, or after topping up mid-
+    month.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    reset_budget()
+    return {"status": "GPU budget reset - all separation tiers re-enabled"}
+
+
 @router.post("/admin/reset-cdn-breaker")
 async def admin_reset_cdn_breaker(request: Request, key: str = Query(...)):
     """
@@ -3236,12 +3102,6 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
 
     Returns only static route metadata - identical for every caller,
     every request. No job ids, no IPs, nothing per-request.
-
-    NOTE: this is still the PATH/family picker, unrelated to the new
-    tool/tier columns. A parallel "which tool/tier tags actually exist in
-    the data" endpoint - for populating a tool/tier dropdown the same way
-    this populates the family dropdown - is a natural follow-up once the
-    frontend is ready to consume it, not part of this change.
     """
     client_ip = guard_admin_request(request)
     verify_admin_key(key, client_ip)
@@ -3313,62 +3173,12 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
         for f in families.values()
     ]
     endpoints.sort(key=lambda e: e["label"].lower())
-
-    # Tool/tier tags - a SEPARATE list from `endpoints` above. `endpoints`
-    # describes URL shapes (path families); `tools` describes what
-    # set_job_context() actually tagged requests as, which is what the
-    # frontend's Tool/Tier filter dropdown needs (see page.tsx's
-    # TOOL_OPTIONS-turned-toolOptions and log_stream.get_tool_counts()'s
-    # docstring for the full "why these are different axes" reasoning).
-    # This is what makes that dropdown dynamic: no hardcoded list on
-    # either side, just whatever tags genuinely exist in the data right
-    # now, with real counts.
-    tool_counts = get_tool_counts()
-    tools = [
-        {
-            "tool": tag,
-            "label": _humanize_tool(tag),
-            "standard_count": counts["standard"],
-            "hq_count": counts["hq"],
-            "total": counts["total"],
-        }
-        for tag, counts in tool_counts.items()
-    ]
-    tools.sort(key=lambda t: t["label"].lower())
-
     # Served alongside the tool list so the Next.js dashboard's "Hide
     # noise" checkbox reads the exact same definition the backend uses
     # to exclude noise from the Client Errors count - see
     # config.NOISE_PATH_MARKERS for why these two were previously
     # separate, silently-drifted copies.
-    return {
-        "endpoints": endpoints,
-        "tools": tools,
-        "noise_patterns": list(NOISE_PATH_MARKERS),
-    }
-
-
-def _humanize_tool(tag: str) -> str:
-    """
-    "SPEECH_TO_TEXT" -> "Speech To Text", "YOUTUBE_STEMS" -> "YouTube
-    Stems", "STEMS" -> "Stems".
-
-    Mirrors _humanize_endpoint() below almost exactly - same special-case
-    map, so a tool's label reads consistently with a path's label even
-    though tool tags are UNDERSCORE-separated (the strings routes.py
-    passes to set_job_context()) where paths are hyphen-separated. Kept
-    as a separate function rather than reusing _humanize_endpoint()
-    directly because that one expects a list of path segments, not a
-    single underscore-joined tag - forcing one shape into the other would
-    be more confusing than two small functions with the same spirit.
-    """
-    special = {"hq": "HQ", "youtube": "YouTube", "url": "URL", "api": "API"}
-    words = []
-    for part in tag.split("_"):
-        if not part:
-            continue
-        words.append(special.get(part.lower(), part.capitalize()))
-    return " ".join(words)
+    return {"endpoints": endpoints, "noise_patterns": list(NOISE_PATH_MARKERS)}
 
 
 def _humanize_endpoint(segments: list) -> str:
@@ -3440,11 +3250,10 @@ async def admin_status(request: Request, key: str = Query(...)):
         # one.
         "accounts": get_account_health(),
     }
-    # GPU spend is no longer tracked as a separate in-app counter - the
-    # ceiling is RunPod's own account balance, checked directly at
-    # https://runpod.io (Billing), not estimated here. See
-    # separation.py's insufficient-balance handling for what happens
-    # when that balance actually runs out mid-request.
+    # GPU spend this month. The number to watch once separation runs on
+    # a metered GPU - see gpu_budget.py for the full reasoning on why
+    # this exists alongside (not instead of) the per-IP rate limits.
+    snapshot["gpu_budget"] = budget_status()
     snapshot["cache"] = {
         "enabled": True,
         "backend": "local-disk",
