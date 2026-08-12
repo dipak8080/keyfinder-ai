@@ -812,7 +812,10 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
-            }
+            },
+            'youtube': {
+                'player_client': ['android_vr', 'android', 'web'],
+            },
         },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
