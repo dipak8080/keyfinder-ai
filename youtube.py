@@ -53,6 +53,57 @@ class VideoTooLongError(Exception):
             f"{limit_seconds // 60} min limit."
         )
 
+# ============================================================
+# PLAYER CLIENT SELECTION (ADDED 2026-08-12)
+#
+# WHY THIS EXISTS: android and android_vr do NOT support cookies - yt-dlp
+# silently SKIPS those clients whenever a cookiefile is attached to the
+# request. Confirmed in production via direct --list-formats testing:
+#
+#   WITH cookies:    "Skipping client android_vr ... does not support
+#                     cookies" / "Skipping client android ..." -> only
+#                     "web" runs -> often returns ONLY storyboard/mhtml
+#                     formats, no audio at all.
+#   WITHOUT cookies: android_vr + android run normally -> real audio
+#                     formats (139, 140, 249, 251, ...) come back fine.
+#
+# Since download_with_fallback almost always has a cookie account
+# available and attaches it on the very first attempt, production was
+# hitting the cookies+web-only path on nearly every request, surfacing as
+# "Requested format is not available" - which is_ip_block_error() then
+# mis-buckets as a bot-check, wrongly escalating to proxy and burning the
+# proxy bot-check breaker for a problem no proxy exit can fix.
+#
+# FIX: pick the player_client list based on whether the CURRENT attempt
+# actually has a cookiefile attached, not a fixed list for the whole
+# process. Every attempt (each cookie-rotation loop iteration AND the
+# proxy attempt) must call _apply_player_clients() right before use,
+# since cookie presence differs attempt to attempt.
+# ============================================================
+PLAYER_CLIENTS_NO_COOKIES = ['android_vr', 'android', 'web']
+PLAYER_CLIENTS_WITH_COOKIES = ['tv', 'web', 'web_safari']
+
+
+def _apply_player_clients(opts: dict, has_cookies: bool) -> dict:
+    """
+    Overrides extractor_args.youtube.player_client on `opts` based on
+    whether THIS specific attempt has a cookiefile attached, returning
+    the same dict for convenient chaining. android/android_vr are dropped
+    whenever cookies are present (yt-dlp would silently skip them anyway,
+    which previously left "web" to run alone and frequently return no
+    audio formats) in favor of clients that actually work with cookies
+    attached.
+    """
+    extractor_args = dict(opts.get('extractor_args') or {})
+    youtube_args = dict(extractor_args.get('youtube') or {})
+    youtube_args['player_client'] = (
+        PLAYER_CLIENTS_WITH_COOKIES if has_cookies else PLAYER_CLIENTS_NO_COOKIES
+    )
+    extractor_args['youtube'] = youtube_args
+    opts['extractor_args'] = extractor_args
+    return opts
+
+
 # Errors where retrying can NEVER help - the video itself is the blocker,
 # not anything transient about the network/bot-check/IP. Retrying these
 # just burns proxy bandwidth (each attempt still fires 6-7 requests:
@@ -1385,6 +1436,13 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     the correct account file in the Discord alert (see
     _maybe_alert_cookie_expiry), instead of a generic unattributed message.
 
+    ALSO before every attempt (both layers), _apply_player_clients()
+    overrides extractor_args.youtube.player_client to match whether THIS
+    attempt has a cookiefile attached (see the ADDED block near the top
+    of this module) - android/android_vr are dropped whenever cookies are
+    present, since yt-dlp silently skips them in that case and leaving
+    only "web" behind frequently returns no downloadable audio formats.
+
     If Layer 2 itself fails with what looks like a proxy billing/quota
     error, trip the circuit breaker as before. If it fails because the
     cookie account used there ALSO turns out to be dead, that account gets
@@ -1409,6 +1467,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             proxied_opts["cookiefile"] = proxy_account
         else:
             proxied_opts.pop("cookiefile", None)
+        proxied_opts = _apply_player_clients(proxied_opts, has_cookies=bool(proxy_account))  # <-- ADDED
 
         _reset_cookie_flag()
         _set_active_account(proxy_account)
@@ -1506,6 +1565,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             opts["cookiefile"] = account_path
         else:
             opts.pop("cookiefile", None)
+        opts = _apply_player_clients(opts, has_cookies=bool(account_path))  # <-- ADDED
 
         _reset_cookie_flag()
         _set_active_account(account_path)
