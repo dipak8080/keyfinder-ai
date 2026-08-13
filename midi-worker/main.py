@@ -29,21 +29,40 @@ A worker-side semaphore bounds real concurrency independently of
 whatever the caller does - the main app has its own _midi_semaphore, but
 this service must not rely on a well-behaved client for its own
 resource safety.
+
+SENSITIVITY CASCADE (added 2026-08-13):
+Real production case that motivated this: a KSHMR sample-pack melody
+(soft-attack, filtered synth, likely some reverb) returned ZERO note
+events at basic-pitch's default onset_threshold=0.5/frame_threshold=0.3
+- confirmed via a 15.9s run that completed normally and genuinely found
+nothing, not a crash or a bug. basic-pitch's onset detector is looking
+for a sharp energy spike to mark "a note started here"; smooth, heavily
+filtered, or reverb-smeared melodies can have weak enough onsets that
+the default threshold misses them entirely even though the audio is
+obviously musical to a human ear.
+
+Rather than requiring every caller to know to lower onset_threshold/
+frame_threshold by hand (which meant re-testing over SSH with curl -F
+params to fix one file), /convert now automatically retries at
+progressively more sensitive thresholds whenever a given attempt comes
+back with zero notes, stopping at the first tier that finds something.
+The caller's own requested thresholds (or the defaults) are always tried
+FIRST and are the ones actually used if they succeed - the cascade is
+purely a safety net for the empty-result case, never a silent override
+of a setting that already worked.
 """
 import os
 import asyncio
 import logging
 import tempfile
+from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from basic_pitch.inference import predict, Model
 from basic_pitch import ICASSP_2022_MODEL_PATH
-
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,6 +70,14 @@ logger = logging.getLogger(__name__)
 SHARED_SECRET = os.environ.get("MIDI_WORKER_SHARED_SECRET", "")
 MAX_UPLOAD_BYTES = int(os.environ.get("MIDI_MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))  # 80 MB
 MAX_CONCURRENT = int(os.environ.get("MIDI_WORKER_CONCURRENCY", "2"))
+
+# Progressively more sensitive (onset_threshold, frame_threshold) pairs
+# tried, in order, after the caller's own requested setting, whenever an
+# attempt returns zero note events. Kept as a fixed constant rather than
+# env-configurable - these are model-tuning values, not deployment
+# config, and the caller can already always override the STARTING point
+# via the request's own onset_threshold/frame_threshold fields.
+CASCADE_TIERS = [(0.35, 0.20), (0.25, 0.15), (0.15, 0.10)]
 
 app = FastAPI()
 
@@ -124,46 +151,72 @@ async def convert(
             raise HTTPException(422, {"reason": "empty", "message": "Empty file."})
 
         async with _semaphore:
-            try:
-                # run_in_threadpool is MANDATORY here - see module
-                # docstring. predict() is blocking TF inference; calling
-                # it inline would freeze this process's event loop.
-                # Tuning knobs, all with basic-pitch's own defaults so an
-                # unparameterised call behaves exactly as before. The
-                # frequency bounds are the highest-value pair in practice:
-                # capping range to the target instrument eliminates most
-                # false notes from other sources bleeding through a mix.
-                _, midi_data, note_events = await run_in_threadpool(
-                    lambda: predict(
-                        input_path,
-                        model_or_model_path=_model,
-                        onset_threshold=onset_threshold,
-                        frame_threshold=frame_threshold,
-                        minimum_note_length=minimum_note_length,
-                        minimum_frequency=minimum_frequency,
-                        maximum_frequency=maximum_frequency,
+            # Cascade: the caller's requested (onset_threshold,
+            # frame_threshold) is tried first, then progressively more
+            # sensitive tiers - but only tiers STRICTLY more sensitive
+            # than what was requested, so a caller who already asked for
+            # 0.2 doesn't get retried at a looser 0.35 first.
+            cascade = [(onset_threshold, frame_threshold)] + [
+                (t_onset, t_frame)
+                for t_onset, t_frame in CASCADE_TIERS
+                if t_onset < onset_threshold
+            ]
+
+            midi_data = None
+            note_events = []
+            used_onset, used_frame = onset_threshold, frame_threshold
+
+            for tier_onset, tier_frame in cascade:
+                try:
+                    # run_in_threadpool is MANDATORY here - see module
+                    # docstring. predict() is blocking TF inference;
+                    # calling it inline would freeze this process's
+                    # event loop.
+                    _, tier_midi_data, tier_note_events = await run_in_threadpool(
+                        lambda t_on=tier_onset, t_fr=tier_frame: predict(
+                            input_path,
+                            model_or_model_path=_model,
+                            onset_threshold=t_on,
+                            frame_threshold=t_fr,
+                            minimum_note_length=minimum_note_length,
+                            minimum_frequency=minimum_frequency,
+                            maximum_frequency=maximum_frequency,
+                        )
                     )
-                )
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"[MIDI_WORKER] Transcription failed ({total} bytes): {e}", exc_info=True)
-                raise HTTPException(
-                    422,
-                    {
-                        "reason": "transcription_failed",
-                        "message": "Could not transcribe this audio. It may be corrupt or unsupported.",
-                    },
-                )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(f"[MIDI_WORKER] Transcription failed ({total} bytes): {e}", exc_info=True)
+                    raise HTTPException(
+                        422,
+                        {
+                            "reason": "transcription_failed",
+                            "message": "Could not transcribe this audio. It may be corrupt or unsupported.",
+                        },
+                    )
+
+                if tier_note_events:
+                    midi_data = tier_midi_data
+                    note_events = tier_note_events
+                    used_onset, used_frame = tier_onset, tier_frame
+                    if (tier_onset, tier_frame) != (onset_threshold, frame_threshold):
+                        logger.info(
+                            f"[MIDI_WORKER] Empty at requested thresholds "
+                            f"(onset={onset_threshold}, frame={frame_threshold}) - "
+                            f"succeeded on cascade retry (onset={tier_onset}, frame={tier_frame})"
+                        )
+                    break
 
         if not note_events:
-            # NOT a crash - a legitimate "nothing musical here" result
-            # (silence, pure noise, spoken word, applause). Same 422 as
-            # a real failure because 204 cannot carry a response body
-            # per HTTP spec, but the structured `reason` field lets the
-            # caller tell the two apart reliably and give the user an
-            # accurate message instead of a generic error.
-            logger.warning(f"[MIDI_WORKER] Zero notes detected ({total} bytes input)")
+            # NOT a crash - a legitimate "nothing musical here" result,
+            # confirmed empty across every sensitivity tier in the
+            # cascade above, not just the first attempt (silence, pure
+            # noise, spoken word, applause). Same 422 as a real failure
+            # because 204 cannot carry a response body per HTTP spec,
+            # but the structured `reason` field lets the caller tell the
+            # two apart reliably and give the user an accurate message
+            # instead of a generic error.
+            logger.warning(f"[MIDI_WORKER] Zero notes detected across all cascade tiers ({total} bytes input)")
             raise HTTPException(
                 422,
                 {"reason": "no_notes", "message": "No musical notes were detected in this audio."},
@@ -189,9 +242,17 @@ async def convert(
 
         logger.info(
             f"[MIDI_WORKER] COMPLETE - {len(note_events)} notes, "
-            f"{len(midi_bytes)} bytes MIDI from {total} bytes audio"
+            f"{len(midi_bytes)} bytes MIDI from {total} bytes audio "
+            f"(onset={used_onset}, frame={used_frame})"
         )
-        return Response(content=midi_bytes, media_type="audio/midi")
+        return Response(
+            content=midi_bytes,
+            media_type="audio/midi",
+            headers={
+                "X-Onset-Threshold-Used": str(used_onset),
+                "X-Frame-Threshold-Used": str(used_frame),
+            },
+        )
 
     finally:
         if input_path and os.path.exists(input_path):
