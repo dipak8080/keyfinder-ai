@@ -128,6 +128,11 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
 MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2700"))  # 45 min
 
+# ---------- DOWNLOAD WALL-CLOCK CAP (frees a stuck semaphore slot) ----------
+DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS", "180"))
+
+
+
 # ---------- ANALYSIS TUNING ----------
 ANALYSIS_MAX_SECONDS: Optional[int] = 180
 

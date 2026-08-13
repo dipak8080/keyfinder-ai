@@ -49,7 +49,9 @@ from youtube import (
     proxy_available,
     get_cookie_accounts,
     ytdlp_alert_logger,
+    extract_video_id,
 )
+from cache import get_cached_audio, put_cached_audio
 
 
 class ChainDownloadError(Exception):
@@ -104,9 +106,50 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     chained job's leftover download, if cleanup somehow doesn't run,
     is still identifiable by the same id shown in job status - same
     naming convention every other tool in this codebase already uses.
+
+    CACHE CHECK (added 2026-08-13): every /youtube/* chained tool
+    (analyze, separate, separate-hq, stems, stems-hq) used to call this
+    with no cache check at all - only routes.py's plain /download route
+    ever consulted get_cached_audio(). That meant re-running any chained
+    tool on a video someone had already downloaded (via /download OR any
+    other chained tool) paid for a full duplicate proxy/direct download
+    of the same googlevideo.com bytes - confirmed via proxy usage logs
+    showing googlevideo.com media transfer as ~76% of total proxy
+    bandwidth, the single largest and most avoidable-when-duplicated
+    cost. video_id is cached under format="wav" specifically, since this
+    function always requests WAV regardless of what the calling tool's
+    final output format will be (see module docstring above) - so a hit
+    here is valid for every chained tool, not just one.
     """
     temp_path = os.path.join(UPLOAD_DIR, f"{job_id}_ytchain.%(ext)s")
     output_file = os.path.join(UPLOAD_DIR, f"{job_id}_ytchain.wav")
+
+    video_id = extract_video_id(url)
+    if video_id:
+        try:
+            cached_audio, cached_title = get_cached_audio(video_id, "wav")
+        except Exception as cache_err:
+            logger.warning(f"[YOUTUBE_CHAIN] Job {job_id}: cache lookup failed (non-fatal): {cache_err}")
+            cached_audio, cached_title = None, None
+
+        if cached_audio:
+            try:
+                with open(output_file, "wb") as f:
+                    f.write(cached_audio)
+                logger.info(
+                    f"[YOUTUBE_CHAIN] Job {job_id}: cache HIT for {video_id} "
+                    f"({len(cached_audio)} bytes) - skipped download entirely"
+                )
+                return output_file, cached_title or "Unknown"
+            except OSError as e:
+                # Fall through to a real download rather than failing the
+                # job over a disk write error on what was meant to be a
+                # fast path - same "cache failures never break the
+                # primary flow" guarantee cache.py itself follows.
+                logger.warning(
+                    f"[YOUTUBE_CHAIN] Job {job_id}: failed to write cached audio to disk, "
+                    f"falling back to a real download: {e}"
+                )
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -166,5 +209,15 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     if not os.path.exists(output_file):
         logger.error(f"[YOUTUBE_CHAIN] Job {job_id}: expected output file not found after download: {output_file}")
         raise ChainDownloadError("The audio file was not produced by the downloader.")
+
+    if video_id:
+        try:
+            with open(output_file, "rb") as f:
+                audio_bytes = f.read()
+            put_cached_audio(video_id, "wav", audio_bytes, title)
+        except Exception as cache_err:
+            # Never let a caching failure break a download that already
+            # succeeded - identical guarantee to routes.py's /download.
+            logger.warning(f"[YOUTUBE_CHAIN] Job {job_id}: cache save failed (non-fatal): {cache_err}")
 
     return output_file, title

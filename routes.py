@@ -198,6 +198,7 @@ from config import (
     MAX_UPLOAD_BYTES,
     ANALYSIS_MAX_SECONDS,
     ADMIN_STATUS_KEY,
+    DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_MODEL,
@@ -841,11 +842,20 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     succeeded = False
     try:
         try:
-            info = await run_blocking(download_with_fallback, ydl_opts, url, proxy_url)
+            info = await asyncio.wait_for(
+                run_blocking(download_with_fallback, ydl_opts, url, proxy_url),
+                timeout=DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
+            )
             title = info.get('title', 'Unknown')
         except VideoTooLongError as e:
             logger.warning(f"[DOWNLOAD] Rejected - video too long: {e}")
             raise HTTPException(400, str(e))
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[DOWNLOAD] Wall-clock timeout ({DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS}s) - "
+                f"aborting to free the download slot: {url}"
+            )
+            raise HTTPException(503, "This download is taking too long. Please try again.")
         except Exception as e:
             error_text = str(e)
 
@@ -2686,7 +2696,17 @@ async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Opti
         await acquire_slot_or_503(_download_semaphore, f"{tool.lower()}-download")
         acquired = True
         started = time.monotonic()
-        file_path, title = await run_blocking(download_audio_to_file, url, job_id)
+        try:
+            file_path, title = await asyncio.wait_for(
+                run_blocking(download_audio_to_file, url, job_id),
+                timeout=DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{tool}] job={job_id} wall-clock timeout "
+                f"({DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS}s) - aborting"
+            )
+            raise ChainDownloadError("This download is taking too long. Please try again.")
         logger.info(
             f"[{tool}] job={job_id} downloaded '{title}' in {time.monotonic() - started:.1f}s"
         )
