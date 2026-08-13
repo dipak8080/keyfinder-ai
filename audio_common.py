@@ -285,6 +285,7 @@ _AUDIO_MIME_TYPES = {
     "aac": "audio/aac",
     "ogg": "audio/ogg",
     "aiff": "audio/aiff",
+    "mid": "audio/midi",
 }
 
 

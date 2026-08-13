@@ -1,0 +1,5 @@
+fastapi==0.127.0
+uvicorn==0.40.0
+python-multipart==0.0.21
+basic-pitch==0.4.0
+tensorflow<2.15.1,>=2.4.1

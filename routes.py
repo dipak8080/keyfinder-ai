@@ -185,6 +185,7 @@ import time
 import uuid
 import base64
 import asyncio
+import requests
 from typing import Callable, List, Optional, Sequence
 from functools import partial
 
@@ -286,6 +287,13 @@ from config import (
     RINGTONE_MAX_DURATION_SECONDS,
     RINGTONE_RATE_LIMIT_MAX_REQUESTS,
     RINGTONE_RATE_LIMIT_WINDOW_SECONDS,
+    MIDI_WORKER_URL,
+    MAX_MIDI_DURATION_SECONDS,
+    MIN_MIDI_DURATION_SECONDS,
+    MAX_CONCURRENT_MIDI,
+    MIDI_RATE_LIMIT_MAX_REQUESTS,
+    MIDI_RATE_LIMIT_WINDOW_SECONDS,
+    MIDI_INPUT_FORMATS,
 )
 from upload import save_upload, save_uploads
 from utils import (
@@ -369,6 +377,7 @@ from audio_loudnorm import normalize_loudness, resolve_target_lufs
 from silence_splitter import split_on_silence
 from youtube_chain import download_audio_to_file, ChainDownloadError
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
+from audio_to_midi import convert_to_midi
 from admin_auth import guard_admin_request, verify_admin_key
 from log_stream import (
     get_endpoint_counts,
@@ -397,6 +406,12 @@ _audio_tools_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO_TOOLS)
 # would otherwise starve fast, cheap tools like /volume of their slots
 # while it runs.
 _transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
+# Dedicated, not shared with _audio_tools_semaphore - this is an HTTP
+# call to a separate TF-backed process (midi-worker), not a lightweight
+# ffmpeg subprocess. Same reasoning as Whisper's own dedicated pool: a
+# slow MIDI job shouldn't starve /volume, /trim, etc. of their slots.
+_midi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI)
 
 
 # ============================================================
@@ -1448,6 +1463,8 @@ async def _submit_audio_tool(
     log_detail: str = "",
     generic_error: str = "Processing failed unexpectedly.",
     semaphore: Optional[asyncio.Semaphore] = None,
+    allowed_input_formats: Optional[frozenset] = None,
+    min_duration_seconds: Optional[float] = None,
 ) -> JSONResponse:
     """
     Shared submit path for every single-input, single-output audio tool.
@@ -1480,7 +1497,23 @@ async def _submit_audio_tool(
     """
     set_job_context(tool=tool, tier="standard")
 
-    source_format = _validated_input_format(file.filename)
+    # allowed_input_formats lets ONE tool (currently only /audio-to-midi)
+    # widen the accepted set without touching it for the other twelve
+    # tools that share this function - basic-pitch decodes opus/webm via
+    # ffmpeg that no other tool here accepts. Defaults to None, which
+    # preserves the original ALLOWED_AUDIO_INPUT_FORMATS-only behaviour
+    # every existing caller already relies on.
+    if allowed_input_formats is not None:
+        ext = (os.path.splitext(file.filename or "")[1] or "").lstrip(".").lower()
+        if ext not in allowed_input_formats:
+            raise HTTPException(
+                400,
+                f"Unsupported file type '.{ext}'. Supported formats: "
+                f"{', '.join(sorted(allowed_input_formats))}.",
+            )
+        source_format = ext
+    else:
+        source_format = _validated_input_format(file.filename)
     out_fmt = output_format or source_format
 
     # Captured NOW, not read inside the background lambda below. The
@@ -1510,7 +1543,19 @@ async def _submit_audio_tool(
         raise HTTPException(500, str(e))
 
     if check_duration:
-        await _validate_duration_or_reject(job_id, input_path, max_duration_seconds)
+        duration = await _validate_duration_or_reject(job_id, input_path, max_duration_seconds)
+
+        # Lower bound, opt-in per tool. Below ~1s there isn't enough
+        # signal for MIDI transcription to find anything - this turns a
+        # guaranteed-empty result into an immediate, explainable 400
+        # instead of a wasted round trip to the worker.
+        if min_duration_seconds is not None and duration < min_duration_seconds:
+            cleanup_file(input_path)
+            mark_failed(job_id, f"Audio is too short (minimum {min_duration_seconds}s).")
+            raise HTTPException(
+                400,
+                f"Audio is too short ({duration:.1f}s). Minimum is {min_duration_seconds}s.",
+            )
 
     asyncio.create_task(_run_tool_job(
         tool=tool,
@@ -2280,6 +2325,60 @@ async def ringtone_preview(job_id: str):
 async def ringtone_download(job_id: str):
     path, _ = _resolve_tool_output_path(job_id, "ringtone")
     return FileResponse(path, media_type="audio/mp4", filename="ringtone.m4r")
+
+
+# ============================================================
+# /audio-to-midi - Polyphonic transcription via the isolated
+# midi-worker sidecar (basic-pitch + TensorFlow, separate container).
+#
+# See audio_to_midi.py's module docstring for why this calls out to a
+# sidecar over HTTP instead of running basic-pitch in this process -
+# short version: basic-pitch's tensorflow<2.15.1 dependency hard-pins
+# numpy<2.0.0, which conflicts with this app's numpy==2.3.5 used by
+# essentia/librosa/demucs/torch. Full process isolation was the only
+# option that added zero risk to the existing product.
+# ============================================================
+
+@router.post(
+    "/audio-to-midi",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=MIDI_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=MIDI_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
+async def audio_to_midi_route(file: UploadFile = File(...)):
+    """Transcribe audio to MIDI via the isolated midi-worker sidecar."""
+    return await _submit_audio_tool(
+        file,
+        job_type="audio_to_midi",
+        tool="AUDIO_TO_MIDI",
+        metric="/audio-to-midi",
+        output_format="mid",
+        max_duration_seconds=MAX_MIDI_DURATION_SECONDS,
+        min_duration_seconds=MIN_MIDI_DURATION_SECONDS,
+        allowed_input_formats=MIDI_INPUT_FORMATS,
+        build_work=lambda inp, out: (lambda: run_blocking(convert_to_midi, inp, out)),
+        generic_error="MIDI conversion failed unexpectedly.",
+        semaphore=_midi_semaphore,
+    )
+
+
+@router.get("/audio-to-midi/status/{job_id}")
+async def audio_to_midi_status(job_id: str):
+    return _tool_status(job_id, "audio_to_midi")
+
+
+@router.get("/audio-to-midi/preview/{job_id}")
+async def audio_to_midi_preview(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "audio_to_midi")
+    return FileResponse(path, media_type=get_audio_mime_type(fmt))
+
+
+@router.get("/audio-to-midi/download/{job_id}")
+async def audio_to_midi_download(job_id: str):
+    path, fmt = _resolve_tool_output_path(job_id, "audio_to_midi")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"transcribed.{fmt}")
 
 
 # ============================================================
@@ -3465,6 +3564,16 @@ async def admin_status(request: Request, key: str = Query(...)):
     # https://runpod.io (Billing), not estimated here. See
     # separation.py's insufficient-balance handling for what happens
     # when that balance actually runs out mid-request.
+    # Sidecar health. Without this, a dead midi-worker is invisible from
+    # the admin panel and only shows up as a run of failed jobs with a
+    # generic message. Short timeout, fully swallowed errors - a health
+    # probe must never be able to take down the status endpoint itself.
+    try:
+        _midi_health = requests.get(f"{MIDI_WORKER_URL}/health", timeout=3).json()
+        snapshot["midi_worker"] = {"reachable": True, **_midi_health}
+    except Exception as e:
+        snapshot["midi_worker"] = {"reachable": False, "error": str(e)[:200]}
+
     snapshot["cache"] = {
         "enabled": True,
         "backend": "local-disk",

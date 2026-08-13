@@ -845,3 +845,53 @@ SILENCE_SPLIT_DETECT_TIMEOUT_SECONDS = int(os.environ.get("SILENCE_SPLIT_DETECT_
 SILENCE_SPLIT_CUT_TIMEOUT_SECONDS = int(os.environ.get("SILENCE_SPLIT_CUT_TIMEOUT_SECONDS", "60"))
 SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS", "3"))
 SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS", "300"))
+
+
+# ---------- AUDIO TO MIDI (isolated midi-worker sidecar) ----------
+# Runs in its OWN container, not this process - basic-pitch requires
+# tensorflow<2.15.1 which hard-pins numpy<2.0.0, incompatible with the
+# numpy==2.3.5 that essentia/librosa/demucs/torch here depend on. See
+# audio_to_midi.py and midi-worker/main.py for the full reasoning.
+MIDI_WORKER_URL = os.environ.get("MIDI_WORKER_URL", "http://midi-worker:8001")
+MIDI_WORKER_SHARED_SECRET = os.environ.get("MIDI_WORKER_SHARED_SECRET", "")
+
+# Generous: transcription of a 10 min track on CPU can take minutes.
+# NOTE this is requests' timeout, which is per-socket-operation, not
+# total wall clock - a pathologically slow trickle could still exceed
+# it. The main app's own job semaphore is what actually bounds
+# throughput; this just stops a dead worker from hanging a slot forever.
+MIDI_WORKER_TIMEOUT_SECONDS = int(os.environ.get("MIDI_WORKER_TIMEOUT_SECONDS", "300"))  # 5 min
+
+# Enforced on THIS side (via ffprobe at submit time) before a byte is
+# ever sent to the worker - same "reject early, don't waste the round
+# trip" reasoning as every other tool's duration check.
+MAX_MIDI_DURATION_SECONDS = int(os.environ.get("MAX_MIDI_DURATION_SECONDS", "600"))  # 10 min
+
+# Below this, there isn't enough signal for the model to find anything
+# and the result is a guaranteed empty MIDI - reject with a clear
+# message instead of burning a worker round-trip on it.
+MIN_MIDI_DURATION_SECONDS = float(os.environ.get("MIN_MIDI_DURATION_SECONDS", "1.0"))
+
+# How many transcriptions may be in flight to the worker at once from
+# this side. The worker enforces its OWN limit independently
+# (MIDI_WORKER_CONCURRENCY) - this one exists so a queue forms here,
+# where the job system can report it, rather than as unbounded blocked
+# HTTP connections.
+MAX_CONCURRENT_MIDI = int(os.environ.get("MAX_CONCURRENT_MIDI", "2"))
+
+MIDI_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_RATE_LIMIT_MAX_REQUESTS", "3"))
+MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+
+# Input formats accepted by /audio-to-midi SPECIFICALLY - a superset of
+# ALLOWED_AUDIO_INPUT_FORMATS, adding opus and webm.
+#
+# Deliberately its own set rather than adding opus/webm to
+# _SUPPORTED_AUDIO_FORMATS above: that tuple generates
+# AUDIO_CONVERSION_MATRIX, so adding them there would silently make
+# every existing tool offer opus/webm as an OUTPUT format too - a much
+# larger, untested behaviour change than this feature needs.
+#
+# Safe here because basic-pitch decodes via librosa.load(), which falls
+# back to audioread/ffmpeg for containers soundfile can't read - and
+# midi-worker's Dockerfile installs ffmpeg for exactly this reason.
+MIDI_INPUT_FORMATS = frozenset(ALLOWED_AUDIO_INPUT_FORMATS) | {"opus", "webm"}
