@@ -200,6 +200,8 @@ from config import (
     ANALYSIS_MAX_SECONDS,
     ADMIN_STATUS_KEY,
     DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
+    DOWNLOAD_RATE_LIMIT_MAX_REQUESTS,
+    DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_MODEL,
@@ -752,7 +754,14 @@ def _tool_status(job_id: str, expected_type: str) -> dict:
 # to buffer, nothing to stall the loop with, and its result is cached.
 # ============================================================
 
-@router.post("/download", dependencies=[Depends(check_rate_limit)])
+@router.post(
+    "/download",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=DOWNLOAD_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
 async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     # Synchronous tool, no job - tagged anyway so its row in request_logs
     # reports "DOWNLOAD" the same consistent way every other tool's rows

@@ -131,6 +131,15 @@ MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2
 # ---------- DOWNLOAD WALL-CLOCK CAP (frees a stuck semaphore slot) ----------
 DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS", "180"))
 
+# ---------- DOWNLOAD RATE LIMIT ----------
+# Dedicated limit for /download, replacing the generic shared
+# RATE_LIMIT_MAX_REQUESTS default it used to sit under. One knob here
+# controls the whole endpoint (both mp3 and wav) - tighten
+# DOWNLOAD_RATE_LIMIT_MAX_REQUESTS alone to cut proxy spend without
+# touching every other endpoint that still shares the generic default.
+DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "5"))
+DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
 
 
 # ---------- ANALYSIS TUNING ----------
