@@ -32,8 +32,18 @@ from config import (
 )
 from audio_common import AudioToolError
 
+from typing import Optional
 
-def convert_to_midi(input_path: str, output_path: str) -> int:
+
+def convert_to_midi(
+    input_path: str,
+    output_path: str,
+    onset_threshold: float = 0.5,
+    frame_threshold: float = 0.3,
+    minimum_note_length: float = 127.70,
+    minimum_frequency: Optional[float] = None,
+    maximum_frequency: Optional[float] = None,
+) -> int:
     """
     Sends input_path to the midi-worker sidecar and writes the returned
     MIDI bytes to output_path. Returns the output size in bytes (used
@@ -62,9 +72,22 @@ def convert_to_midi(input_path: str, output_path: str) -> int:
             # filename to hand librosa a correctly-suffixed temp file,
             # and relying on requests' implicit basename derivation
             # would make that depend on an implementation detail.
+            data = {
+                "onset_threshold": onset_threshold,
+                "frame_threshold": frame_threshold,
+                "minimum_note_length": minimum_note_length,
+            }
+            # Omitted entirely when None - basic-pitch treats absent as
+            # "no bound", which is different from any numeric value.
+            if minimum_frequency is not None:
+                data["minimum_frequency"] = minimum_frequency
+            if maximum_frequency is not None:
+                data["maximum_frequency"] = maximum_frequency
+
             response = requests.post(
                 f"{MIDI_WORKER_URL}/convert",
                 files={"file": (filename, f)},
+                data=data,
                 headers={"x-internal-secret": MIDI_WORKER_SHARED_SECRET},
                 timeout=MIDI_WORKER_TIMEOUT_SECONDS,
             )

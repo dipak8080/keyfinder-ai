@@ -2347,8 +2347,34 @@ async def ringtone_download(job_id: str):
         window_seconds=MIDI_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
-async def audio_to_midi_route(file: UploadFile = File(...)):
-    """Transcribe audio to MIDI via the isolated midi-worker sidecar."""
+async def audio_to_midi_route(
+    file: UploadFile = File(...),
+    onset_threshold: float = Form(0.5),
+    frame_threshold: float = Form(0.3),
+    minimum_note_length: float = Form(127.70),
+    minimum_frequency: float = Form(None),
+    maximum_frequency: float = Form(None),
+):
+    """Transcribe audio to MIDI via the isolated midi-worker sidecar.
+
+    Accuracy note: basic-pitch is designed for ONE instrument at a time.
+    A full mix transcribes noticeably worse than a single separated stem,
+    so the frontend should point users at /stems first for best results.
+    """
+    if not 0.05 <= onset_threshold <= 0.95:
+        raise HTTPException(400, "onset_threshold must be between 0.05 and 0.95.")
+    if not 0.05 <= frame_threshold <= 0.95:
+        raise HTTPException(400, "frame_threshold must be between 0.05 and 0.95.")
+    if not 10 <= minimum_note_length <= 2000:
+        raise HTTPException(400, "minimum_note_length must be between 10 and 2000 ms.")
+    if minimum_frequency is not None and not 20 <= minimum_frequency <= 5000:
+        raise HTTPException(400, "minimum_frequency must be between 20 and 5000 Hz.")
+    if maximum_frequency is not None and not 20 <= maximum_frequency <= 20000:
+        raise HTTPException(400, "maximum_frequency must be between 20 and 20000 Hz.")
+    if (minimum_frequency is not None and maximum_frequency is not None
+            and minimum_frequency >= maximum_frequency):
+        raise HTTPException(400, "minimum_frequency must be less than maximum_frequency.")
+
     return await _submit_audio_tool(
         file,
         job_type="audio_to_midi",
@@ -2358,7 +2384,12 @@ async def audio_to_midi_route(file: UploadFile = File(...)):
         max_duration_seconds=MAX_MIDI_DURATION_SECONDS,
         min_duration_seconds=MIN_MIDI_DURATION_SECONDS,
         allowed_input_formats=MIDI_INPUT_FORMATS,
-        build_work=lambda inp, out: (lambda: run_blocking(convert_to_midi, inp, out)),
+        build_work=lambda inp, out: (lambda: run_blocking(
+            convert_to_midi, inp, out,
+            onset_threshold, frame_threshold, minimum_note_length,
+            minimum_frequency, maximum_frequency,
+        )),
+        log_detail=f"onset={onset_threshold} frame={frame_threshold} min_len={minimum_note_length}ms",
         generic_error="MIDI conversion failed unexpectedly.",
         semaphore=_midi_semaphore,
     )

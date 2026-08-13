@@ -42,6 +42,9 @@ from fastapi.responses import Response
 from basic_pitch.inference import predict, Model
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,11 @@ async def health():
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
+    onset_threshold: float = Form(0.5),
+    frame_threshold: float = Form(0.3),
+    minimum_note_length: float = Form(127.70),
+    minimum_frequency: Optional[float] = Form(None),
+    maximum_frequency: Optional[float] = Form(None),
     x_internal_secret: str = Header(default=""),
 ):
     _verify_secret(x_internal_secret)
@@ -120,8 +128,21 @@ async def convert(
                 # run_in_threadpool is MANDATORY here - see module
                 # docstring. predict() is blocking TF inference; calling
                 # it inline would freeze this process's event loop.
+                # Tuning knobs, all with basic-pitch's own defaults so an
+                # unparameterised call behaves exactly as before. The
+                # frequency bounds are the highest-value pair in practice:
+                # capping range to the target instrument eliminates most
+                # false notes from other sources bleeding through a mix.
                 _, midi_data, note_events = await run_in_threadpool(
-                    predict, input_path, _model
+                    lambda: predict(
+                        input_path,
+                        model_or_model_path=_model,
+                        onset_threshold=onset_threshold,
+                        frame_threshold=frame_threshold,
+                        minimum_note_length=minimum_note_length,
+                        minimum_frequency=minimum_frequency,
+                        maximum_frequency=maximum_frequency,
+                    )
                 )
             except HTTPException:
                 raise
