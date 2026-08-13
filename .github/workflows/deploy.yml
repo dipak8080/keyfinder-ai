@@ -30,6 +30,66 @@ jobs:
             docker system prune -af --volumes || true
             docker builder prune -af || true
 
+            # Internal network for audioforges-api <-> midi-worker traffic.
+            # Idempotent: docker network create fails non-zero if it already
+            # exists, so || true makes repeat deploys safe. No host port is
+            # ever published for midi-worker - it's reachable ONLY from
+            # containers on this network, never from the public internet.
+            echo "Ensuring internal Docker network exists..."
+            docker network create audioforges-net || true
+
+            # ============================================================
+            # MIDI-WORKER (isolated sidecar) - built and deployed FIRST,
+            # and DELIBERATELY NON-FATAL to this whole workflow.
+            #
+            # Rationale: midi-worker is dependency-isolated on purpose (see
+            # audio_to_midi.py's module docstring) specifically so it can
+            # never break the main product. That isolation should extend to
+            # deploy time too - if TensorFlow fails to build, or the model
+            # fails to load, that must degrade ONLY the /audio-to-midi
+            # feature, not roll back or block deployment of every other
+            # tool. Every step below is wrapped so a failure here logs
+            # loudly and falls through, rather than tripping `set -e` and
+            # aborting the whole deploy.
+            # ============================================================
+            echo "Building midi-worker..."
+            if docker build -t midi-worker:latest ./midi-worker; then
+              docker stop midi-worker 2>/dev/null || true
+              docker rm midi-worker 2>/dev/null || true
+
+              docker run -d \
+                --name midi-worker \
+                --restart unless-stopped \
+                --network audioforges-net \
+                -e MIDI_WORKER_SHARED_SECRET="${{ secrets.MIDI_WORKER_SHARED_SECRET }}" \
+                midi-worker:latest || echo "WARNING: midi-worker failed to start - /audio-to-midi will be unavailable until this is fixed manually."
+
+              echo "Waiting for midi-worker to become healthy..."
+              MIDI_HEALTHY=false
+              for i in 1 2 3 4 5 6; do
+                sleep 10
+                if docker exec midi-worker python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)" 2>/dev/null; then
+                  echo "midi-worker health check passed."
+                  MIDI_HEALTHY=true
+                  break
+                fi
+                echo "midi-worker health check attempt $i failed, retrying..."
+              done
+
+              if [ "$MIDI_HEALTHY" = false ]; then
+                echo "WARNING: midi-worker did not become healthy after retries. Logs:"
+                docker logs midi-worker --tail 50 || true
+                echo "Continuing with main app deploy anyway - /audio-to-midi will be degraded until this is investigated."
+              fi
+            else
+              echo "WARNING: midi-worker image failed to build. /audio-to-midi will be unavailable until this is fixed manually. Continuing with main app deploy."
+            fi
+
+            # ============================================================
+            # MAIN APP - unchanged logic below, this is the deploy that
+            # actually gates success/failure and rollback for this workflow.
+            # ============================================================
+
             # Tag current container as rollback point (safe – won't abort if it fails)
             if docker inspect audioforges-api > /dev/null 2>&1; then
               if docker commit audioforges-api audioforges-api:rollback; then
@@ -49,10 +109,12 @@ jobs:
             docker stop audioforges-api || true
             docker rm audioforges-api || true
 
-            # Start new container
+            # Start new container - now on audioforges-net so it can reach
+            # midi-worker by container name.
             docker run -d \
               --name audioforges-api \
               --restart unless-stopped \
+              --network audioforges-net \
               --env-file .env \
               -e PORT=8000 \
               -v /home/deploy/app/data:/app/data \
@@ -85,6 +147,7 @@ jobs:
               docker run -d \
                 --name audioforges-api \
                 --restart unless-stopped \
+                --network audioforges-net \
                 --env-file .env \
                 -e PORT=8000 \
                 -v /home/deploy/app/data:/app/data \
