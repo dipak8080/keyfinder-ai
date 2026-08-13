@@ -262,6 +262,17 @@ NOT_YET_LIVE_MARKERS = (
     "this live event will begin in",
     "premieres in",
     "this video is a live stream that has not yet started",
+    # ADDED 2026-08-13: confirmed in production - this exact phrasing
+    # ("Premiere will begin shortly") fell through every existing marker
+    # here, so is_not_yet_live_error() returned False and the request
+    # went through the full generic-error path instead: 3 retries with
+    # backoff (~4.5s wasted), THEN correctly declined to escalate to
+    # proxy via should_use_proxy() (a different IP can't start a
+    # scheduled premiere early either way) - so the outcome was already
+    # correct, this only removes the wasted retry time before reaching
+    # it. Same fail-fast/skip-proxy handling as every other marker in
+    # this tuple once matched.
+    "premiere will begin shortly",
 )
 
 
