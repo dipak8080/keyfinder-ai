@@ -31,56 +31,54 @@ this service must not rely on a well-behaved client for its own
 resource safety.
 
 --------------------------------------------------------------------------
-THE SENSITIVITY CASCADE, AND WHY IT EXISTS
+THE SENSITIVITY CASCADE
 
 basic-pitch exposes three knobs that between them decide whether a note
-survives into the output at all:
+survives into the output at all: onset_threshold (attack sensitivity),
+frame_threshold (sustain sensitivity), minimum_note_length (discards
+short notes outright). The published defaults (0.5 / 0.3 / 127.7ms) miss
+soft-attack/filtered/fast melodic material entirely or near-entirely -
+confirmed in production, not theoretical.
 
-  onset_threshold      - how much energy a note ATTACK needs to register
-  frame_threshold      - how much energy a SUSTAINED note needs
-  minimum_note_length  - notes shorter than this are discarded outright
+So this runs a cascade: the caller's own settings first, then
+progressively more permissive tiers, stopping at the first tier that's
+"good enough" (see _is_substantial).
 
-Its published defaults (0.5 / 0.3 / 127.7ms) are a sensible
-general-purpose middle ground, but they are NOT universally right, and
-two real production failures on this service proved it:
+--------------------------------------------------------------------------
+FIXED 2026-08-13: TIER SELECTION WAS PICKING THE NOISIEST RESULT
 
-  1. A soft-attack filtered synth melody (sample-pack style, some
-     reverb) returned ZERO notes at the defaults. Confirmed not a bug -
-     a full 15.9s inference ran and genuinely found nothing. The onset
-     detector wants a sharp energy spike; smooth/filtered/reverb-smeared
-     attacks don't produce one, even though the audio is obviously
-     musical to a human.
+The first version of this cascade selected whichever tier returned the
+MOST raw note events when no tier hit the "substantial" bar. That is
+backwards: a lower threshold admits both more REAL notes and more FALSE
+POSITIVES as noise gets misread as notes, and looser thresholds almost
+always win a raw note-count contest regardless of accuracy. In practice
+this meant the fallback path silently preferred the single noisiest,
+most-permissive tier almost every time a file didn't cleanly clear the
+substantial bar - a real regression from the single-attempt version this
+cascade replaced, not an improvement.
 
-  2. After loosening onset/frame alone, the SAME file returned exactly
-     ONE note. The melody was built from fast, short notes - the model
-     was finding them, and then the 127.7ms minimum_note_length floor
-     was throwing nearly all of them away. Sensitivity alone could never
-     have fixed that; the length floor itself had to shrink.
+The fix: results are now ranked cleanest-first, not biggest-first.
 
-So a single fixed-threshold attempt is structurally incapable of
-handling both a slow pad and a fast arpeggio well. Rather than pushing
-that problem onto the caller (who would have to know what these knobs
-mean and re-upload repeatedly to find settings that work), this service
-runs a CASCADE: the caller's own settings first, then progressively more
-permissive tiers, keeping the RICHEST result found rather than the first
-non-empty one.
-
-Two rules make the cascade safe rather than just "loosen until
-something appears":
-
-  - The caller's requested settings are ALWAYS tier one, and are the
-    ones used if they produce a good result. A deliberate, working
-    custom setting is never silently overridden.
-  - It stops as soon as a result is genuinely substantial (see
-    _is_substantial below). Loosening past that point starts admitting
-    noise as false notes, which makes the transcription worse, not
-    better. "Most permissive" is NOT the goal; "best" is.
+  1. Any tier that is genuinely SUBSTANTIAL - the first (least
+     permissive, cleanest) one wins. The loop breaks here immediately,
+     so more permissive tiers are never even run.
+  2. Failing that, any tier that cleared a low MODERATE floor (see
+     MODERATE_FLOOR_NOTES) - again the FIRST (cleanest) one wins, not
+     the biggest.
+  3. Failing that, whatever tier found the most notes at all - this is
+     the true last resort, reached only when every tier including the
+     most permissive one found next to nothing, so "biggest of a bad
+     set" is a reasonable final fallback rather than the default
+     behaviour.
+  4. If every tier found zero notes, this is an honest "no notes
+     detected" result, not a bug.
 --------------------------------------------------------------------------
 """
 import os
 import asyncio
 import logging
 import tempfile
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form
@@ -98,36 +96,35 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MIDI_MAX_UPLOAD_BYTES", str(80 * 1024 * 1
 MAX_CONCURRENT = int(os.environ.get("MIDI_WORKER_CONCURRENCY", "2"))
 
 # (onset_threshold, frame_threshold, minimum_note_length_ms), ordered
-# from least to most permissive. All three loosen together because they
-# fail together in practice - the same quiet/soft/fast material that
-# defeats the onset detector also tends to produce short notes that the
-# length floor then discards.
-#
-# The floor stops at 30ms deliberately. Below roughly that, basic-pitch
-# starts emitting sub-perceptual fragments that read as transcription
-# noise rather than notes a person played - going lower produces a
-# BUSIER output, not a more accurate one.
+# from least to most permissive. Fourth tier added for genuinely soft/
+# simple monophonic material (soft-attack synths, pads) that even tier 3
+# can miss - this is the noisiest tier in the cascade and is only ever
+# reached as a near-last-resort, which is exactly why correct SELECTION
+# (see module docstring) matters more than adding more tiers does.
 CASCADE_TIERS: List[Tuple[float, float, float]] = [
     (0.35, 0.20, 100.0),
     (0.25, 0.15, 60.0),
     (0.15, 0.10, 30.0),
+    (0.10, 0.05, 20.0),
 ]
 
-# A result is "substantial" (stop cascading) at this many notes per
-# second of transcribed span. Deliberately DENSITY-based, not a flat
-# note count: 6 notes is a rich transcription of a 3-second one-shot and
-# a nearly-empty one for a 3-minute track, and a flat threshold would
-# stop far too early on long files while over-searching short ones.
-#
-# 1.5 notes/sec is roughly eighth notes at 90bpm - comfortably "a real
-# melody is present" without demanding density that a slow, sparse pad
-# legitimately wouldn't have.
-SUBSTANTIAL_NOTES_PER_SECOND = float(os.environ.get("MIDI_SUBSTANTIAL_NPS", "1.5"))
+# A result is "substantial" (stop cascading, use it, don't go further)
+# at this many notes per second of transcribed span, AND at least this
+# many notes in absolute terms. Both conditions required - see
+# _is_substantial's docstring. Lowered from the original 1.5 nps / 8
+# notes: simple, sparse, correctly-transcribed melodies (a single
+# instrument playing a clear line) legitimately don't need to be dense
+# to be a GOOD result, and the original bar was rejecting clean tier-1/
+# tier-2 transcriptions that should have been accepted immediately.
+SUBSTANTIAL_NOTES_PER_SECOND = float(os.environ.get("MIDI_SUBSTANTIAL_NPS", "1.2"))
+SUBSTANTIAL_MIN_NOTES = int(os.environ.get("MIDI_SUBSTANTIAL_MIN_NOTES", "5"))
 
-# Absolute floor regardless of density - a handful of notes spread over
-# a long file is not a transcription worth stopping on, however sparse
-# the source material genuinely is.
-SUBSTANTIAL_MIN_NOTES = int(os.environ.get("MIDI_SUBSTANTIAL_MIN_NOTES", "8"))
+# The "moderate" floor used only in the fallback ranking (step 2 in the
+# module docstring) - deliberately much lower than SUBSTANTIAL_MIN_NOTES.
+# This is what lets an earlier, CLEANER tier that found a handful of
+# genuine notes beat a later, noisier tier that found more total notes
+# but wasn't itself substantial.
+MODERATE_FLOOR_NOTES = int(os.environ.get("MIDI_MODERATE_FLOOR_NOTES", "3"))
 
 app = FastAPI()
 
@@ -136,10 +133,9 @@ app = FastAPI()
 # the main app's _midi_semaphore: a service should never depend on its
 # client being well-behaved for its own resource safety.
 #
-# Worth knowing: the cascade means ONE request can now run predict()
-# multiple times, so a request's worst-case wall time is a multiple of
-# what it was before. That is exactly why this semaphore matters more
-# now than it did with single-shot inference.
+# Worth knowing: the cascade means one request can now run predict()
+# up to len(CASCADE_TIERS)+1 times, so a request's worst-case wall time
+# is a multiple of what a single-shot inference used to take.
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 # Loaded ONCE at process startup. basic-pitch's own docs call reloading
@@ -182,13 +178,10 @@ def _note_span_seconds(note_events: list) -> float:
 
 def _is_substantial(note_events: list) -> bool:
     """
-    True when a transcription is good enough to stop cascading.
-
-    Both conditions must hold: enough notes in absolute terms AND enough
-    density. Requiring both is what stops the cascade settling for two
-    stray notes at a permissive threshold (dense by span, trivial in
-    reality) or for a long thin dribble of notes across a whole track
-    (numerous, but not actually a transcription of anything).
+    True when a transcription is good enough to stop cascading on -
+    the FIRST tier that satisfies this wins, deliberately, so a clean
+    result from a stricter/less-permissive tier is always preferred over
+    continuing to loosen further.
     """
     if len(note_events) < SUBSTANTIAL_MIN_NOTES:
         return False
@@ -196,6 +189,41 @@ def _is_substantial(note_events: list) -> bool:
     if span <= 0:
         return False
     return (len(note_events) / span) >= SUBSTANTIAL_NOTES_PER_SECOND
+
+
+@dataclass
+class _TierResult:
+    tier_index: int
+    onset: float
+    frame: float
+    min_len: float
+    note_events: list
+    midi_data: object
+
+
+def _select_best(results: List[_TierResult]) -> Optional[_TierResult]:
+    """
+    Ranks cleanest-first, not biggest-first - see the module docstring's
+    "FIXED 2026-08-13" section for the regression this replaces and why
+    "most notes" was the wrong selection criterion.
+
+    Tiers are already in cascade order (least to most permissive), so
+    "first result satisfying a condition" is equivalent to "least
+    permissive / cleanest result satisfying a condition" throughout.
+    """
+    for r in results:
+        if _is_substantial(r.note_events):
+            return r
+    for r in results:
+        if len(r.note_events) >= MODERATE_FLOOR_NOTES:
+            return r
+    non_empty = [r for r in results if r.note_events]
+    if non_empty:
+        # True last resort: every tier including the most permissive one
+        # found barely anything. "Biggest of a bad set" here, not the
+        # default behaviour it was before.
+        return max(non_empty, key=lambda r: len(r.note_events))
+    return None
 
 
 @app.get("/health")
@@ -220,19 +248,11 @@ async def convert(
     minimum_note_length: float = Form(127.70),
     minimum_frequency: Optional[float] = Form(None),
     maximum_frequency: Optional[float] = Form(None),
-    # Off by default: pitch bends make a transcription more faithful to
-    # a expressive/slide-heavy performance, but they also make the MIDI
-    # messier to edit in a DAW, which is the more common use for this
-    # tool. Exposed so a caller who wants the expressive version can ask.
     multiple_pitch_bends: bool = Form(False),
     x_internal_secret: str = Header(default=""),
 ):
     _verify_secret(x_internal_secret)
 
-    # Streamed to a temp file in 1MB chunks rather than read whole into
-    # memory - same reasoning as the main app's upload.py. The cap is
-    # enforced MID-STREAM so an oversized body is abandoned partway,
-    # not fully buffered and then rejected.
     suffix = os.path.splitext(file.filename or "")[1].lower() or ".audio"
     input_path = None
     try:
@@ -242,10 +262,7 @@ async def convert(
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        413,
-                        {"reason": "too_large", "message": "File too large."},
-                    )
+                    raise HTTPException(413, {"reason": "too_large", "message": "File too large."})
                 tmp_in.write(chunk)
 
         if total == 0:
@@ -253,10 +270,8 @@ async def convert(
 
         async with _semaphore:
             # Tier one is ALWAYS exactly what the caller asked for (or
-            # the defaults). Subsequent tiers are included only if they
-            # are genuinely more permissive on at least one axis than
-            # what was requested - a caller who already asked for
-            # onset=0.2 shouldn't be retried at a stricter 0.35.
+            # the defaults). Later tiers included only if genuinely more
+            # permissive on at least one axis than what was requested.
             cascade: List[Tuple[float, float, float]] = [
                 (onset_threshold, frame_threshold, minimum_note_length)
             ] + [
@@ -265,28 +280,10 @@ async def convert(
                 if t_onset < onset_threshold or t_min_len < minimum_note_length
             ]
 
-            best_midi_data = None
-            best_note_events: list = []
-            used_onset, used_frame, used_min_len = (
-                onset_threshold,
-                frame_threshold,
-                minimum_note_length,
-            )
-            tiers_run = 0
+            results: List[_TierResult] = []
 
-            for tier_onset, tier_frame, tier_min_len in cascade:
-                tiers_run += 1
+            for i, (tier_onset, tier_frame, tier_min_len) in enumerate(cascade):
                 try:
-                    # run_in_threadpool is MANDATORY here - see module
-                    # docstring. predict() is blocking TF inference;
-                    # calling it inline would freeze this process's
-                    # event loop.
-                    #
-                    # Default-argument binding on the lambda (t_on=... )
-                    # captures THIS iteration's values. A bare closure
-                    # over the loop variables would evaluate them at
-                    # call time, and every tier would silently run with
-                    # the final tier's settings - a real bug, not style.
                     _, tier_midi_data, tier_note_events = await run_in_threadpool(
                         lambda t_on=tier_onset, t_fr=tier_frame, t_ml=tier_min_len: predict(
                             input_path,
@@ -297,11 +294,6 @@ async def convert(
                             minimum_frequency=minimum_frequency,
                             maximum_frequency=maximum_frequency,
                             multiple_pitch_bends=multiple_pitch_bends,
-                            # basic-pitch's own default, stated
-                            # explicitly rather than relied on: this
-                            # post-processing step meaningfully improves
-                            # melodic contour, and it should be obvious
-                            # here that it's deliberately ON.
                             melodia_trick=True,
                         )
                     )
@@ -309,8 +301,7 @@ async def convert(
                     raise
                 except Exception as e:
                     logger.error(
-                        f"[MIDI_WORKER] Transcription failed ({total} bytes, "
-                        f"tier {tiers_run}): {e}",
+                        f"[MIDI_WORKER] Transcription failed ({total} bytes, tier {i + 1}): {e}",
                         exc_info=True,
                     )
                     raise HTTPException(
@@ -321,28 +312,40 @@ async def convert(
                         },
                     )
 
-                # Strictly better = more notes found. Tracked rather
-                # than break-on-first-nonempty because an early tier
-                # scraping together 1-2 notes is not a transcription,
-                # and settling for it was the exact production bug this
-                # replaced.
-                if len(tier_note_events) > len(best_note_events):
-                    best_midi_data = tier_midi_data
-                    best_note_events = tier_note_events
-                    used_onset, used_frame, used_min_len = tier_onset, tier_frame, tier_min_len
+                span = _note_span_seconds(tier_note_events)
+                density = (len(tier_note_events) / span) if span > 0 else 0.0
+                logger.info(
+                    f"[MIDI_WORKER] tier {i + 1}/{len(cascade)} "
+                    f"(onset={tier_onset}, frame={tier_frame}, min_len={tier_min_len}ms) "
+                    f"-> {len(tier_note_events)} notes, {density:.2f} notes/sec"
+                )
+
+                results.append(_TierResult(
+                    tier_index=i,
+                    onset=tier_onset,
+                    frame=tier_frame,
+                    min_len=tier_min_len,
+                    note_events=tier_note_events,
+                    midi_data=tier_midi_data,
+                ))
 
                 if _is_substantial(tier_note_events):
-                    # Good enough. Loosening further from here trades
-                    # accuracy for noise - stop while the result is
-                    # clean.
+                    # Clean and good enough - stop here. Do NOT keep
+                    # loosening past this point; every further tier only
+                    # risks admitting more noise.
                     break
 
-            midi_data = best_midi_data
-            note_events = best_note_events
+            best = _select_best(results)
+            midi_data = best.midi_data if best else None
+            note_events = best.note_events if best else []
+            used_onset = best.onset if best else onset_threshold
+            used_frame = best.frame if best else frame_threshold
+            used_min_len = best.min_len if best else minimum_note_length
+            tiers_run = len(results)
 
             if tiers_run > 1:
                 logger.info(
-                    f"[MIDI_WORKER] Cascade ran {tiers_run} tier(s) - best result "
+                    f"[MIDI_WORKER] Cascade ran {tiers_run} tier(s) - selected "
                     f"{len(note_events)} notes at onset={used_onset}, "
                     f"frame={used_frame}, min_note_length={used_min_len}ms "
                     f"(requested: onset={onset_threshold}, frame={frame_threshold}, "
@@ -350,16 +353,6 @@ async def convert(
                 )
 
         if not note_events:
-            # NOT a crash - a legitimate "nothing musical here" result,
-            # and now a much stronger claim than it used to be: it means
-            # EVERY tier down to the most permissive found nothing, not
-            # merely that the default threshold was too strict. Silence,
-            # pure noise, spoken word, applause, or heavily percussive
-            # material with no pitched content all land here honestly.
-            #
-            # Same 422 as a real failure because 204 cannot carry a
-            # response body per HTTP spec, but the structured `reason`
-            # field lets the caller tell the two apart reliably.
             logger.warning(
                 f"[MIDI_WORKER] Zero notes across all {tiers_run} cascade tier(s) "
                 f"({total} bytes input)"
@@ -398,9 +391,6 @@ async def convert(
         return Response(
             content=midi_bytes,
             media_type="audio/midi",
-            # Diagnostic headers - these are what let you tell, per
-            # request and without reading container logs, whether the
-            # cascade fired and how rich the result actually was.
             headers={
                 "X-Note-Count": str(len(note_events)),
                 "X-Note-Span-Seconds": f"{span:.2f}",
