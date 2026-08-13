@@ -2417,8 +2417,36 @@ async def audio_to_midi_preview(job_id: str):
 
 @router.get("/audio-to-midi/download/{job_id}")
 async def audio_to_midi_download(job_id: str):
+    """
+    Downloads named after the ORIGINAL uploaded file, not a generic
+    "transcribed.mid" - deliberately different from every other tool's
+    download route (which all use a fixed generic name like
+    "converted.mp3"). A MIDI file loaded straight into a DAW is far more
+    useful named after the source track ("song.mid") than a batch of
+    "transcribed.mid" files from different sessions colliding on disk or
+    being impossible to tell apart once downloaded.
+
+    Falls back to "transcribed" only if the job has no recorded title at
+    all (shouldn't normally happen, but the download must never 500 over
+    a missing/empty original filename).
+    """
     path, fmt = _resolve_tool_output_path(job_id, "audio_to_midi")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"transcribed.{fmt}")
+    job = get_job(job_id)
+    original_title = (job.get("title") if job else None) or "transcribed"
+
+    # Strips the ORIGINAL extension (.mp3, .wav, etc.) so it isn't
+    # doubled up with the new .mid - "song.mp3" -> "song", not
+    # "song.mp3.mid". safe_extension-style sanitization isn't needed
+    # here since this only sets a Content-Disposition header value, not
+    # a filesystem path - unlike build_temp_input_path's use case, no
+    # path traversal or filesystem-length concern applies.
+    base_name = os.path.splitext(original_title)[0].strip() or "transcribed"
+
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=f"{base_name}.{fmt}",
+    )
 
 
 # ============================================================
