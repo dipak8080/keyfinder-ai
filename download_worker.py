@@ -47,6 +47,10 @@ from youtube import (
     download_with_fallback,
     ytdlp_alert_logger,
     VideoTooLongError,
+    proxy_available,
+    direct_path_degraded,
+    proxy_botcheck_degraded,
+    get_cookie_accounts,
 )
 
 
@@ -82,14 +86,20 @@ def main():
         result = {"ok": False, "kind": "too_long", "error": str(e)}
 
     except Exception as e:
-        # Every other failure - permanent, geo-restricted, bot-check,
-        # CDN timeout, TLS handshake, format-unavailable, etc. - is
-        # returned as a plain classified-later string. The parent
-        # (routes.py / youtube_chain.py) runs the SAME is_permanent_
-        # error() / is_bot_check_error() / etc. classification chain on
-        # result["error"] that it always did on str(e) - nothing about
-        # that logic changes, only where the exception was caught.
         result = {"ok": False, "kind": "error", "error": str(e)}
+
+    # Breaker/health state lives as module-level globals in youtube.py -
+    # meaningless here since this process exits right after. Snapshot
+    # whatever tripped INSIDE this run so the parent (long-lived) process
+    # can re-apply it to ITS OWN in-memory state. Without this, every
+    # circuit breaker silently never trips because each download gets a
+    # fresh, empty state.
+    result["breaker_state"] = {
+        "proxy_was_available": proxy_available(),
+        "direct_was_degraded": direct_path_degraded(),
+        "proxy_was_botcheck_degraded": proxy_botcheck_degraded(),
+        "cookie_accounts_remaining": get_cookie_accounts(),
+    }
 
     with open(output_path, "w") as f:
         json.dump(result, f)

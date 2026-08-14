@@ -358,14 +358,14 @@ async def run_in_killable_subprocess(
         proc = await asyncio.create_subprocess_exec(
             sys.executable, _worker_script_path(), input_path, output_path,
             start_new_session=True,  # own process group - required for killpg below
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # NO stdout/stderr PIPE - inherits parent's fds so yt-dlp's
+            # verbose output, [COOKIES]/[PROXY]/[CDN] log lines, etc. still
+            # reach the container's log stream. Piping them silently
+            # discarded every log line from inside a download.
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_seconds
-            )
+            await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             # Kill the WHOLE process group, not just proc.pid - the worker's
             # Node/Deno/ffmpeg children are what actually keep burning
@@ -385,9 +385,9 @@ async def run_in_killable_subprocess(
             return {"ok": False, "kind": "timeout", "error": "Download timed out."}
 
         if proc.returncode != 0:
-            stderr_text = (stderr or b"").decode(errors="replace")[-2000:]
             logger.error(
-                f"[DOWNLOAD_WORKER] job={job_id} exited with code {proc.returncode}: {stderr_text}"
+                f"[DOWNLOAD_WORKER] job={job_id} exited with code {proc.returncode} "
+                f"(see worker's own log lines above for detail)"
             )
             return {
                 "ok": False,
@@ -399,10 +399,9 @@ async def run_in_killable_subprocess(
             with open(output_path) as f:
                 result = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError) as e:
-            stderr_text = (stderr or b"").decode(errors="replace")[-2000:]
             logger.error(
-                f"[DOWNLOAD_WORKER] job={job_id} produced no valid output file: {e}. "
-                f"stderr: {stderr_text}"
+                f"[DOWNLOAD_WORKER] job={job_id} produced no valid output file: {e} "
+                f"(see worker's own log lines above for detail)"
             )
             return {
                 "ok": False,
