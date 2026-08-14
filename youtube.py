@@ -687,6 +687,7 @@ def proxy_available() -> bool:
 
 
 def _trip_proxy_circuit_breaker():
+    _record_event("proxy_quota")
     global _proxy_disabled_until
     with _proxy_lock:
         _proxy_disabled_until = time.time() + PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS
@@ -743,6 +744,7 @@ def record_cdn_timeout():
     would keep the breaker latched on the very failures it's meant to
     route around.
     """
+    _record_event("cdn_timeout")
     global _direct_degraded_until
     now = time.time()
     tripped_for = None
@@ -820,6 +822,7 @@ _proxy_botcheck_until = 0.0
 
 def record_proxy_botcheck():
     """Called when a PROXY attempt fails with a bot-check specifically."""
+    _record_event("proxy_botcheck")
     global _proxy_botcheck_until
     now = time.time()
     tripped = False
@@ -904,6 +907,7 @@ def record_account_result(
     rather than the cookie. Losing that distinction would flatten the
     single most useful signal here back into an ambiguous failure count.
     """
+    _record_event("account_result", path=path, ok=ok, via=via, error_text=error_text)
     if not path:
         return
     now = time.time()
@@ -988,6 +992,7 @@ _path_stats: dict = {
 
 
 def record_path_attempt(via: str, ok: bool):
+    _record_event("path_attempt", via=via, ok=ok)
     with _path_stats_lock:
         bucket = _path_stats.setdefault(via, {"attempts": 0, "successes": 0})
         bucket["attempts"] += 1
@@ -1104,6 +1109,12 @@ def _maybe_alert_cookie_expiry(message: str):
     going bad later still alerts on its own schedule, it isn't silenced by
     an unrelated account's recent alert.
     """
+    if _record_events_enabled:
+        # In worker mode: the rolling-window counter here is per-process
+        # and would reset every download, so it could never reach the
+        # alert threshold. Hand the occurrence to the parent instead.
+        _record_event("cookie_warning", path=_get_active_account())
+        return
     global _cookie_alert_last_sent
     account_path = _get_active_account()
     account_label = account_path if account_path else "unknown/cookie-less attempt"
@@ -1254,6 +1265,7 @@ def get_cookie_accounts() -> list:
 
 
 def _disable_cookie_account(path: str):
+    _record_event("cookie_dead", path=path)
     with _cookie_accounts_lock:
         _cookie_account_disabled_until[path] = time.time() + COOKIE_ACCOUNT_COOLDOWN_SECONDS
     logger.warning(
@@ -1862,3 +1874,139 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     # is_bot_check_error()/is_geo_restricted_error()/etc. classification on
     # top of it for the user-facing message).
     return _try_proxy("direct attempt failed")
+
+
+# ============================================================
+# CROSS-PROCESS BREAKER STATE (added 2026-08-14)
+#
+# WHY THIS EXISTS: since downloads moved into download_worker.py (see
+# utils.run_in_killable_subprocess), every download runs in a FRESH
+# process that imports this module from scratch. Every breaker, counter
+# and cookie-cooldown above is a module-level global - so in a worker
+# they all start empty and die when the process exits. Concretely, this
+# silently disabled EVERY cost-control mechanism in this file:
+#
+#   _proxy_disabled_until          quota breaker never trips
+#   _cdn_timeout_events            CDN degradation breaker never trips
+#   _proxy_botcheck_events         proxy bot-check breaker never trips
+#   _cookie_account_disabled_until dead cookie accounts never disabled
+#   _account_health / _path_stats  /admin/status permanently reports zeros
+#   _cookie_warning_events         cookie-expiry alerts never fire
+#
+# The fix is two-way, and both directions are required:
+#
+#   PARENT -> WORKER (export/import_breaker_state): the worker must SEE
+#   the parent's current breakers, or it will happily hammer a proxy the
+#   parent already knows is out of credit, or retry a cookie account the
+#   parent already disabled.
+#
+#   WORKER -> PARENT (enable_event_recording/drain_events/apply_events):
+#   whatever tripped inside the worker must be replayed into the
+#   parent's long-lived state, or it evaporates when the process exits.
+#
+# Events, not state, on the way back: the parent may have handled other
+# concurrent downloads while this worker ran, so replaying raw state
+# would clobber theirs. Replaying events composes correctly with
+# whatever else happened.
+# ============================================================
+
+_events_lock = threading.Lock()
+_recorded_events: list = []
+_record_events_enabled = False
+
+
+def enable_event_recording():
+    """Called ONCE by download_worker.py at startup. The parent process
+    never calls this, so _record_event is a no-op there and apply_events
+    below cannot recurse into the recorder."""
+    global _record_events_enabled
+    _record_events_enabled = True
+
+
+def _record_event(kind: str, **payload):
+    if not _record_events_enabled:
+        return
+    with _events_lock:
+        _recorded_events.append({"kind": kind, **payload})
+
+
+def drain_events() -> list:
+    """Worker-side: everything that tripped during this download."""
+    with _events_lock:
+        out = list(_recorded_events)
+        _recorded_events.clear()
+    return out
+
+
+def apply_events(events: list):
+    """
+    Parent-side: replay a worker's events into THIS process's state.
+    Never raises - a malformed event must not break a download that
+    otherwise succeeded.
+    """
+    if not events:
+        return
+    for ev in events:
+        try:
+            kind = ev.get("kind")
+            if kind == "cdn_timeout":
+                record_cdn_timeout()
+            elif kind == "proxy_botcheck":
+                record_proxy_botcheck()
+            elif kind == "proxy_quota":
+                _trip_proxy_circuit_breaker()
+            elif kind == "cookie_dead" and ev.get("path"):
+                _disable_cookie_account(ev["path"])
+            elif kind == "account_result":
+                record_account_result(
+                    ev.get("path"), ev.get("ok", False),
+                    ev.get("via", "direct"), ev.get("error_text", ""),
+                )
+            elif kind == "path_attempt":
+                record_path_attempt(ev.get("via", "direct"), ev.get("ok", False))
+            elif kind == "cookie_warning":
+                _set_active_account(ev.get("path"))
+                _maybe_alert_cookie_expiry("cookies are no longer valid")
+        except Exception as e:
+            logger.warning(f"[BREAKER] Failed to apply worker event {ev}: {e}")
+
+
+def export_breaker_state() -> dict:
+    """
+    Parent-side snapshot handed to the worker. All values are absolute
+    time.time() deadlines, so they survive the process boundary without
+    any relative-time recalculation.
+    """
+    with _proxy_lock:
+        proxy_until = _proxy_disabled_until
+    with _cdn_lock:
+        cdn_until = _direct_degraded_until
+    with _proxy_botcheck_lock:
+        botcheck_until = _proxy_botcheck_until
+    with _cookie_accounts_lock:
+        disabled = dict(_cookie_account_disabled_until)
+    return {
+        "proxy_disabled_until": proxy_until,
+        "direct_degraded_until": cdn_until,
+        "proxy_botcheck_until": botcheck_until,
+        "cookie_disabled": disabled,
+    }
+
+
+def import_breaker_state(state: dict):
+    """Worker-side: adopt the parent's breakers before doing any work."""
+    global _proxy_disabled_until, _direct_degraded_until, _proxy_botcheck_until
+    if not state:
+        return
+    try:
+        with _proxy_lock:
+            _proxy_disabled_until = float(state.get("proxy_disabled_until") or 0.0)
+        with _cdn_lock:
+            _direct_degraded_until = float(state.get("direct_degraded_until") or 0.0)
+        with _proxy_botcheck_lock:
+            _proxy_botcheck_until = float(state.get("proxy_botcheck_until") or 0.0)
+        with _cookie_accounts_lock:
+            _cookie_account_disabled_until.clear()
+            _cookie_account_disabled_until.update(state.get("cookie_disabled") or {})
+    except Exception as e:
+        logger.warning(f"[BREAKER] Failed to import parent breaker state: {e}")

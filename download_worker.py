@@ -8,37 +8,25 @@ possible Deno JS-challenge solver, ffmpeg for postprocessing) - instead
 of only abandoning an asyncio await while those children keep running
 unsupervised.
 
-WHY THIS EXISTS: see utils.py's "KILLABLE SUBPROCESS FOR YOUTUBE
-DOWNLOADS" comment block for the full incident writeup. Short version -
-confirmed in production 2026-08-14: a wall-clock timeout logged at
-4:51:04 didn't actually stop the underlying yt-dlp call, which kept
-running and logged its own failure at 4:55:26 - over 4 minutes later,
-on a thread pool with no way to force-kill a thread. This script exists
-so that timeout can kill something real.
+WHY THIS EXISTS: confirmed in production 2026-08-14 - a wall-clock
+timeout logged at 4:51:04 didn't stop the underlying yt-dlp call, which
+kept running and logged its own failure at 4:55:26, over 4 minutes
+later, on a thread pool with no way to force-kill a thread.
 
-USAGE (invoked by utils.run_in_killable_subprocess, not run by hand):
+BREAKER STATE (added 2026-08-14): this process imports youtube.py fresh
+every run, so every circuit breaker and counter in that module starts
+empty here and dies on exit. import_breaker_state() adopts the parent's
+breakers on the way in; drain_events() reports back what tripped on the
+way out, and the parent replays them into its own long-lived state. See
+youtube.py's "CROSS-PROCESS BREAKER STATE" section for the full writeup.
+
+USAGE (invoked by utils.run_in_killable_subprocess, not by hand):
     python download_worker.py <input_json_path> <output_json_path>
 
-input_json_path contains: {"ydl_opts": {...}, "url": "...", "proxy_url": "..."}
-  - ydl_opts must NOT contain 'logger' or 'progress_hooks' - neither
-    survives a JSON boundary. This script reconstructs its own
-    ytdlp_alert_logger below. progress_hooks (used only by the live
-    /download progress UI) are not reconstructed here - the chained
-    /youtube/* tools never had them either, and /download's progress
-    polling falls back gracefully to plain status-based waiting for the
-    duration of a subprocess-backed download.
-
-output_json_path is written with one of:
-    {"ok": true, "title": "..."}
-    {"ok": false, "kind": "too_long", "error": "..."}
-    {"ok": false, "kind": "error", "error": "..."}
-
-Exit code is always 0 on a clean run (even a classified download
-failure is NOT a crash - the result dict carries that information).
-A non-zero exit code or a missing output file means this script itself
-crashed unexpectedly (bad input JSON, import failure, etc.) - the
-parent (run_in_killable_subprocess) already handles that case by
-returning kind="crashed".
+stdout/stderr are INHERITED from the parent, deliberately - that is what
+puts this process's [COOKIES]/[PROXY]/[CDN] lines and yt-dlp's verbose
+output into the same container log stream as everything else. Piping
+them silently discarded every log line a download produced.
 """
 import sys
 import json
@@ -47,16 +35,16 @@ from youtube import (
     download_with_fallback,
     ytdlp_alert_logger,
     VideoTooLongError,
-    proxy_available,
-    direct_path_degraded,
-    proxy_botcheck_degraded,
-    get_cookie_accounts,
+    enable_event_recording,
+    import_breaker_state,
+    drain_events,
 )
+from download_progress import make_progress_hook
 
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: python download_worker.py <input_json_path> <output_json_path>", file=sys.stderr)
+        print("Usage: python download_worker.py <in.json> <out.json>", file=sys.stderr)
         sys.exit(1)
 
     input_path, output_path = sys.argv[1], sys.argv[2]
@@ -68,38 +56,39 @@ def main():
     url = payload["url"]
     proxy_url = payload.get("proxy_url")
 
-    # Reconstructed here rather than passed in - the live logger object
-    # in youtube.py can't survive a JSON boundary, and this process needs
-    # its own reference to the SAME shared alert/cookie-health machinery
-    # (per-account failure tracking, cookie-expiry Discord alerts, etc.)
-    # that youtube.py already defines. Importing ytdlp_alert_logger here
-    # gives this subprocess the identical behavior /download and the
-    # chained tools had before - the alerting logic itself lives in
-    # youtube.py, unchanged.
+    # Order matters: recording on BEFORE any work, so nothing that trips
+    # during import_breaker_state or the download itself is missed.
+    enable_event_recording()
+    import_breaker_state(payload.get("breaker_state"))
+
+    # Reconstructed here, not passed in - a live logger object cannot
+    # cross a JSON boundary. Importing the shared instance from
+    # youtube.py gives this process the identical cookie-expiry
+    # detection the in-process version had.
     ydl_opts["logger"] = ytdlp_alert_logger
+
+    # Progress hook likewise reconstructed rather than serialized. Only
+    # /download sends progress_label (the chained /youtube/* tools poll
+    # job status instead and never had one), so this is skipped for them.
+    progress_label = payload.get("progress_label")
+    if progress_label:
+        ydl_opts["progress_hooks"] = [make_progress_hook(progress_label)]
 
     try:
         info = download_with_fallback(ydl_opts, url, proxy_url)
         result = {"ok": True, "title": info.get("title", "Unknown")}
-
     except VideoTooLongError as e:
         result = {"ok": False, "kind": "too_long", "error": str(e)}
-
     except Exception as e:
+        # Everything else - permanent, geo, bot-check, CDN timeout, TLS,
+        # format-unavailable - comes back as a plain string. The parent
+        # runs the SAME is_permanent_error()/is_bot_check_error()/etc.
+        # chain on it that it always ran on str(e).
         result = {"ok": False, "kind": "error", "error": str(e)}
 
-    # Breaker/health state lives as module-level globals in youtube.py -
-    # meaningless here since this process exits right after. Snapshot
-    # whatever tripped INSIDE this run so the parent (long-lived) process
-    # can re-apply it to ITS OWN in-memory state. Without this, every
-    # circuit breaker silently never trips because each download gets a
-    # fresh, empty state.
-    result["breaker_state"] = {
-        "proxy_was_available": proxy_available(),
-        "direct_was_degraded": direct_path_degraded(),
-        "proxy_was_botcheck_degraded": proxy_botcheck_degraded(),
-        "cookie_accounts_remaining": get_cookie_accounts(),
-    }
+    # Drained LAST, outside the try, so events are returned even when the
+    # download failed - a failure is exactly when breakers matter most.
+    result["events"] = drain_events()
 
     with open(output_path, "w") as f:
         json.dump(result, f)

@@ -317,6 +317,7 @@ async def run_in_killable_subprocess(
     proxy_url: str,
     timeout_seconds: int,
     job_id: str,
+    progress_label: str = None,
 ) -> dict:
     """
     Spawns download_worker.py in its own process group, writes ydl_opts+url
@@ -343,10 +344,25 @@ async def run_in_killable_subprocess(
     input_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_in.json")
     output_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_out.json")
 
+    # Imported lazily: youtube.py does not import utils, so there is no
+    # cycle today, but a module-level import here would create one the
+    # moment it ever does.
+    from youtube import export_breaker_state, apply_events
+
     try:
         with open(input_path, "w") as f:
             json.dump(
-                {"ydl_opts": ydl_opts_serializable, "url": url, "proxy_url": proxy_url},
+                {
+                    "ydl_opts": ydl_opts_serializable,
+                    "url": url,
+                    "proxy_url": proxy_url,
+                    # The worker imports youtube.py fresh, so its breakers
+                    # start empty. Without this it would retry a proxy the
+                    # parent already circuit-broke and cookie accounts the
+                    # parent already disabled.
+                    "breaker_state": export_breaker_state(),
+                    "progress_label": progress_label,
+                },
                 f,
             )
     except Exception as e:
@@ -408,6 +424,14 @@ async def run_in_killable_subprocess(
                 "kind": "crashed",
                 "error": "Downloader process did not return a result.",
             }
+
+        # Replay whatever tripped inside the worker into THIS process's
+        # long-lived state - the worker's own copy dies with it. Wrapped
+        # so a bad event can never fail a download that succeeded.
+        try:
+            apply_events(result.pop("events", []))
+        except Exception as e:
+            logger.warning(f"[DOWNLOAD_WORKER] job={job_id} failed to apply breaker events: {e}")
 
         return result
 

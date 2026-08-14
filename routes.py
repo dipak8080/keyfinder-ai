@@ -877,6 +877,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         result = await run_in_killable_subprocess(
             serializable_ydl_opts, url, proxy_url,
             DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS, temp_id,
+            progress_label=video_id or url,
         )
 
         if result["ok"]:
