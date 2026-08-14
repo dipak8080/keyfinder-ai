@@ -383,6 +383,7 @@ from audio_effects import apply_fade, convert_channels, resample_audio, make_rin
 from audio_to_midi import convert_to_midi
 from admin_auth import guard_admin_request, verify_admin_key
 from log_stream import (
+    get_current_request_id,
     get_endpoint_counts,
     get_tool_counts,
     remember_job_tags,
@@ -878,6 +879,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             serializable_ydl_opts, url, proxy_url,
             DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS, temp_id,
             progress_label=video_id or url,
+            request_id=get_current_request_id(),
         )
 
         if result["ok"]:

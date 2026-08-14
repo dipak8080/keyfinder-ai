@@ -21,6 +21,7 @@ wiring is required.
 
 import time
 from config import logger
+from log_stream import write_system_log_direct
 
 # Only log a new line every this many percent, so a fast download doesn't
 # flood the System Logs stream with dozens of near-identical lines a
@@ -34,14 +35,29 @@ PROGRESS_LOG_STEP_PERCENT = 10
 PROGRESS_LOG_MIN_INTERVAL_SECONDS = 3
 
 
-def make_progress_hook(label: str):
+def make_progress_hook(label: str, request_id: str = "-", tool: str = "-", tier: str = "-"):
     """
     Returns a NEW hook function scoped to this specific download (label is
     typically the video_id or URL) - each download gets its own throttle
     state, so concurrent downloads don't interfere with each other's
     "last logged at X%" tracking.
+
+    request_id/tool/tier let a caller running in a SEPARATE PROCESS (i.e.
+    download_worker.py) tag its progress rows for dashboard correlation,
+    since it has no access to this process's contextvars - those live in
+    the parent and don't cross a process boundary. In-process callers (if
+    any ever exist) can simply omit them and get the untagged default.
     """
     state = {"last_logged_percent": -1, "last_logged_time": 0.0}
+
+    def _emit(level: str, message: str):
+        # stdout via logger.info, same as before - still lands in
+        # `docker logs`/journalctl via the inherited fds. This alone is
+        # NOT enough to reach the System Logs dashboard from a subprocess
+        # (BufferLogHandler is only attached in the PARENT process's
+        # logging tree), so a direct DB write is also required.
+        getattr(logger, level.lower(), logger.info)(message)
+        write_system_log_direct(level, "download_progress", message, request_id, tool, tier)
 
     def hook(d):
         try:
@@ -67,7 +83,8 @@ def make_progress_hook(label: str):
                     downloaded_mb = downloaded / 1024 / 1024
                     total_mb = total / 1024 / 1024
 
-                    logger.info(
+                    _emit(
+                        "INFO",
                         f"[DOWNLOAD] {label}: {percent:.0f}% "
                         f"({downloaded_mb:.1f}MB / {total_mb:.1f}MB) "
                         f"- {speed_str} - ETA {eta_str}"
@@ -76,10 +93,10 @@ def make_progress_hook(label: str):
                     state["last_logged_time"] = now
 
             elif status == "finished":
-                logger.info(f"[DOWNLOAD] {label}: 100% complete - post-processing...")
+                _emit("INFO", f"[DOWNLOAD] {label}: 100% complete - post-processing...")
 
             elif status == "error":
-                logger.warning(f"[DOWNLOAD] {label}: download hook reported an error")
+                _emit("WARNING", f"[DOWNLOAD] {label}: download hook reported an error")
 
         except Exception as e:
             logger.warning(f"[DOWNLOAD] Progress hook error (non-fatal): {e}")

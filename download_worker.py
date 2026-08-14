@@ -67,12 +67,22 @@ def main():
     # detection the in-process version had.
     ydl_opts["logger"] = ytdlp_alert_logger
 
-    # Progress hook likewise reconstructed rather than serialized. Only
+# Progress hook likewise reconstructed rather than serialized. Only
     # /download sends progress_label (the chained /youtube/* tools poll
     # job status instead and never had one), so this is skipped for them.
+    # request_id is threaded through so progress rows written from this
+    # subprocess (see download_progress.py's write_system_log_direct call)
+    # group under the same request in the dashboard as everything else
+    # that request logged. tool/tier are hardcoded here since progress_label
+    # is only ever sent by /download, which always tags itself this way.
     progress_label = payload.get("progress_label")
     if progress_label:
-        ydl_opts["progress_hooks"] = [make_progress_hook(progress_label)]
+        ydl_opts["progress_hooks"] = [make_progress_hook(
+            progress_label,
+            request_id=payload.get("request_id", "-"),
+            tool="DOWNLOAD",
+            tier="standard",
+        )]
 
     try:
         info = download_with_fallback(ydl_opts, url, proxy_url)

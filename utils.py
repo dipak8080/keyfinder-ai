@@ -318,6 +318,7 @@ async def run_in_killable_subprocess(
     timeout_seconds: int,
     job_id: str,
     progress_label: str = None,
+    request_id: str = "-",
 ) -> dict:
     """
     Spawns download_worker.py in its own process group, writes ydl_opts+url
@@ -362,6 +363,7 @@ async def run_in_killable_subprocess(
                     # parent already disabled.
                     "breaker_state": export_breaker_state(),
                     "progress_label": progress_label,
+                    "request_id": request_id,
                 },
                 f,
             )

@@ -249,6 +249,68 @@ def _current_tags() -> tuple:
     return (tags.get("tool") or "-", tags.get("tier") or "-")
 
 
+def get_current_request_id() -> str:
+    """Read-only accessor for the current request's id, for callers
+    (routes.py) that need to hand it to a subprocess - the subprocess
+    can't read this process's contextvar directly, so the value has to
+    be captured here and passed explicitly."""
+    return _request_id_ctx.get()
+
+
+def write_system_log_direct(
+    level: str,
+    logger_name: str,
+    message: str,
+    request_id: str = "-",
+    tool: str = "-",
+    tier: str = "-",
+) -> None:
+    """
+    Direct, synchronous system_logs insert for callers OUTSIDE this
+    process's own writer-queue machinery - specifically download_worker.py,
+    which runs as a separate OS process (see utils.run_in_killable_subprocess)
+    and therefore cannot touch this module's in-memory _write_queue or
+    per-thread connections; those are Python objects living only in THIS
+    process's address space and are invisible across a process boundary,
+    same as BufferLogHandler's registration on the root logger.
+
+    Opens and closes a short-lived connection rather than reusing get_db()'s
+    per-thread-kept-forever pattern - that pattern exists to amortize
+    connection setup across a long-running server process, which a
+    downloader subprocess is not. Call volume here is bounded by
+    download_progress.py's own throttling (every ~10% or ~3s), so the
+    per-call overhead is negligible.
+
+    WAL mode (set inside _configure(), which _new_conn() always calls) is
+    what makes this safe to call concurrently with the main process's
+    writer thread - that's the whole reason WAL was enabled in the first
+    place (see fix #10 at the top of this file).
+    """
+    try:
+        conn = _new_conn()
+        try:
+            conn.execute(
+                "INSERT INTO system_logs "
+                "(timestamp, level, logger, message, request_id, tool, tier) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    datetime.utcnow().isoformat(),
+                    level,
+                    logger_name,
+                    message,
+                    request_id,
+                    tool,
+                    tier,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # A logging failure must never break the download itself.
+        pass
+
+
 def new_job_context() -> dict:
     """
     Installs a fresh, empty tag holder for this request. Called by
