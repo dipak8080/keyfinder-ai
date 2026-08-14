@@ -4,8 +4,25 @@ utils.py - Shared low-level helpers used across the app:
 - memory cleanup / temp file cleanup
 - thread pool + run_blocking() for offloading blocking calls
 - safe upload path construction (byte-bounded, no user-controlled bytes)
-- concurrency semaphores + acquire_slot_or_503()
+- concurrency semaphores (all six, app-wide) + acquire_slot_or_503()
 - Camelot wheel / key math
+- killable subprocess for YouTube downloads
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-14): SEMAPHORE CONSOLIDATION
+
+The four route-level semaphores (_separation_semaphore, _audio_tools_
+semaphore, _transcription_semaphore, _midi_semaphore) used to live as
+module-level globals inside routes.py. During the routes/ package
+restructure they moved here, next to the two that already lived here
+(_analysis_semaphore, _download_semaphore) - so there is exactly ONE
+place in the codebase where "how many things can run at once" is
+declared, instead of two. Nothing about how any of the six is used
+changed: same asyncio.Semaphore objects, same import-time construction,
+same acquire/release pattern via `async with` or acquire_slot_or_503().
+routes/_shared.py and every routes/*.py module now import whichever of
+the six they need from here instead of from routes.py.
+--------------------------------------------------------------------------
 """
 import os
 import gc
@@ -19,7 +36,6 @@ import asyncio
 import functools
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
-
 from fastapi import HTTPException
 
 from config import (
@@ -27,13 +43,16 @@ from config import (
     THREAD_POOL_WORKERS,
     MAX_CONCURRENT_ANALYSIS,
     MAX_CONCURRENT_DOWNLOADS,
+    MAX_CONCURRENT_SEPARATIONS,
+    MAX_CONCURRENT_AUDIO_TOOLS,
+    MAX_CONCURRENT_TRANSCRIPTIONS,
+    MAX_CONCURRENT_MIDI,
     QUEUE_WAIT_TIMEOUT_SECONDS,
     YT_COOKIES_PATH_DEFAULT,
     UPLOAD_DIR,
 )
 
 # ========== COOKIES BOOTSTRAP (base64 env var -> real file) ==========
-
 
 def ensure_cookies_file():
     cookies_path = os.environ.get('YT_COOKIES_PATH', YT_COOKIES_PATH_DEFAULT)
@@ -131,6 +150,7 @@ def cleanup_file(filepath):
 # Every blocking call is routed through run_blocking() so the event loop
 # stays free to accept and queue other requests while heavy work happens
 # in a worker thread.
+
 _executor = ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS)
 
 
@@ -219,8 +239,37 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 # of people hit the API at once - it's independent of THREAD_POOL_WORKERS
 # above (that's about not freezing the event loop; this is about not
 # loading many audio files into RAM simultaneously).
+#
+# All six of the app's concurrency pools are declared here, together:
+#   _analysis_semaphore       - /analyze, and the analyze half of
+#                                /youtube/analyze
+#   _download_semaphore       - /download, and the download half of every
+#                                /youtube/* chained route
+#   _separation_semaphore     - Demucs: /separate(-hq), /stems(-hq), and
+#                                their /youtube/* equivalents (moved here
+#                                from routes.py during the routes/ package
+#                                restructure - see this file's own
+#                                "WHAT CHANGED" note above)
+#   _audio_tools_semaphore    - every ffmpeg/rubberband tool (convert,
+#                                trim, volume, pitch, tempo, reverse,
+#                                noise-remove, voice-clean, echo-remove,
+#                                silence-remove, loudnorm, fade, channels,
+#                                resample, ringtone, video-to-audio, join,
+#                                silence-split) (moved here, same as above)
+#   _transcription_semaphore  - Whisper /speech-to-text, on its own pool
+#                                so a slow transcription can't starve
+#                                cheap ffmpeg tools of their slots (moved
+#                                here, same as above)
+#   _midi_semaphore           - /audio-to-midi's HTTP call to the
+#                                midi-worker sidecar, on its own pool for
+#                                the same reason as transcription (moved
+#                                here, same as above)
 _analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+_separation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEPARATIONS)
+_audio_tools_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO_TOOLS)
+_transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+_midi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI)
 
 
 async def acquire_slot_or_503(semaphore: asyncio.Semaphore, what: str):
@@ -279,6 +328,7 @@ def relative_major_of_minor(minor_key: str) -> str:
     idx = PITCH_CLASSES.index(minor_key)
     return PITCH_CLASSES[(idx + 3) % 12]
 
+
 # ========== KILLABLE SUBPROCESS FOR YOUTUBE DOWNLOADS ==========
 # WHY THIS EXISTS: run_blocking() above offloads to a ThreadPoolExecutor,
 # and asyncio.wait_for() timing out on a thread-pool future only abandons
@@ -301,7 +351,6 @@ def relative_major_of_minor(minor_key: str) -> str:
 # would be fragile against yt-dlp internals changing across versions;
 # killing the process group is correct regardless of what yt-dlp does
 # internally.
-
 
 def _worker_script_path() -> str:
     """download_worker.py lives next to this file - resolved relative to
@@ -329,7 +378,7 @@ async def run_in_killable_subprocess(
 
     Returns a plain dict, always - never raises. Callers (routes.py,
     youtube_chain.py) branch on result["ok"]:
-      {"ok": True,  "title": "..."}
+      {"ok": True, "title": "..."}
       {"ok": False, "kind": "timeout" | "too_long" | "crashed" | "error",
        "error": "..."}
     "error" text is what the existing is_permanent_error() /
