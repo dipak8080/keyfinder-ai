@@ -183,7 +183,7 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
             'preferredcodec': 'wav',
             'preferredquality': '192',
         }],
-        'remote_components': {'ejs:github'},
+        'remote_components': ['ejs:github'],
         'logger': ytdlp_alert_logger,
         # No progress_hooks here deliberately - those exist in /download
         # to drive a live download-progress UI on that specific route.

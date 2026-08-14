@@ -848,7 +848,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             'preferredcodec': format,
             'preferredquality': '192',
         }],
-        'remote_components': {'ejs:github'},
+        'remote_components': ['ejs:github'],
         'logger': ytdlp_alert_logger,
         'progress_hooks': [make_progress_hook(video_id or url)],
     }
