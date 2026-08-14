@@ -1381,6 +1381,19 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                 )
                 raise
 
+            if is_proxy_tls_error(error_text):
+                # TLS handshake to this specific proxy exit failed outright
+                # - retrying the SAME exit 2 more times with backoff can't
+                # change a cipher/protocol negotiation that already failed.
+                # Only a fresh proxy session (a different exit) has any
+                # chance. Fail fast instead of burning ~4.5s of pointless
+                # backoff on a guaranteed repeat handshake failure.
+                logger.warning(
+                    f"Attempt {attempt}: TLS handshake failure - not retrying "
+                    f"on the same connection: {error_text}"
+                )
+                raise
+
             if is_format_unavailable_error(error_text):
                 # No format in the manifest matched the player_client list
                 # active for THIS attempt - retrying with the IDENTICAL
