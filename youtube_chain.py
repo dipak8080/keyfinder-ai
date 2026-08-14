@@ -36,7 +36,8 @@ import os
 import uuid
 from typing import Tuple
 
-from config import logger, UPLOAD_DIR
+from config import DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS, logger, UPLOAD_DIR
+from utils import run_in_killable_subprocess
 from youtube import (
     download_with_fallback,
     is_permanent_error,
@@ -89,7 +90,7 @@ def classify_download_error(error_text: str) -> str:
     return f"Could not download this video: {error_text}"
 
 
-def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
+async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     """
     Downloads url as WAV to a local file and returns (file_path, title).
 
@@ -198,13 +199,27 @@ def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         f"circuit_breaker={'OPEN' if not proxy_available() else 'CLOSED'} url={url}"
     )
 
-    try:
-        info = download_with_fallback(ydl_opts, url, proxy_url)
-        title = info.get('title', 'Unknown')
-    except VideoTooLongError as e:
-        raise ChainDownloadError(str(e))
-    except Exception as e:
-        raise ChainDownloadError(classify_download_error(str(e)))
+    # 'logger' is a live object and won't survive a JSON boundary -
+    # download_worker.py reconstructs its own ytdlp_alert_logger
+    # internally. No progress_hooks here (chained tools poll job status
+    # instead), so nothing else needs stripping.
+    serializable_ydl_opts = {k: v for k, v in ydl_opts.items() if k != "logger"}
+
+    result = await run_in_killable_subprocess(
+        serializable_ydl_opts, url, proxy_url,
+        DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS, job_id,
+    )
+
+    if result["ok"]:
+        title = result["title"]
+    elif result["kind"] == "too_long":
+        raise ChainDownloadError(result["error"])
+    elif result["kind"] == "timeout":
+        raise ChainDownloadError("This download is taking too long. Please try again.")
+    elif result["kind"] == "crashed":
+        raise ChainDownloadError(f"Could not download this video: {result['error']}")
+    else:
+        raise ChainDownloadError(classify_download_error(result["error"]))
 
     if not os.path.exists(output_file):
         logger.error(f"[YOUTUBE_CHAIN] Job {job_id}: expected output file not found after download: {output_file}")

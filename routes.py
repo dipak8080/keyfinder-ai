@@ -302,6 +302,7 @@ from utils import (
     cleanup_file,
     release_memory_to_os,
     run_blocking,
+    run_in_killable_subprocess,
     acquire_slot_or_503,
     get_camelot,
     build_safe_upload_path,
@@ -860,28 +861,40 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         f"url={url}"
     )
 
+    # download_worker.py runs in a separate process and reconstructs its
+    # own logger/hooks internally - neither survives a JSON boundary, so
+    # strip them here rather than pass them across.
+    serializable_ydl_opts = {
+        k: v for k, v in ydl_opts.items()
+        if k not in ("logger", "progress_hooks")
+    }
+
     await acquire_slot_or_503(_download_semaphore, "download")
 
     audio_data = None
     succeeded = False
     try:
-        try:
-            info = await asyncio.wait_for(
-                run_blocking(download_with_fallback, ydl_opts, url, proxy_url),
-                timeout=DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
-            )
-            title = info.get('title', 'Unknown')
-        except VideoTooLongError as e:
-            logger.warning(f"[DOWNLOAD] Rejected - video too long: {e}")
-            raise HTTPException(400, str(e))
-        except asyncio.TimeoutError:
+        result = await run_in_killable_subprocess(
+            serializable_ydl_opts, url, proxy_url,
+            DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS, temp_id,
+        )
+
+        if result["ok"]:
+            title = result["title"]
+        elif result["kind"] == "too_long":
+            logger.warning(f"[DOWNLOAD] Rejected - video too long: {result['error']}")
+            raise HTTPException(400, result["error"])
+        elif result["kind"] == "timeout":
             logger.warning(
                 f"[DOWNLOAD] Wall-clock timeout ({DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS}s) - "
-                f"aborting to free the download slot: {url}"
+                f"process group killed, slot freed: {url}"
             )
             raise HTTPException(503, "This download is taking too long. Please try again.")
-        except Exception as e:
-            error_text = str(e)
+        elif result["kind"] == "crashed":
+            logger.error(f"[DOWNLOAD] Worker process crashed: {result['error']}")
+            raise HTTPException(500, f"Failed: {result['error']}")
+        else:
+            error_text = result["error"]
 
             # Each branch below maps a yt-dlp failure onto the status code
             # that actually describes it. This matters more than it looks:
@@ -2863,17 +2876,11 @@ async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Opti
         await acquire_slot_or_503(_download_semaphore, f"{tool.lower()}-download")
         acquired = True
         started = time.monotonic()
-        try:
-            file_path, title = await asyncio.wait_for(
-                run_blocking(download_audio_to_file, url, job_id),
-                timeout=DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[{tool}] job={job_id} wall-clock timeout "
-                f"({DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS}s) - aborting"
-            )
-            raise ChainDownloadError("This download is taking too long. Please try again.")
+        # download_audio_to_file is now `async def` and handles its own
+        # wall-clock timeout internally via run_in_killable_subprocess -
+        # the outer asyncio.wait_for/run_blocking wrapping is gone since
+        # a killed process group needs no further guarding here.
+        file_path, title = await download_audio_to_file(url, job_id)
         logger.info(
             f"[{tool}] job={job_id} downloaded '{title}' in {time.monotonic() - started:.1f}s"
         )

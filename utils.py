@@ -9,6 +9,9 @@ utils.py - Shared low-level helpers used across the app:
 """
 import os
 import gc
+import sys
+import json
+import signal
 import ctypes
 import base64
 import gzip
@@ -26,6 +29,7 @@ from config import (
     MAX_CONCURRENT_DOWNLOADS,
     QUEUE_WAIT_TIMEOUT_SECONDS,
     YT_COOKIES_PATH_DEFAULT,
+    UPLOAD_DIR,
 )
 
 # ========== COOKIES BOOTSTRAP (base64 env var -> real file) ==========
@@ -274,3 +278,140 @@ def relative_major_of_minor(minor_key: str) -> str:
     """A minor's relative major is C major, etc. (major tonic = minor tonic + 3 semitones)."""
     idx = PITCH_CLASSES.index(minor_key)
     return PITCH_CLASSES[(idx + 3) % 12]
+
+# ========== KILLABLE SUBPROCESS FOR YOUTUBE DOWNLOADS ==========
+# WHY THIS EXISTS: run_blocking() above offloads to a ThreadPoolExecutor,
+# and asyncio.wait_for() timing out on a thread-pool future only abandons
+# the AWAIT - the thread itself keeps running to completion, since Python
+# has no way to forcibly kill a thread. Confirmed in production 2026-08-14:
+# a /download request logged its 180s wall-clock timeout at 4:51:04, then
+# the SAME extract_info attempt (started at 4:48:08) logged its own
+# failure at 4:55:26 - over 4 minutes AFTER the app had already released
+# the semaphore slot and returned a 503 to the user. That gap is yt-dlp's
+# PO-token (Node) / JS-challenge (Deno) subprocesses still running,
+# unsupervised, still consuming a proxy connection, still holding a
+# thread-pool worker - all invisible to the rest of the app, which had
+# already moved on.
+#
+# This runs the ENTIRE download_with_fallback() call in its own OS
+# process instead, so a timeout can SIGKILL the whole process GROUP
+# (worker + every child it spawned) rather than politely giving up on
+# waiting for a thread. Deliberately isolates the WHOLE call rather than
+# hunting for yt-dlp's specific PO-token/JS-challenge child PIDs - that
+# would be fragile against yt-dlp internals changing across versions;
+# killing the process group is correct regardless of what yt-dlp does
+# internally.
+
+
+def _worker_script_path() -> str:
+    """download_worker.py lives next to this file - resolved relative to
+    utils.py's own location rather than assuming a fixed working
+    directory, so this doesn't break if the process is ever launched from
+    a different cwd."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_worker.py")
+
+
+async def run_in_killable_subprocess(
+    ydl_opts_serializable: dict,
+    url: str,
+    proxy_url: str,
+    timeout_seconds: int,
+    job_id: str,
+) -> dict:
+    """
+    Spawns download_worker.py in its own process group, writes ydl_opts+url
+    to a temp input file on UPLOAD_DIR (same disk every other temp file in
+    this app already uses - not /tmp, which may be a different mount and
+    isn't cleaned up by any of this app's existing TTL/cleanup logic),
+    waits up to timeout_seconds.
+
+    Returns a plain dict, always - never raises. Callers (routes.py,
+    youtube_chain.py) branch on result["ok"]:
+      {"ok": True,  "title": "..."}
+      {"ok": False, "kind": "timeout" | "too_long" | "crashed" | "error",
+       "error": "..."}
+    "error" text is what the existing is_permanent_error() /
+    is_bot_check_error() / etc. classification chain in youtube.py should
+    be run against downstream - unchanged from what str(e) used to
+    provide, so nothing in that classification logic needs to change.
+
+    ydl_opts_serializable must NOT contain the 'logger' object or
+    'progress_hooks' closures - those don't survive a JSON boundary. The
+    caller strips them before calling this; download_worker.py
+    reconstructs its own ytdlp_alert_logger internally.
+    """
+    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_in.json")
+    output_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_out.json")
+
+    try:
+        with open(input_path, "w") as f:
+            json.dump(
+                {"ydl_opts": ydl_opts_serializable, "url": url, "proxy_url": proxy_url},
+                f,
+            )
+    except Exception as e:
+        logger.error(f"[DOWNLOAD_WORKER] job={job_id} failed to write input file: {e}")
+        return {"ok": False, "kind": "error", "error": f"Failed to prepare download: {e}"}
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, _worker_script_path(), input_path, output_path,
+            start_new_session=True,  # own process group - required for killpg below
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            # Kill the WHOLE process group, not just proc.pid - the worker's
+            # Node/Deno/ffmpeg children are what actually keep burning
+            # proxy bandwidth and CPU after a timeout, and they don't die
+            # just because their parent does. start_new_session=True above
+            # is what makes killpg() valid here.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                logger.warning(
+                    f"[DOWNLOAD_WORKER] job={job_id} exceeded {timeout_seconds}s - "
+                    f"killed process group {proc.pid} (worker + any Node/Deno/ffmpeg children)"
+                )
+            except ProcessLookupError:
+                # Process already exited between the timeout firing and us
+                # trying to kill it - harmless race, nothing left to kill.
+                pass
+            return {"ok": False, "kind": "timeout", "error": "Download timed out."}
+
+        if proc.returncode != 0:
+            stderr_text = (stderr or b"").decode(errors="replace")[-2000:]
+            logger.error(
+                f"[DOWNLOAD_WORKER] job={job_id} exited with code {proc.returncode}: {stderr_text}"
+            )
+            return {
+                "ok": False,
+                "kind": "crashed",
+                "error": f"Downloader process crashed unexpectedly (exit {proc.returncode}).",
+            }
+
+        try:
+            with open(output_path) as f:
+                result = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            stderr_text = (stderr or b"").decode(errors="replace")[-2000:]
+            logger.error(
+                f"[DOWNLOAD_WORKER] job={job_id} produced no valid output file: {e}. "
+                f"stderr: {stderr_text}"
+            )
+            return {
+                "ok": False,
+                "kind": "crashed",
+                "error": "Downloader process did not return a result.",
+            }
+
+        return result
+
+    finally:
+        cleanup_file(input_path)
+        cleanup_file(output_path)

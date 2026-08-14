@@ -651,6 +651,26 @@ def is_proxy_quota_error(error_text: str) -> bool:
     return any(marker in normalized for marker in PROXY_QUOTA_ERROR_MARKERS)
 
 
+# Errors meaning the TLS handshake to the proxy (or through it to the
+# destination) failed outright - a cipher/protocol mismatch, not a
+# YouTube-side bot-check or block. Retrying the SAME proxy exit 2 more
+# times with backoff produces the identical handshake failure every time
+# (nothing about the negotiation changes between sleeps) - only a
+# different exit (a new proxy session) has any chance. Narrow and
+# specific on purpose: "ssl: " is broad enough to catch most OpenSSL
+# error strings without accidentally matching unrelated text.
+PROXY_TLS_ERROR_MARKERS = (
+    "sslv3_alert_handshake_failure",
+    "ssl: ",
+    "handshake failure",
+)
+
+
+def is_proxy_tls_error(error_text: str) -> bool:
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in PROXY_TLS_ERROR_MARKERS)
+
+
 # ---------- PROXY CIRCUIT BREAKER ----------
 # In-memory, per-instance (same pattern as monitoring.py). Once tripped,
 # proxy_available() returns False until the cooldown passes, so
