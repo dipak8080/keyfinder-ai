@@ -7,6 +7,37 @@ move: every docstring, comment, and line of logic here is unchanged from
 its original location, with exactly ONE deliberate wiring change - see
 the "DELIBERATE WRINKLE" note below on admin_endpoints(). Everything else
 is unchanged behaviour.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-15): SPLIT-TUNNEL OBSERVABILITY + AN EVENT-LOOP FIX
+
+1. /admin/status now reports a "split_tunnel" block (see
+   split_breaker_status() in youtube.py). Without it the split tunnel's
+   three new path counters - proxy_extract, direct_media, proxy_media -
+   arrive in "paths" with no context: no way to tell whether the feature
+   is even enabled, whether a sticky session is pinned, or whether the
+   health breaker has silently reverted to full-proxy downloads. That
+   last case is the dangerous one, because a silent revert is
+   indistinguishable from "the savings just stopped" unless something
+   states it explicitly.
+
+2. POST /admin/reset-split-breaker, mirroring the existing
+   /admin/reset-proxy-botcheck and /admin/reset-cdn-breaker.
+
+3. BUG FIX, unrelated to the above and older than it: the midi-worker
+   health probe called requests.get(..., timeout=3) DIRECTLY inside this
+   async handler. requests is synchronous, so that call blocked the
+   event loop - the entire server, every concurrent connection - for up
+   to 3 seconds whenever the sidecar was slow or unreachable. This is
+   precisely the failure class the codebase already guards against
+   everywhere else via utils.run_blocking() (see its docstring, and the
+   "must always be called via run_blocking" warnings throughout
+   youtube.py and audio_analysis.py). The probe was the one place it was
+   missed - and it is a probe that runs exactly when the sidecar is
+   already unhealthy, i.e. exactly when the server can least afford to
+   stall. Now dispatched through run_blocking like every other blocking
+   call in the app.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -31,6 +62,7 @@ from config import (
     MAX_CONCURRENT_SEPARATIONS,
     MIDI_WORKER_URL,
 )
+from utils import run_blocking
 from youtube import (
     proxy_available,
     reset_proxy_circuit_breaker,
@@ -41,6 +73,8 @@ from youtube import (
     get_account_health,
     get_path_stats,
     get_cookie_accounts,
+    split_breaker_status,
+    reset_split_breaker,
 )
 from cache import clear_cache, set_cache_max_gb, get_cache_stats
 from monitoring import get_status_snapshot
@@ -382,6 +416,51 @@ async def admin_reset_proxy_botcheck(request: Request, key: str = Query(...)):
     return {"status": "proxy bot-check breaker reset - escalation re-enabled"}
 
 
+@router.post("/admin/reset-split-breaker")
+async def admin_reset_split_breaker(request: Request, key: str = Query(...)):
+    """
+    Clears the split-tunnel health breaker immediately instead of waiting
+    out SPLIT_TUNNEL_COOLDOWN_SECONDS.
+
+    Use after changing whatever the breaker was reacting to - pinning a
+    sticky session in YT_PROXY_URL, switching proxy provider, raising
+    YT_MEDIA_SOCKET_TIMEOUT - so the new setup gets measured on its own
+    merits rather than serving out a cooldown earned by the old one.
+    Exactly the same purpose and shape as /admin/reset-proxy-botcheck
+    above; the breaker it resets just happens to govern bandwidth spend
+    rather than escalation.
+    """
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    reset_split_breaker()
+    return {"status": "split-tunnel health breaker reset - direct media re-enabled"}
+
+
+def _probe_midi_worker() -> dict:
+    """
+    Blocking midi-worker health probe, dispatched via run_blocking from
+    admin_status().
+
+    MUST NOT be called directly from async code. `requests` is fully
+    synchronous, so calling it inline in an async handler blocks the
+    event loop - and therefore every other in-flight connection - for
+    the full timeout. That is not theoretical here: this probe fires
+    precisely when the sidecar is slow or down, which is exactly the
+    moment the rest of the server can least afford a 3-second stall.
+    Same threading rule as every other blocking call in this codebase
+    (see utils.run_blocking's docstring).
+
+    Errors are swallowed and returned as data rather than raised: a
+    health probe must never be able to take down the status endpoint
+    that reports on everything else.
+    """
+    try:
+        health = requests.get(f"{MIDI_WORKER_URL}/health", timeout=3).json()
+        return {"reachable": True, **health}
+    except Exception as e:
+        return {"reachable": False, "error": str(e)[:200]}
+
+
 @router.get("/admin/status")
 async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
@@ -398,11 +477,31 @@ async def admin_status(request: Request, key: str = Query(...)):
     # this server's IP to unreachable googlevideo edges and downloads are
     # being sent straight to the proxy - which means proxy spend is
     # temporarily higher, and is the number to watch if the bill moves.
+    #
+    # As of 2026-08-15 this breaker is fed ONLY by genuine connect
+    # timeouts. It used to be fed by read timeouts too, which meant a
+    # merely SLOW transfer counted as an unreachable edge - three of them
+    # in five minutes forced every subsequent download onto the proxy,
+    # so slow transfers were manufacturing proxy spend. See
+    # is_cdn_read_timeout_error() in youtube.py for the full writeup.
     snapshot["cdn"] = cdn_breaker_status()
     # Per-path success rates. Answers "is the proxy actually working?"
     # and "did that proxy config change help?" - both previously
     # unanswerable without reading raw logs.
+    #
+    # With YT_SPLIT_TUNNEL=1 this grows three buckets beyond
+    # direct/proxy: proxy_extract (phase 1 through the proxy),
+    # direct_media (phase 2 direct - the bytes no longer being paid for),
+    # and proxy_media (phase 2 fallback). direct_media.success_rate is
+    # the single number that says whether the split tunnel is working.
     snapshot["paths"] = get_path_stats()
+    # The context those raw counters can't carry: whether the feature is
+    # enabled at all, whether a sticky session is pinned (without one the
+    # media fallback can land on a different exit IP and 403 on a signed
+    # URL), and whether the health breaker has reverted to full-proxy
+    # downloads. That last one is why this block exists - a silent revert
+    # is otherwise indistinguishable from "the savings stopped".
+    snapshot["split_tunnel"] = split_breaker_status()
     snapshot["cookies"] = {
         "accounts_available": len(get_cookie_accounts()),
         # Per-account detail, including WHICH phase each account last
@@ -423,11 +522,9 @@ async def admin_status(request: Request, key: str = Query(...)):
     # the admin panel and only shows up as a run of failed jobs with a
     # generic message. Short timeout, fully swallowed errors - a health
     # probe must never be able to take down the status endpoint itself.
-    try:
-        _midi_health = requests.get(f"{MIDI_WORKER_URL}/health", timeout=3).json()
-        snapshot["midi_worker"] = {"reachable": True, **_midi_health}
-    except Exception as e:
-        snapshot["midi_worker"] = {"reachable": False, "error": str(e)[:200]}
+    # Dispatched via run_blocking: see _probe_midi_worker's docstring for
+    # why calling requests.get() inline here was freezing the event loop.
+    snapshot["midi_worker"] = await run_blocking(_probe_midi_worker)
 
     snapshot["cache"] = {
         "enabled": True,

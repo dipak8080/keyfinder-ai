@@ -196,6 +196,7 @@ from youtube import (
     is_not_yet_live_error,
     is_permanent_error,
     is_cdn_connect_timeout_error,
+    is_cdn_read_timeout_error,
     is_valid_youtube_url,
     extract_video_id,
     proxy_available,
@@ -317,7 +318,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         # over. 10s is still generous for a genuinely slow-but-working
         # connection; it is not so low that it risks false-failing normal
         # requests under typical latency.
-        'socket_timeout': 10,
+        'socket_timeout': 20,
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
@@ -446,7 +447,7 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     "Please try again in a few minutes."
                 )
 
-            if is_cdn_connect_timeout_error(error_text):
+            if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text):
                 # A connect-timeout to a specific googlevideo media edge.
                 # should_use_proxy() DOES escalate this to the proxy tier
                 # (see its docstring in youtube.py for the back-and-forth

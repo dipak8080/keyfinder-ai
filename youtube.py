@@ -138,6 +138,24 @@ SPLIT_TUNNEL_MIN_SUCCESS_RATE = float(os.environ.get("YT_SPLIT_MIN_SUCCESS_RATE"
 SPLIT_TUNNEL_WINDOW_SECONDS = int(os.environ.get("YT_SPLIT_WINDOW_SECONDS", str(60 * 60)))
 SPLIT_TUNNEL_COOLDOWN_SECONDS = int(os.environ.get("YT_SPLIT_COOLDOWN_SECONDS", str(30 * 60)))
 
+# Socket timeout for the MEDIA phase specifically, deliberately HIGHER
+# than the 10s /download sets globally.
+#
+# CONFIRMED IN PRODUCTION 2026-08-15 09:28: a download died on
+#   "[download] Got error: HTTPSConnectionPool(host='rr1---sn-...
+#    googlevideo.com', port=443): Read timed out. (read timeout=10.0)"
+# That is socket_timeout=10 being applied as a READ timeout partway
+# through a media transfer. It is the right value for the EXTRACTION
+# phase (a dead edge should fail in 10s, not 20s - that is why it was
+# lowered on 2026-08-05) and the wrong value for the media phase, where
+# it kills legitimate slow transfers through a residential exit.
+#
+# The real ceiling on a runaway media fetch is
+# DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS in the parent, which SIGKILLs the
+# whole process group. That is the bound this phase should rely on - not
+# a read timeout tuned for a completely different failure mode.
+MEDIA_SOCKET_TIMEOUT_SECONDS = int(os.environ.get("YT_MEDIA_SOCKET_TIMEOUT", "30"))
+
 
 def _sticky_proxy_url(proxy_url: Optional[str], session_id: str) -> Optional[str]:
     """
@@ -690,7 +708,57 @@ def is_cdn_connect_timeout_error(error_text: str) -> bool:
         proxy tier the caller escalates to next) has any chance.
     """
     normalized = _normalize_error_text(error_text)
-    return "googlevideo.com" in normalized and "timed out" in normalized
+    return (
+        "googlevideo.com" in normalized
+        and "timed out" in normalized
+        # EXCLUDES read timeouts as of 2026-08-15 - see
+        # is_cdn_read_timeout_error() below for why conflating the two
+        # was actively inflating proxy spend.
+        and "read timed out" not in normalized
+    )
+
+
+def is_cdn_read_timeout_error(error_text: str) -> bool:
+    """
+    True if the connection to a googlevideo edge SUCCEEDED and then
+    stalled mid-transfer ("Read timed out. (read timeout=10.0)").
+
+    WHY THIS IS SPLIT OUT FROM is_cdn_connect_timeout_error - this was
+    one classifier until 2026-08-15, and merging them had a real cost:
+
+      A CONNECT timeout means the edge is unreachable. Nothing this
+      server does fixes it, retrying is pointless, and clustering them
+      is genuine evidence the direct path is dead - which is exactly
+      what record_cdn_timeout()'s degradation breaker is built on.
+
+      A READ timeout means the edge answered and the bytes were simply
+      slower than socket_timeout. That is a THROUGHPUT problem, not a
+      reachability one. Retrying can work. And crucially, it is also
+      the expected failure shape for a slow residential proxy exit
+      carrying a multi-MB file.
+
+    Because both matched the same function, every slow transfer was
+    counted as a dead edge. Three of them inside
+    CDN_DEGRADED_WINDOW_SECONDS tripped the direct-path breaker, which
+    routes EVERY subsequent download straight to the proxy for
+    CDN_DEGRADED_COOLDOWN_SECONDS. Slow transfers were therefore
+    manufacturing proxy spend - and the slower the proxy got under load,
+    the more traffic the breaker pushed onto it. A feedback loop with
+    the bill on the wrong side of it.
+
+    Handling now differs in two places and only two:
+      - record_cdn_timeout() is NOT called (this is not evidence the
+        direct path is unreachable)
+      - the fail-fast branch in extract_info_with_retry does not fire,
+        so a stalled transfer gets its normal backoff retries
+
+    should_use_proxy() deliberately still returns True for this shape -
+    a different exit frequently lands on a faster edge, and changing
+    escalation behaviour here would alter the success rate, which is not
+    what this fix is for.
+    """
+    normalized = _normalize_error_text(error_text)
+    return "googlevideo.com" in normalized and "read timed out" in normalized
 
 
 def is_media_phase_error(error_text: str) -> bool:
@@ -840,6 +908,11 @@ def should_use_proxy(error_text: str) -> bool:
         is_ip_block_error(error_text)
         or is_bot_check_error(error_text)
         or is_cdn_connect_timeout_error(error_text)
+        # Kept escalating, same as before the connect/read split - see
+        # is_cdn_read_timeout_error()'s docstring. Only the breaker and
+        # fail-fast behaviour changed; escalation is untouched so the
+        # success rate is unaffected.
+        or is_cdn_read_timeout_error(error_text)
     )
 
 
@@ -1945,9 +2018,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             # a timeout. youtube_chain.py's opts set no socket_timeout at
             # all (only routes/youtube.py's /download does), so this is
             # the one place that guarantees a floor for both callers.
-            media_opts["socket_timeout"] = min(
-                media_opts.get("socket_timeout") or 10, 10
-            )
+            media_opts["socket_timeout"] = MEDIA_SOCKET_TIMEOUT_SECONDS
 
         try:
             result = extract_info_with_retry(proxied_opts, url, media_opts)
