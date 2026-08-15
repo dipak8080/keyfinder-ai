@@ -160,6 +160,44 @@ SCHEMA CHANGE (2026-08-10): TOOL / TIER IDENTITY
      it. Until routes.py calls set_job_context(), tool/tier will simply
      be "-" on every row, same as request_id defaults to "-" for lines
      with no request in flight.
+
+RELIABILITY PASS (2026-08-15): DELTA CURSOR SEEDING
+ 15. The frontend's delta pollers (fetchHttpDelta / fetchSystemDelta)
+     refuse to fire while their cursor (httpLastIdRef / sysLastIdRef) is
+     0, and previously that cursor was ONLY set from the newest row of a
+     full/paged fetch - i.e. only when that fetch actually matched at
+     least one row. Any filter combination that legitimately matched
+     zero rows at the moment it was applied (a tool/tier filter before
+     that tool's first job of the day, a search term, a fresh empty
+     table right after "Delete all logs") left the cursor permanently at
+     0. Delta polling for that filter was then dead forever - matching
+     rows that arrived afterwards never appeared - until something else
+     (manual Refresh, a tab switch, changing the filter again) forced a
+     full refetch and re-seeded it by accident.
+
+     Both data endpoints now also return `max_id`: the newest id in the
+     table, computed WITHOUT any of the request's filters applied. The
+     frontend seeds its cursor from max(newest-matching-row, max_id), so
+     even a zero-match response gives it a valid, meaningful cursor -
+     "everything up to here has already been considered and didn't
+     match" - and delta polling keeps working correctly the instant
+     something new does match.
+
+     This also means the after_id (delta) branch can now legitimately be
+     asked to resume from id 0 on a fresh table, which previously wasn't
+     a state the frontend could produce. That branch ignores `limit` by
+     design (a 3s poll should never be capped mid-page), which is fine
+     for the normal few-rows-since-last-tick case but would return the
+     ENTIRE table if ever asked from 0. Capped at _DELTA_MAX with a
+     `truncated` flag so the frontend can detect it and fall back to a
+     normal paged fetch instead of silently splicing a truncated slice
+     onto its in-memory list.
+
+     Also added a small TTL cache around the filtered_total/total
+     COUNT(*) queries (_cached_count), the same fix #12 already applied
+     to the status counters - these two counts were added after that
+     pass and had quietly reintroduced the same per-poll full-scan cost,
+     including on LIKE-based filters that can't use an index.
 --------------------------------------------------------------------------
 """
 
@@ -842,6 +880,44 @@ _COUNTS_TTL = 2.0  # seconds
 _counts_lock = threading.Lock()
 _counts_cache: dict = {"at": 0.0, "val": None}
 
+# ---------- FILTERED-COUNT CACHE (fix #15) ----------
+# get_http_logs()/get_system_logs() each run a filtered_total COUNT(*)
+# (and get_system_logs also runs an unfiltered `total` COUNT) on every
+# single request - including every 3s poll tick, per open tab. Some of
+# those clauses are LIKE-based (`q` search) and can't use an index, so
+# under a handful of open dashboard tabs this was a real, avoidable scan
+# cost repeating every few seconds for a number that moves by single
+# digits between ticks. Same shape as fix #12's _status_counts cache,
+# generalised to arbitrary WHERE clauses via a (table, clause, params)
+# key.
+_FILTERED_COUNT_TTL = 2.0
+_filtered_count_lock = threading.Lock()
+_filtered_count_cache: dict = {}
+
+
+def _cached_count(conn, table: str, clause: str, params: tuple) -> int:
+    """COUNT(*) under the current filter set, memoised for a couple of
+    seconds. `table` is interpolated rather than parameterised because
+    SQLite can't parameterise identifiers and every call site passes a
+    literal ("request_logs" or "system_logs"), never request data."""
+    key = (table, clause, params)
+    now = time.monotonic()
+    with _filtered_count_lock:
+        hit = _filtered_count_cache.get(key)
+        if hit is not None and (now - hit[0]) < _FILTERED_COUNT_TTL:
+            return hit[1]
+    val = conn.execute(
+        f"SELECT COUNT(*) AS c FROM {table}{clause}", params
+    ).fetchone()["c"]
+    with _filtered_count_lock:
+        # Bounded: each distinct filter combination is its own key, and a
+        # user fiddling with filters generates new ones faster than old
+        # ones expire. Reset rather than let this grow unbounded.
+        if len(_filtered_count_cache) > 200:
+            _filtered_count_cache.clear()
+        _filtered_count_cache[key] = (now, val)
+    return val
+
 
 def _invalidate_counts() -> None:
     with _counts_lock:
@@ -857,6 +933,11 @@ def _invalidate_counts() -> None:
     with _tool_counts_lock:
         _tool_counts_cache["at"] = 0.0
         _tool_counts_cache["val"] = None
+    # Same reasoning, for the filtered_total/total caches used by the
+    # data endpoints - a deletion invalidates every filter combination
+    # currently cached, since the underlying table just changed.
+    with _filtered_count_lock:
+        _filtered_count_cache.clear()
 
 
 # ---------- PER-ENDPOINT TOTALS ----------
@@ -1048,6 +1129,18 @@ def _status_counts(conn) -> dict:
     return val
 
 
+# Hard cap on the after_id (delta) branch of both data endpoints.
+# `after_id` deliberately ignores `limit` - correct for a 3-second poll
+# returning a handful of rows, catastrophic if a client ever asks from a
+# low/zero cursor, which is the entire table in one response. The
+# frontend can now legitimately hold a cursor of 0 on a fresh table or a
+# zero-match filter (see fix #15 above), so this went from theoretical to
+# reachable. Capped, and the response says so via `truncated` so the
+# client re-seeds from a normal page instead of splicing a truncated
+# middle onto its in-memory list.
+_DELTA_MAX = 2000
+
+
 @router.get("/admin/logs/http/data")
 def get_http_logs(
     request: Request,
@@ -1082,7 +1175,9 @@ def get_http_logs(
     Filtering in SQL means the answer doesn't depend on how far someone
     has scrolled. `filtered_total` is returned alongside so the UI can
     say how many rows actually match, rather than how many happen to be
-    in memory.
+    in memory. `max_id` is returned so the client's delta-poll cursor can
+    always be seeded, even when this particular query matches nothing -
+    see fix #15 at the top of this file.
 
     Date filtering takes explicit `since`/`until` UTC timestamps rather
     than a "today"/"yesterday" keyword: the dashboard displays Nepal
@@ -1159,12 +1254,18 @@ def get_http_logs(
             parts.append(extra)
         return (" WHERE " + " AND ".join(parts)) if parts else ""
 
+    truncated = False
     with get_db() as conn:
         if after_id is not None:
+            # LIMIT + 1 so we can distinguish "exactly at the cap" from
+            # "more behind it" without a second query.
             rows = conn.execute(
-                f"SELECT * FROM request_logs{_clause('id > ?')} ORDER BY id ASC",
-                (*params, after_id),
+                f"SELECT * FROM request_logs{_clause('id > ?')} ORDER BY id ASC LIMIT ?",
+                (*params, after_id, _DELTA_MAX + 1),
             ).fetchall()
+            if len(rows) > _DELTA_MAX:
+                rows = rows[:_DELTA_MAX]
+                truncated = True
         elif before_id is not None:
             rows = conn.execute(
                 f"SELECT * FROM request_logs{_clause('id < ?')} ORDER BY id DESC LIMIT ?",
@@ -1180,15 +1281,29 @@ def get_http_logs(
         # Without this the UI can only report "showing N of what's
         # loaded", which is the number that was misleading in the first
         # place.
-        filtered_total = conn.execute(
-            f"SELECT COUNT(*) AS c FROM request_logs{_clause()}", tuple(params)
-        ).fetchone()["c"]
+        filtered_total = _cached_count(conn, "request_logs", _clause(), tuple(params))
+
+        # Newest id in the table, IGNORING every filter. This exists for
+        # one specific reason: the client seeds its delta-poll cursor
+        # from the newest row it received, and a filter matching nothing
+        # gives it nothing to seed from - leaving the cursor at 0, which
+        # its delta poller treats as "not ready" and refuses to send.
+        # Delta polling then stayed permanently dead for that filter and
+        # later matching rows never arrived. max_id is the correct
+        # starting point in that case: every row up to it has already
+        # been considered by this query and didn't match, so there's
+        # nothing before it worth re-asking for. See fix #15.
+        max_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM request_logs"
+        ).fetchone()["m"]
 
         counts = _status_counts(conn)
 
     return JSONResponse({
         **counts,
         "filtered_total": filtered_total,
+        "max_id": max_id,
+        "truncated": truncated,
         "logs": [dict(r) for r in rows],
     })
 
@@ -1337,11 +1452,15 @@ def get_system_logs(
                 parts.append(extra)
             return (" WHERE " + " AND ".join(parts)) if parts else ""
 
+        truncated = False
         if after_id is not None:
             rows = conn.execute(
-                f"SELECT * FROM system_logs{_clause('id > ?')} ORDER BY id ASC",
-                (*params, after_id),
+                f"SELECT * FROM system_logs{_clause('id > ?')} ORDER BY id ASC LIMIT ?",
+                (*params, after_id, _DELTA_MAX + 1),
             ).fetchall()
+            if len(rows) > _DELTA_MAX:
+                rows = rows[:_DELTA_MAX]
+                truncated = True
             logs = [dict(r) for r in rows]
         elif before_id is not None:
             rows = conn.execute(
@@ -1356,12 +1475,22 @@ def get_system_logs(
             ).fetchall()
             logs = [dict(r) for r in rows][::-1]  # oldest -> newest, for chronological display
 
-        total = conn.execute("SELECT COUNT(*) as c FROM system_logs").fetchone()["c"]
-        filtered_total = conn.execute(
-            f"SELECT COUNT(*) as c FROM system_logs{_clause()}", tuple(params)
-        ).fetchone()["c"]
+        total = _cached_count(conn, "system_logs", "", ())
+        filtered_total = _cached_count(conn, "system_logs", _clause(), tuple(params))
+        # See get_http_logs for why this is unfiltered and why it
+        # matters - it's what lets the client seed a valid delta cursor
+        # even when this particular query matched zero rows.
+        max_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM system_logs"
+        ).fetchone()["m"]
 
-    return JSONResponse({"total": total, "filtered_total": filtered_total, "logs": logs})
+    return JSONResponse({
+        "total": total,
+        "filtered_total": filtered_total,
+        "max_id": max_id,
+        "truncated": truncated,
+        "logs": logs,
+    })
 
 
 async def _system_log_event_generator():
