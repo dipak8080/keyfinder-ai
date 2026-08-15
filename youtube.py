@@ -1774,6 +1774,37 @@ def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict]
                 )
                 raise
 
+            if is_cdn_read_timeout_error(error_text):
+                # ADDED 2026-08-15, after a real production timeout: a read
+                # timeout mid-DOWNLOAD (not just extraction) was falling
+                # through to the generic retry path, which re-runs the
+                # WHOLE extract+download cycle from scratch up to
+                # YT_DLP_MAX_ATTEMPTS times. On a multi-MB file that is
+                # real transfer time paid 2-3x over, on top of retry
+                # overhead - confirmed hitting
+                # DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS=180 and getting
+                # SIGKILLed, turning a slow-but-recoverable transfer into a
+                # guaranteed failure.
+                #
+                # Fails fast here, same shape as the connect-timeout branch
+                # above, so download_with_fallback moves straight to the
+                # proxy tier after one attempt instead of three full
+                # download attempts. Does NOT call record_cdn_timeout() -
+                # this is deliberately not fed to the CDN degradation
+                # breaker (see is_cdn_read_timeout_error's docstring): a
+                # slow transfer is not evidence the direct path is
+                # unreachable, only that this one attempt was slow.
+                # should_use_proxy() still escalates this error shape, so
+                # the retry happens - just via the OTHER path instead of
+                # burning the wall clock on more attempts down this one.
+                logger.warning(
+                    f"Attempt {attempt}: read timeout mid-transfer on a "
+                    f"googlevideo edge - not retrying the full "
+                    f"download/extraction cycle, handing off to "
+                    f"account rotation/proxy instead: {error_text}"
+                )
+                raise
+
             if is_proxy_tls_error(error_text):
                 # TLS handshake to this specific proxy exit failed outright
                 # - retrying the SAME exit 2 more times with backoff can't
