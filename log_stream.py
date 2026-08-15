@@ -12,7 +12,7 @@ Mount points (added to main.py):
   GET  /admin/logs/http/data           -> JSON snapshot (for initial page load)
   DELETE /admin/logs                   -> clear old logs (HTTP + system)
 
-All endpoints require ?key=<ADMIN_STATUS_KEY> to match your existing admin key.
+All endpoints requires ?key=<ADMIN_STATUS_KEY> to match your existing admin key.
 
 IMPORTANT: for the /stream (SSE) endpoints to actually be live rather than
 buffered, nginx needs `proxy_buffering off;` on those specific routes - see
