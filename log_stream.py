@@ -198,10 +198,65 @@ RELIABILITY PASS (2026-08-15): DELTA CURSOR SEEDING
      to the status counters - these two counts were added after that
      pass and had quietly reintroduced the same per-poll full-scan cost,
      including on LIKE-based filters that can't use an index.
+
+CORRECTNESS PASS (2026-08-15b): SEARCH, ESCAPING, COUNTS
+ 16. Searching "500" returned three 500s and two unrelated 200s. The
+     rows were real and the filter was working exactly as written - `q`
+     ORs across request_id, and request_id is 8 hex characters, so "500"
+     is a perfectly valid substring of one. The match was a coincidence
+     of encoding, not intent: nobody typing a number into a log search
+     means "find this digit sequence inside a hex id." A numeric search
+     term now skips request_id and tool entirely (tool tags are
+     alphabetic and can never match digits anyway), leaving path,
+     client_ip, method and the exact status_code match. Same change on
+     the System tab's `q`, where the hex collision is the only effect
+     since there's no status_code column there.
+
+ 17. LIKE wildcards in user input were taken literally as wildcards.
+     Searching for "_" matched every row, and any path segment
+     containing "_" in a `family` or `job_id` filter silently
+     over-matched, because "_" is LIKE's single-character wildcard.
+     Every user-supplied LIKE pattern is now escaped and every LIKE
+     carries ESCAPE '\\'. Same treatment for NOISE_PATH_MARKERS, which
+     contains literal underscores.
+
+ 18. `DELETE FROM request_logs` with no WHERE triggers SQLite's truncate
+     optimization, and cursor.rowcount is not reliable under it - "Delete
+     all logs" could report "Removed 0 entries" after deleting 815. Both
+     branches now COUNT(*) first and report that number, which is true
+     regardless of which delete path SQLite takes.
+
+ 19. Deleting logs left the WAL file at whatever size it had grown to,
+     which on a VPS already at ~69% disk is the opposite of what someone
+     pressing Delete is trying to achieve. A full delete now checkpoints
+     the WAL and VACUUMs so the space is actually returned.
+
+ 20. The SSE generators polled forever with no disconnect check, so every
+     closed dashboard tab left a task querying the database once a second
+     for the life of the container. Both now stop when the client goes
+     away.
+
+ 21. datetime.utcnow() is deprecated from Python 3.12. Replaced with an
+     explicit UTC-now-as-naive helper that produces the byte-identical
+     string format, because `since`/`until` filtering compares timestamps
+     as TEXT - a mix of "…T10:00:00" and "…T10:00:00+00:00" rows would
+     break those range queries in a way that only shows up on old data.
+
+ 22. Composite (level, id) and (status_code, id) indexes. The common
+     query on both tabs is "filter by one indexed column, ORDER BY id
+     DESC LIMIT n"; with only the single-column index SQLite could use
+     the index for the filter or for the ordering, not both, and fell
+     back to sorting the matched set.
+
+ 23. Rows dropped by the bounded write queue were counted and then never
+     surfaced anywhere. The count is now returned by the HTTP data
+     endpoint, so silent log loss under load is visible rather than
+     needing to be inferred from gaps.
 --------------------------------------------------------------------------
 """
 
 import asyncio
+import atexit
 import contextvars
 import json
 import logging
@@ -214,7 +269,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -229,6 +284,23 @@ ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 router = APIRouter()
+
+
+def _utcnow_iso() -> str:
+    """
+    UTC now, formatted exactly as datetime.utcnow().isoformat() always
+    was - naive, no zone suffix.
+
+    datetime.utcnow() is deprecated from 3.12, but the obvious
+    replacement (datetime.now(timezone.utc)) appends "+00:00", and these
+    timestamps are compared as TEXT by the since/until filters. A table
+    holding both "2026-08-15T10:00:00" and "2026-08-15T10:00:00+00:00"
+    would sort and range-filter incorrectly across the boundary, and the
+    breakage would only appear on rows written before the change. Strip
+    the tzinfo back off so the stored format is byte-identical.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
 
 # Per-request ID, readable from anywhere in the call stack (including a
 # background task spawned via asyncio.create_task() from inside a request,
@@ -332,7 +404,7 @@ def write_system_log_direct(
                 "(timestamp, level, logger, message, request_id, tool, tier) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    datetime.utcnow().isoformat(),
+                    _utcnow_iso(),
                     level,
                     logger_name,
                     message,
@@ -468,7 +540,41 @@ def tag_from_job(job_id: str) -> bool:
 
 
 # ============================================================
-# 0. CONNECTION HANDLING
+# 0. LIKE ESCAPING
+# ============================================================
+# SQLite's LIKE treats % and _ as wildcards, and there is no way to turn
+# that off - the only escape hatch is an explicit ESCAPE clause. Without
+# one, a user typing "_" into the search box matched EVERY row, and any
+# filter value containing an underscore (which real paths and job ids do)
+# silently over-matched. Every LIKE below that takes user or config input
+# now goes through _like() and carries ESCAPE '\'.
+
+_LIKE_ESCAPE = "\\"
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE's wildcards so a search term means itself."""
+    return (
+        value.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+
+
+def _like(value: str) -> str:
+    """A `%contains%` pattern with wildcards in the value neutralised."""
+    return f"%{_like_escape(value)}%"
+
+
+# SQL fragment appended to every LIKE that uses the above. Kept as a
+# constant so no call site can forget it - a LIKE with an escaped pattern
+# but no ESCAPE clause matches the backslashes literally and finds
+# nothing, which is a worse failure than the bug it was fixing.
+_ESC = f" ESCAPE '{_LIKE_ESCAPE}'"
+
+
+# ============================================================
+# 0b. CONNECTION HANDLING
 # ============================================================
 # One connection per thread, created once and kept. Previously every
 # query - including the one fired by the middleware on every single HTTP
@@ -495,6 +601,10 @@ def _configure(conn: sqlite3.Connection) -> sqlite3.Connection:
     # ~8MB page cache (negative = KiB). Keeps the hot end of the log
     # table resident so the common "last N rows" query stays in memory.
     conn.execute("PRAGMA cache_size=-8000")
+    # Cap WAL growth. Without this the WAL only checkpoints when SQLite
+    # feels like it, and on a box already tight on disk a busy day can
+    # leave a large -wal sitting next to the database indefinitely.
+    conn.execute("PRAGMA journal_size_limit=16777216")  # 16MB
     return conn
 
 
@@ -573,6 +683,21 @@ def _init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_tool ON request_logs(tool)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_tier ON request_logs(tier)")
 
+        # Composite (filter column, id) indexes - fix #22. Every query the
+        # dashboard issues is "filter on one indexed column, ORDER BY id
+        # DESC LIMIT n". With only the single-column index SQLite can use
+        # it for the filter OR satisfy the ordering from the rowid, not
+        # both, so it materialises and sorts the whole matched set - fine
+        # at 800 rows, not at 100k. Including id in the index gives it an
+        # ordered scan it can stop early.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_status_id "
+            "ON request_logs(status_code, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_tool_id ON request_logs(tool, id)"
+        )
+
         # System logs now share this same SQLite file (and volume mount) as
         # request_logs, so they survive container restarts/redeploys instead
         # of vanishing every time deploy.yml recreates the container.
@@ -617,6 +742,11 @@ def _init_db():
             pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_tool ON system_logs(tool)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_system_tier ON system_logs(tier)")
+        # Same composite reasoning as request_logs above. "level=ERROR,
+        # newest first" is the single most-used query on the System tab.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_system_level_id ON system_logs(level, id)"
+        )
 
         conn.commit()
     finally:
@@ -627,7 +757,7 @@ _init_db()
 
 
 # ============================================================
-# 0b. BATCHED BACKGROUND WRITER
+# 0c. BATCHED BACKGROUND WRITER
 # ============================================================
 # Nothing on the request path writes to SQLite directly any more. Both
 # the request-logging middleware and the logging handler just append to
@@ -648,6 +778,19 @@ _BATCH_WINDOW = 0.25    # seconds to wait accumulating a batch
 
 _write_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=_MAX_QUEUE)
 _dropped_rows = 0
+
+
+def get_dropped_row_count() -> int:
+    """How many log rows the bounded queue has discarded since start.
+
+    Surfaced by the HTTP data endpoint (fix #23). This used to be
+    incremented and then never read anywhere, which meant the one
+    condition it exists to signal - the writer falling far enough behind
+    that logging is silently lossy - was invisible. A gap in the log is
+    exactly the kind of thing you'd otherwise spend an hour chasing as a
+    bug in the code that failed to log.
+    """
+    return _dropped_rows
 
 
 def _enqueue(kind: int, row: tuple) -> None:
@@ -713,6 +856,25 @@ def _writer_loop() -> None:
 
 _writer_thread = threading.Thread(target=_writer_loop, name="log-writer", daemon=True)
 _writer_thread.start()
+
+
+def _flush_pending(timeout: float = 3.0) -> None:
+    """
+    Give the writer a moment to drain before the process exits.
+
+    The writer is a daemon thread, so a normal shutdown kills it wherever
+    it happens to be - up to a full batch window's worth of queued rows
+    vanish. deploy.yml does stop+rm+run on every push, so that's every
+    deploy, and the rows lost are the ones written immediately before a
+    restart, which are disproportionately the interesting ones. Bounded
+    wait: a slow flush must never hold up a container stop.
+    """
+    deadline = time.monotonic() + timeout
+    while not _write_queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+atexit.register(_flush_pending)
 
 
 # ============================================================
@@ -799,7 +961,7 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                 _enqueue(
                     _HTTP,
                     (
-                        datetime.utcnow().isoformat(),
+                        _utcnow_iso(),
                         request.method,
                         request.url.path,
                         response.status_code,
@@ -859,8 +1021,16 @@ def _noise_exclusion_sql() -> str:
     NOISE_PATH_MARKERS is a fixed, hardcoded tuple in config.py - never
     user input, never request data - so there is no injection surface;
     building it as literal SQL just keeps the call sites below readable.
+
+    The markers ARE escaped for LIKE wildcards though (fix #17): several
+    of them contain underscores, and an unescaped "_" is a
+    single-character wildcard, so "/wp_admin" would also have excluded
+    "/wpXadmin". Quietly wrong rather than obviously wrong, which is
+    worse.
     """
-    return " AND ".join(f"path NOT LIKE '%{p}%'" for p in NOISE_PATH_MARKERS)
+    return " AND ".join(
+        f"path NOT LIKE '%{_like_escape(p)}%'{_ESC}" for p in NOISE_PATH_MARKERS
+    )
 
 
 # Built once at import instead of re-joining 17 strings on every request.
@@ -1106,6 +1276,13 @@ def _status_counts(conn) -> dict:
     gets the noise filter, since that is the one number noise was
     actually distorting.
 
+    NOTE 2: "server" counts every 5xx, so a 502/503/504 is included here
+    but will NOT match a search for "500". That is intentional - the
+    search box matches an exact status code and the 5xx chip matches the
+    class - but it does mean the Server Errors box and a "500" search can
+    legitimately disagree. The 5xx chip is the control that always agrees
+    with this number.
+
     PERF: one scan, not four, and memoised for _COUNTS_TTL seconds. The
     poll loop asks for these counts every few seconds per open tab; at
     14k+ rows four full scans per poll was the single most expensive
@@ -1141,6 +1318,59 @@ def _status_counts(conn) -> dict:
 _DELTA_MAX = 2000
 
 
+def _build_search_clause(
+    q: str,
+    text_columns: list,
+    *,
+    id_columns: list = (),
+    status_column: str = None,
+) -> tuple:
+    """
+    Builds the OR clause for the global `q` search box, shared by both
+    data endpoints so they can never disagree about what a search term
+    means.
+
+    THE BUG THIS EXISTS TO FIX (fix #16): searching "500" on a table with
+    five 5xx rows returned three 500s and two unrelated 200s. Both 200s
+    were real and the SQL was doing exactly what it said - `q` ORed
+    across request_id, and request_id is 8 hex characters, so "500" is a
+    perfectly ordinary substring of one. The match was an artifact of the
+    id's encoding, not of anything the operator meant.
+
+    So `id_columns` (request_id, tool) are searched ONLY for non-numeric
+    terms:
+      - request_id is hex, so digits collide with it by coincidence
+      - tool tags are alphabetic and can never match a digit string at
+        all, so including them for a numeric term is pure cost
+
+    A bare 3-digit term additionally matches status_code exactly, IN
+    ADDITION to the text columns rather than instead of them, because
+    "500" can legitimately appear in a path.
+
+    Returns (clause, params). Every LIKE carries the ESCAPE clause so
+    wildcards in the search term mean themselves (fix #17).
+    """
+    stripped = q.strip()
+    if not stripped:
+        return None, []
+
+    pattern = _like(stripped)
+    numeric = stripped.isdigit()
+
+    parts = [f"{col} LIKE ?{_ESC}" for col in text_columns]
+    params = [pattern] * len(text_columns)
+
+    if not numeric:
+        parts += [f"{col} LIKE ?{_ESC}" for col in id_columns]
+        params += [pattern] * len(id_columns)
+
+    if numeric and status_column and len(stripped) == 3:
+        parts.append(f"{status_column} = ?")
+        params.append(int(stripped))
+
+    return "(" + " OR ".join(parts) + ")", params
+
+
 @router.get("/admin/logs/http/data")
 def get_http_logs(
     request: Request,
@@ -1150,7 +1380,7 @@ def get_http_logs(
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
     family: str = Query(None, description="Tool family, e.g. '/volume' also matches '/volume/status/<id>'."),
     method: str = Query(None, description="HTTP method filter, e.g. 'POST'."),
-    q: str = Query(None, description="Global substring search across path, client_ip, method, request_id and tool. A bare 3-digit value also matches status_code."),
+    q: str = Query(None, description="Global substring search across path, client_ip and method; plus request_id and tool for non-numeric terms. A bare 3-digit value also matches status_code exactly."),
     status_class: str = Query(None, description="'4xx' or '5xx'."),
     hide_noise: bool = Query(False, description="Exclude known bot/scanner paths."),
     since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
@@ -1190,6 +1420,13 @@ def get_http_logs(
     what the handler actually decided this request/job IS, which stays
     correct even when several tiers share the same polling routes. See
     set_job_context()'s docstring for the full reasoning.
+
+    ROW ORDER: the default and before_id branches return NEWEST-FIRST and
+    the client reverses them; the after_id branch returns oldest-first.
+    That asymmetry is deliberate (LIMIT has to take the newest N, which
+    requires DESC) and the frontend depends on it - note that
+    get_system_logs() reverses server-side instead, so the two endpoints
+    do NOT have the same contract here.
     """
     _check_admin(request, key)
 
@@ -1199,56 +1436,36 @@ def get_http_logs(
     if family:
         # Matches the family itself plus anything nested under it. The
         # trailing slash in the LIKE is what stops '/separate' from also
-        # matching '/separate-hq'.
-        where.append("(path = ? OR path LIKE ?)")
-        params.extend([family, family + "/%"])
+        # matching '/separate-hq'. Escaped because real families contain
+        # underscores, which LIKE would otherwise treat as wildcards.
+        where.append(f"(path = ? OR path LIKE ?{_ESC})")
+        params.extend([family, _like_escape(family) + "/%"])
     if method:
         where.append("method = ?")
         params.append(method)
     if q:
-        # GLOBAL search, not path-only.
-        #
-        # This used to be `path LIKE ?` and nothing else, which meant the
+        # See _build_search_clause for the full reasoning. Short version:
+        # this used to be `path LIKE ?` and nothing else, which meant the
         # one text box on the dashboard could answer exactly one question
-        # ("which requests hit a URL containing X") and silently returned
-        # nothing for every other thing an operator actually types into a
-        # log search: an IP they saw in another row, a job id, a tool tag,
-        # a status code. Typing an IP looked identical to typing a
-        # nonexistent path - zero results, no indication that the field
-        # simply doesn't look there.
+        # and silently returned nothing for an IP, a job id, a tool tag or
+        # a status code. Widening it introduced a second problem - numeric
+        # terms colliding with hex request ids - which is why id columns
+        # are conditional now.
         #
-        # SQLite LIKE is case-insensitive for ASCII by default, so this
-        # matches the case-insensitive behaviour the frontend search had.
-        #
-        # request_id/tool are LIKE rather than exact so a partial paste
-        # works - operators copy the first few characters of an id far
-        # more often than the whole thing.
-        #
-        # PERF: this is a full scan, and deliberately so. Only `path`,
-        # `status_code`, `tool` and `tier` are indexed, and an OR across
-        # columns can't use any of them regardless - SQLite would have to
-        # scan for the un-indexed terms anyway. Search is a
-        # human-triggered, debounced action (250ms in page.tsx), not part
-        # of the 3s poll loop, so one scan per typed phrase is the right
-        # trade for a box that actually finds things.
-        like = f"%{q.strip()}%"
-        or_parts = [
-            "path LIKE ?",
-            "client_ip LIKE ?",
-            "method LIKE ?",
-            "request_id LIKE ?",
-            "tool LIKE ?",
-        ]
-        or_params: list = [like, like, like, like, like]
-        # A bare number is overwhelmingly a status code ("404", "500"),
-        # so match it as one IN ADDITION to the text columns rather than
-        # instead of them - "500" could legitimately appear in a path.
-        stripped = q.strip()
-        if stripped.isdigit() and len(stripped) == 3:
-            or_parts.append("status_code = ?")
-            or_params.append(int(stripped))
-        where.append("(" + " OR ".join(or_parts) + ")")
-        params.extend(or_params)
+        # PERF: this is a full scan, deliberately. An OR across columns
+        # can't use any index regardless, and search is a debounced,
+        # human-triggered action (250ms in page.tsx), not part of the 3s
+        # poll loop. One scan per typed phrase is the right trade for a
+        # box that actually finds things.
+        clause, search_params = _build_search_clause(
+            q,
+            text_columns=["path", "client_ip", "method"],
+            id_columns=["request_id", "tool"],
+            status_column="status_code",
+        )
+        if clause:
+            where.append(clause)
+            params.extend(search_params)
     if status_class == "4xx":
         where.append("status_code >= 400 AND status_code < 500")
     elif status_class == "5xx":
@@ -1276,8 +1493,8 @@ def get_http_logs(
         # youtube_separate_hq_route in routes.py). The job id is the only
         # thing common to all of them, so it's what actually answers
         # "show me everything this one job did".
-        where.append("path LIKE ?")
-        params.append(f"%{job_id}%")
+        where.append(f"path LIKE ?{_ESC}")
+        params.append(_like(job_id))
     if tool:
         # Exact match, not LIKE - tool is a fixed vocabulary set by
         # set_job_context() (e.g. "STEMS", "CONVERT"), not free text.
@@ -1343,11 +1560,15 @@ def get_http_logs(
         "filtered_total": filtered_total,
         "max_id": max_id,
         "truncated": truncated,
+        # Non-zero means the write queue overflowed and log rows were
+        # discarded - see get_dropped_row_count(). Surfaced so a gap in
+        # the log is attributable rather than mysterious.
+        "dropped_rows": get_dropped_row_count(),
         "logs": [dict(r) for r in rows],
     })
 
 
-async def _http_log_event_generator():
+async def _http_log_event_generator(request: Request):
     last_id = 0
     with get_db() as conn:
         row = conn.execute("SELECT MAX(id) as m FROM request_logs").fetchone()
@@ -1355,6 +1576,12 @@ async def _http_log_event_generator():
 
     while True:
         await asyncio.sleep(1)
+        # Without this check a closed tab left this loop querying the
+        # database once a second for the life of the container - the
+        # generator has no other way to learn its reader is gone, since
+        # nothing downstream raises until a write is attempted.
+        if await request.is_disconnected():
+            break
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT * FROM request_logs WHERE id > ? ORDER BY id ASC", (last_id,)
@@ -1367,7 +1594,9 @@ async def _http_log_event_generator():
 @router.get("/admin/logs/http/stream")
 async def stream_http_logs(request: Request, key: str = Query(...)):
     _check_admin(request, key)
-    return StreamingResponse(_http_log_event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        _http_log_event_generator(request), media_type="text/event-stream"
+    )
 
 
 # ============================================================
@@ -1392,7 +1621,9 @@ class BufferLogHandler(logging.Handler):
             _enqueue(
                 _SYS,
                 (
-                    datetime.utcfromtimestamp(record.created).isoformat(),
+                    datetime.fromtimestamp(record.created, timezone.utc)
+                    .replace(tzinfo=None)
+                    .isoformat(),
                     record.levelname,
                     record.name,
                     record.getMessage(),
@@ -1421,10 +1652,17 @@ def get_system_logs(
     request_id: str = Query(None, description="If set, return EVERY system_logs row carrying this request_id, ignoring limit/before_id/after_id entirely."),
     job_id: str = Query(None, description="If set, return every system_logs row mentioning this job id, ignoring pagination. Use when a request produced no logs of its own (e.g. a status poll) but its JOB did."),
     level: str = Query(None, description="Log level filter, e.g. 'ERROR'."),
-    q: str = Query(None, description="Global substring search across message, logger, request_id and tool."),
+    q: str = Query(None, description="Global substring search across message and logger; plus request_id and tool for non-numeric terms."),
     tool: str = Query(None, description="Exact tool tag set via set_job_context(), e.g. 'STEMS'."),
     tier: str = Query(None, description="'standard' or 'hq'."),
 ):
+    """
+    ROW ORDER: every branch here returns OLDEST-FIRST, reversed
+    server-side where the query had to run DESC to take the newest N.
+    That differs from get_http_logs(), which returns newest-first and
+    leaves the reversal to the client. Both contracts are relied on by
+    page.tsx as written - don't "harmonise" one without the other.
+    """
     _check_admin(request, key)
     with get_db() as conn:
         if job_id is not None:
@@ -1443,8 +1681,8 @@ def get_system_logs(
             # on the job id in the message text surfaces the real story
             # instead: queued -> downloaded -> Demucs started -> complete.
             rows = conn.execute(
-                "SELECT * FROM system_logs WHERE message LIKE ? ORDER BY id ASC",
-                (f"%{job_id}%",),
+                f"SELECT * FROM system_logs WHERE message LIKE ?{_ESC} ORDER BY id ASC",
+                (_like(job_id),),
             ).fetchall()
             logs = [dict(r) for r in rows]
             return JSONResponse({"total": len(logs), "filtered_total": len(logs), "logs": logs})
@@ -1476,17 +1714,24 @@ def get_system_logs(
             where.append("level = ?")
             params.append(level)
         if q:
-            # Same widening as get_http_logs' q above, scoped to the
-            # columns this table has. request_id and tool were the
-            # notable gaps: pasting a request id from the HTTP tab into
-            # this box found nothing, even though correlating on that
-            # exact id is the single most common thing anyone wants to do
-            # here.
-            like = f"%{q.strip()}%"
-            where.append(
-                "(message LIKE ? OR logger LIKE ? OR request_id LIKE ? OR tool LIKE ?)"
+            # Same widening as get_http_logs' q, scoped to the columns
+            # this table has, and with the same numeric-term rule (fix
+            # #16). There's no status_code here, so for a numeric term
+            # this narrows to message and logger only - which is correct:
+            # a digit string matching a hex request id was never what
+            # anyone meant. request_id and tool were the notable gaps
+            # before this existed at all - pasting a request id from the
+            # HTTP tab into this box found nothing, even though
+            # correlating on that exact id is the single most common
+            # thing anyone wants to do here.
+            clause, search_params = _build_search_clause(
+                q,
+                text_columns=["message", "logger"],
+                id_columns=["request_id", "tool"],
             )
-            params.extend([like, like, like, like])
+            if clause:
+                where.append(clause)
+                params.extend(search_params)
         if tool:
             where.append("tool = ?")
             params.append(tool)
@@ -1541,13 +1786,15 @@ def get_system_logs(
     })
 
 
-async def _system_log_event_generator():
+async def _system_log_event_generator(request: Request):
     with get_db() as conn:
         row = conn.execute("SELECT MAX(id) as m FROM system_logs").fetchone()
         last_id = row["m"] or 0
 
     while True:
         await asyncio.sleep(1)
+        if await request.is_disconnected():
+            break
         with get_db() as conn:
             rows = conn.execute(
                 "SELECT * FROM system_logs WHERE id > ? ORDER BY id ASC", (last_id,)
@@ -1560,7 +1807,9 @@ async def _system_log_event_generator():
 @router.get("/admin/logs/system/stream")
 async def stream_system_logs(request: Request, key: str = Query(...)):
     _check_admin(request, key)
-    return StreamingResponse(_system_log_event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        _system_log_event_generator(request), media_type="text/event-stream"
+    )
 
 
 # ============================================================
@@ -1572,15 +1821,56 @@ def delete_logs(request: Request, key: str = Query(...), older_than_days: int = 
     _check_admin(request, key)
     with get_db() as conn:
         if older_than_days is not None:
-            cutoff = (datetime.utcnow() - timedelta(days=older_than_days)).isoformat()
-            cur = conn.execute("DELETE FROM request_logs WHERE timestamp < ?", (cutoff,))
-            cur_sys = conn.execute("DELETE FROM system_logs WHERE timestamp < ?", (cutoff,))
+            cutoff = (
+                datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(days=older_than_days)
+            ).isoformat()
+            # COUNT first rather than trusting cursor.rowcount - see the
+            # note in the else branch. Cheap here (indexed on timestamp)
+            # and keeps both branches reporting the same way.
+            deleted_http = conn.execute(
+                "SELECT COUNT(*) AS c FROM request_logs WHERE timestamp < ?", (cutoff,)
+            ).fetchone()["c"]
+            deleted_system = conn.execute(
+                "SELECT COUNT(*) AS c FROM system_logs WHERE timestamp < ?", (cutoff,)
+            ).fetchone()["c"]
+            conn.execute("DELETE FROM request_logs WHERE timestamp < ?", (cutoff,))
+            conn.execute("DELETE FROM system_logs WHERE timestamp < ?", (cutoff,))
         else:
-            cur = conn.execute("DELETE FROM request_logs")
-            cur_sys = conn.execute("DELETE FROM system_logs")
+            # `DELETE FROM table` with no WHERE triggers SQLite's truncate
+            # optimization, which drops the whole b-tree in one step
+            # instead of walking rows - and under it, changes() (which is
+            # what cursor.rowcount reports) is not a reliable count of
+            # what was removed. "Deleted all 815 logs" could come back as
+            # "Deleted 0 logs", which reads as the button being broken.
+            # Counting first is correct regardless of which path SQLite
+            # takes internally.
+            deleted_http = conn.execute(
+                "SELECT COUNT(*) AS c FROM request_logs"
+            ).fetchone()["c"]
+            deleted_system = conn.execute(
+                "SELECT COUNT(*) AS c FROM system_logs"
+            ).fetchone()["c"]
+            conn.execute("DELETE FROM request_logs")
+            conn.execute("DELETE FROM system_logs")
         conn.commit()
-        deleted_http = cur.rowcount
-        deleted_system = cur_sys.rowcount
+
+        # Deleting rows returns their pages to SQLite's freelist, not to
+        # the filesystem, and leaves the WAL at whatever size it grew to.
+        # Someone pressing "Delete all logs" on a VPS at ~69% disk is
+        # trying to reclaim space, so actually reclaim it. Both are
+        # best-effort: a checkpoint can be blocked by a concurrent reader
+        # and VACUUM needs the file lock, and neither failing is worth
+        # turning a successful delete into an error response.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        if older_than_days is None:
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.Error:
+                pass
 
     # The cached counters describe a table that no longer looks like
     # that. Without this the dashboard would show pre-delete numbers for
@@ -1607,7 +1897,12 @@ def delete_logs(request: Request, key: str = Query(...), older_than_days: int = 
 @router.get("/admin/logs", response_class=HTMLResponse)
 def logs_dashboard(request: Request, key: str = Query(...)):
     _check_admin(request, key)
-    html = """
+    # Raw string: the embedded JS contains /\d{2}/ regexes, and in a
+    # normal string Python treats "\d" as an unknown escape - it survives
+    # at runtime but emits a SyntaxWarning on every import (and becomes a
+    # hard error in a future version). No intentional Python escapes in
+    # here, so r"""...""" is a straight upgrade.
+    html = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -1784,7 +2079,8 @@ function renderCounters() {
 // Next.js dashboard both read.
 const NOISE_PATTERNS = PLACEHOLDER_NOISE_PATTERNS;
 function isNoise(path) {
-  return NOISE_PATTERNS.some(p => path.includes(p));
+  const lower = path.toLowerCase();
+  return NOISE_PATTERNS.some(p => lower.includes(p.toLowerCase()));
 }
 
 function statusClass(code) {
