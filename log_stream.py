@@ -1150,7 +1150,7 @@ def get_http_logs(
     before_id: int = Query(None, description="If set, return one page of OLDER rows with id < before_id, capped at `limit`."),
     family: str = Query(None, description="Tool family, e.g. '/volume' also matches '/volume/status/<id>'."),
     method: str = Query(None, description="HTTP method filter, e.g. 'POST'."),
-    q: str = Query(None, description="Substring match on path."),
+    q: str = Query(None, description="Global substring search across path, client_ip, method, request_id and tool. A bare 3-digit value also matches status_code."),
     status_class: str = Query(None, description="'4xx' or '5xx'."),
     hide_noise: bool = Query(False, description="Exclude known bot/scanner paths."),
     since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
@@ -1206,10 +1206,49 @@ def get_http_logs(
         where.append("method = ?")
         params.append(method)
     if q:
-        # SQLite LIKE is case-insensitive for ASCII by default, matching
-        # the case-insensitive behaviour the frontend search had.
-        where.append("path LIKE ?")
-        params.append(f"%{q}%")
+        # GLOBAL search, not path-only.
+        #
+        # This used to be `path LIKE ?` and nothing else, which meant the
+        # one text box on the dashboard could answer exactly one question
+        # ("which requests hit a URL containing X") and silently returned
+        # nothing for every other thing an operator actually types into a
+        # log search: an IP they saw in another row, a job id, a tool tag,
+        # a status code. Typing an IP looked identical to typing a
+        # nonexistent path - zero results, no indication that the field
+        # simply doesn't look there.
+        #
+        # SQLite LIKE is case-insensitive for ASCII by default, so this
+        # matches the case-insensitive behaviour the frontend search had.
+        #
+        # request_id/tool are LIKE rather than exact so a partial paste
+        # works - operators copy the first few characters of an id far
+        # more often than the whole thing.
+        #
+        # PERF: this is a full scan, and deliberately so. Only `path`,
+        # `status_code`, `tool` and `tier` are indexed, and an OR across
+        # columns can't use any of them regardless - SQLite would have to
+        # scan for the un-indexed terms anyway. Search is a
+        # human-triggered, debounced action (250ms in page.tsx), not part
+        # of the 3s poll loop, so one scan per typed phrase is the right
+        # trade for a box that actually finds things.
+        like = f"%{q.strip()}%"
+        or_parts = [
+            "path LIKE ?",
+            "client_ip LIKE ?",
+            "method LIKE ?",
+            "request_id LIKE ?",
+            "tool LIKE ?",
+        ]
+        or_params: list = [like, like, like, like, like]
+        # A bare number is overwhelmingly a status code ("404", "500"),
+        # so match it as one IN ADDITION to the text columns rather than
+        # instead of them - "500" could legitimately appear in a path.
+        stripped = q.strip()
+        if stripped.isdigit() and len(stripped) == 3:
+            or_parts.append("status_code = ?")
+            or_params.append(int(stripped))
+        where.append("(" + " OR ".join(or_parts) + ")")
+        params.extend(or_params)
     if status_class == "4xx":
         where.append("status_code >= 400 AND status_code < 500")
     elif status_class == "5xx":
@@ -1382,7 +1421,7 @@ def get_system_logs(
     request_id: str = Query(None, description="If set, return EVERY system_logs row carrying this request_id, ignoring limit/before_id/after_id entirely."),
     job_id: str = Query(None, description="If set, return every system_logs row mentioning this job id, ignoring pagination. Use when a request produced no logs of its own (e.g. a status poll) but its JOB did."),
     level: str = Query(None, description="Log level filter, e.g. 'ERROR'."),
-    q: str = Query(None, description="Substring match on logger or message."),
+    q: str = Query(None, description="Global substring search across message, logger, request_id and tool."),
     tool: str = Query(None, description="Exact tool tag set via set_job_context(), e.g. 'STEMS'."),
     tier: str = Query(None, description="'standard' or 'hq'."),
 ):
@@ -1437,8 +1476,17 @@ def get_system_logs(
             where.append("level = ?")
             params.append(level)
         if q:
-            where.append("(message LIKE ? OR logger LIKE ?)")
-            params.extend([f"%{q}%", f"%{q}%"])
+            # Same widening as get_http_logs' q above, scoped to the
+            # columns this table has. request_id and tool were the
+            # notable gaps: pasting a request id from the HTTP tab into
+            # this box found nothing, even though correlating on that
+            # exact id is the single most common thing anyone wants to do
+            # here.
+            like = f"%{q.strip()}%"
+            where.append(
+                "(message LIKE ? OR logger LIKE ? OR request_id LIKE ? OR tool LIKE ?)"
+            )
+            params.extend([like, like, like, like])
         if tool:
             where.append("tool = ?")
             params.append(tool)
