@@ -8,8 +8,10 @@ import os
 import re
 import time
 import base64
+import uuid
 import threading
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import yt_dlp
 
@@ -83,6 +85,200 @@ class VideoTooLongError(Exception):
 # ============================================================
 PLAYER_CLIENTS_NO_COOKIES = ['android_vr', 'android', 'web']
 PLAYER_CLIENTS_WITH_COOKIES = ['tv', 'web', 'web_safari']
+
+
+# ============================================================
+# SPLIT-TUNNEL PROXY (added 2026-08-15)
+#
+# WHY THIS EXISTS: _try_proxy sets proxied_opts["proxy"] once, so yt-dlp
+# routes BOTH phases of the request through the residential proxy:
+#
+#   phase 1 (extraction)  ~1.3 MB  webpage + base.js + player API calls
+#                                  + PO token + JS challenge
+#   phase 2 (media)       ~5.6 MB  the actual audio bytes off
+#                                  *.googlevideo.com
+#
+# Provider usage log, 2026-08-12 18:00 -> 2026-08-15 02:00 UTC, 4.90 GB
+# across 57h (~2.1 GB/day, ~63 GB/month):
+#
+#   *.googlevideo.com   3.93 GB   80.1%   <- phase 2
+#   www.youtube.com      964 MB   19.7%   <- phase 1
+#   everything else      ~11 MB    0.2%
+#
+# The residential IP exists to survive the BOT-CHECK, and the bot-check
+# happens in phase 1. Phase 2 is a signed URL hitting a CDN edge that
+# validates the signature, not the IP's reputation. So 80% of the bill
+# buys something the request did not need.
+#
+# Split tunnel: phase 1 through the proxy (byte-for-byte unchanged),
+# phase 2 direct, and on ANY phase-2 failure retry phase 2 through the
+# SAME proxy exit - reusing the already-extracted info dict, so the
+# expensive part is never paid twice.
+#
+# WHY STICKY SESSIONS ARE LOAD-BEARING: googlevideo URLs are frequently
+# bound to the IP that requested them. If phase 1 runs through exit A
+# and the phase-2 fallback lands on exit B, that fallback 403s too - and
+# a request that succeeds today is LOST. The "same success rate"
+# guarantee rests entirely on the fallback reusing exit A. Note that
+# record_proxy_botcheck()'s own warning already recommends pinning a
+# sticky session for an unrelated reason; this makes it mandatory.
+# ============================================================
+SPLIT_TUNNEL_ENABLED = os.environ.get("YT_SPLIT_TUNNEL", "0") == "1"
+
+# Provider-specific username pattern, {session} is where the id goes:
+#   Bright Data / Oxylabs : "customer-af1-sess-{session}"
+#   Smartproxy / IPRoyal  : password-suffix style - check their docs
+# Empty = split tunnel still runs, but the phase-2 fallback rolls a
+# fresh exit and the guarantee above no longer holds.
+PROXY_STICKY_TEMPLATE = os.environ.get("YT_PROXY_STICKY_TEMPLATE", "")
+
+# Auto-disable thresholds for the split-tunnel health breaker below.
+SPLIT_TUNNEL_MIN_SAMPLES = int(os.environ.get("YT_SPLIT_MIN_SAMPLES", "20"))
+SPLIT_TUNNEL_MIN_SUCCESS_RATE = float(os.environ.get("YT_SPLIT_MIN_SUCCESS_RATE", "25"))
+SPLIT_TUNNEL_WINDOW_SECONDS = int(os.environ.get("YT_SPLIT_WINDOW_SECONDS", str(60 * 60)))
+SPLIT_TUNNEL_COOLDOWN_SECONDS = int(os.environ.get("YT_SPLIT_COOLDOWN_SECONDS", str(30 * 60)))
+
+
+def _sticky_proxy_url(proxy_url: Optional[str], session_id: str) -> Optional[str]:
+    """
+    Rewrites the proxy URL's username so the extraction phase and the
+    media-phase fallback land on the SAME exit IP.
+
+    Returns proxy_url unchanged when no template is configured or the URL
+    carries no credentials, and NEVER raises - a malformed template must
+    degrade to today's behaviour, not break every download on the box.
+    """
+    if not proxy_url or not PROXY_STICKY_TEMPLATE:
+        return proxy_url
+    try:
+        parts = urlsplit(proxy_url)
+        if not parts.username:
+            return proxy_url
+        username = PROXY_STICKY_TEMPLATE.format(session=session_id)
+        password = f":{parts.password}" if parts.password else ""
+        port = f":{parts.port}" if parts.port else ""
+        netloc = f"{username}{password}@{parts.hostname or ''}{port}"
+        return urlunsplit(
+            (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+        )
+    except Exception as e:
+        logger.warning(
+            f"[SPLIT] Could not build a sticky proxy URL "
+            f"(YT_PROXY_STICKY_TEMPLATE may be malformed) - falling back to "
+            f"the plain proxy URL: {e}"
+        )
+        return proxy_url
+
+
+# ---------- SPLIT-TUNNEL HEALTH BREAKER ----------
+# The safety net that makes this change reversible WITHOUT a deploy.
+#
+# The whole bet is "googlevideo will serve signed URLs to this VPS's own
+# IP". If that bet is wrong - YouTube tightens IP-binding, the CDN starts
+# challenging the datacenter range, whatever - every request pays a
+# wasted direct attempt before falling back, and the only symptom is
+# creeping latency. That is exactly the kind of regression that hides for
+# a week.
+#
+# So: track phase-2 direct outcomes in a rolling window and, once there
+# is enough evidence, auto-disable the split tunnel for a cooldown. The
+# system reverts itself to the known-good all-proxy path and says so
+# loudly. Same rolling-window shape as the CDN and bot-check breakers
+# above, for the same reason - one bad minute is noise, a sustained rate
+# is a real signal.
+_split_lock = threading.Lock()
+_split_media_events: list = []   # (timestamp, ok)
+_split_disabled_until = 0.0
+
+
+def split_tunnel_available() -> bool:
+    """True when the split tunnel is both enabled and not in cooldown."""
+    if not SPLIT_TUNNEL_ENABLED:
+        return False
+    with _split_lock:
+        return time.time() >= _split_disabled_until
+
+
+def record_split_media_result(ok: bool):
+    """
+    Feeds the health breaker with one phase-2 DIRECT outcome.
+
+    Only direct outcomes count. A proxy-fallback result says nothing
+    about whether direct is viable, and counting it would keep the
+    breaker latched on the very requests it exists to route around -
+    same reasoning as record_cdn_timeout()'s direct-only rule.
+    """
+    _record_event("split_media", ok=ok)
+    global _split_disabled_until
+    now = time.time()
+    tripped = None
+
+    with _split_lock:
+        _split_media_events.append((now, ok))
+        cutoff = now - SPLIT_TUNNEL_WINDOW_SECONDS
+        while _split_media_events and _split_media_events[0][0] < cutoff:
+            _split_media_events.pop(0)
+
+        total = len(_split_media_events)
+        if total >= SPLIT_TUNNEL_MIN_SAMPLES and now >= _split_disabled_until:
+            successes = sum(1 for _, o in _split_media_events if o)
+            rate = successes / total * 100
+            if rate < SPLIT_TUNNEL_MIN_SUCCESS_RATE:
+                _split_disabled_until = now + SPLIT_TUNNEL_COOLDOWN_SECONDS
+                _split_media_events.clear()
+                tripped = (rate, total)
+
+    if tripped:
+        rate, total = tripped
+        message = (
+            f"[SPLIT] Health breaker TRIPPED - direct media fetches are "
+            f"succeeding only {rate:.0f}% of the time over the last {total} "
+            f"attempts (floor is {SPLIT_TUNNEL_MIN_SUCCESS_RATE:.0f}%). "
+            f"googlevideo appears to be IP-binding signed URLs, so the direct "
+            f"attempt is pure added latency. Reverting to full-proxy downloads "
+            f"for {SPLIT_TUNNEL_COOLDOWN_SECONDS // 60} min. Bandwidth savings "
+            f"pause; success rate is unaffected. If this repeats, set "
+            f"YT_SPLIT_TUNNEL=0 and move the media phase to a cheap datacenter "
+            f"proxy pool instead."
+        )
+        logger.warning(message)
+        alert_now(message)
+
+
+def split_breaker_status() -> dict:
+    """Snapshot for /admin/status, so a silent revert is visible without
+    grepping logs."""
+    now = time.time()
+    with _split_lock:
+        events = list(_split_media_events)
+        disabled_until = _split_disabled_until
+    total = len(events)
+    successes = sum(1 for _, o in events if o)
+    return {
+        "enabled": SPLIT_TUNNEL_ENABLED,
+        "sticky_session_configured": bool(PROXY_STICKY_TEMPLATE),
+        "state": (
+            "disabled (YT_SPLIT_TUNNEL=0)" if not SPLIT_TUNNEL_ENABLED
+            else "DEGRADED (full-proxy fallback)" if now < disabled_until
+            else "active"
+        ),
+        "seconds_until_retried": max(0, int(disabled_until - now)),
+        "recent_direct_media_attempts": total,
+        "recent_direct_media_success_rate": (
+            round(successes / total * 100, 1) if total else None
+        ),
+        "min_samples": SPLIT_TUNNEL_MIN_SAMPLES,
+        "min_success_rate": SPLIT_TUNNEL_MIN_SUCCESS_RATE,
+    }
+
+
+def reset_split_breaker():
+    """Manual override, mirroring reset_proxy_circuit_breaker()."""
+    global _split_disabled_until
+    with _split_lock:
+        _split_disabled_until = 0.0
+        _split_media_events.clear()
+    logger.info("[SPLIT] Health breaker manually reset.")
 
 
 def _apply_player_clients(opts: dict, has_cookies: bool) -> dict:
@@ -524,7 +720,20 @@ def is_media_phase_error(error_text: str) -> bool:
     carry the "[youtube] <video_id>:" prefix instead.
     """
     normalized = _normalize_error_text(error_text)
-    return "[download] got error" in normalized or "googlevideo.com" in normalized
+    return (
+        "[download] got error" in normalized
+        or "googlevideo.com" in normalized
+        # ADDED 2026-08-15: yt-dlp's message for a media-fetch 403 carries
+        # NEITHER marker above - the literal text is "unable to download
+        # video data: HTTP Error 403: Forbidden". So the single most
+        # common media failure on this server was being reported as
+        # phase=extraction in logs, in Discord alerts, and in
+        # /admin/status's last_failure_phase - the exact inversion of the
+        # signal this function's docstring says is the most diagnostic
+        # thing available. Pure labelling fix: is_ip_block_error() already
+        # matched this text, so no routing decision changes.
+        or "unable to download video data" in normalized
+    )
 
 
 def failure_phase(error_text: str) -> str:
@@ -1275,7 +1484,98 @@ def _disable_cookie_account(path: str):
     )
 
 
-def extract_info_with_retry(ydl_opts: dict, url: str):
+def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
+    """
+    Phase 2 of a split-tunnel request: turn an already-extracted info
+    dict into downloaded, postprocessed audio - direct first, the
+    extraction's own proxy exit as fallback.
+
+    WHY THERE IS NO is_media_phase_error() CHECK HERE. The absence looks
+    like an omission, so: is_media_phase_error() matches on "[download]
+    got error" or "googlevideo.com". The most common real media failure
+    on this server - "unable to download video data: HTTP Error 403:
+    Forbidden" - contained NEITHER substring until the marker added
+    above. Gating the fallback on a marker list means one uncatalogued
+    error string silently turns the fallback off, and the symptom is
+    lost downloads, not a log line.
+
+    It does not need to be gated, because this function IS the media
+    phase. extract_info(download=False) already returned successfully
+    before this was called, so anything raised below happened while
+    fetching bytes, by construction. Structural knowledge beats text
+    matching: no list to keep in sync, no new error string can break it.
+
+    Two things genuinely are excluded, because a proxy retry would
+    re-download the whole file only to fail identically:
+      - PostProcessingError: ffmpeg/disk, nothing to do with the network
+      - is_permanent_error(): the video itself is the blocker
+    """
+    try:
+        with yt_dlp.YoutubeDL(media_opts) as ydl:
+            result = ydl.process_ie_result(info, download=True)
+        record_path_attempt("direct_media", True)
+        record_split_media_result(True)
+        logger.info("[SPLIT] Media fetched direct - proxy paid for extraction only.")
+        return result
+
+    except yt_dlp.utils.PostProcessingError:
+        # NOT counted by record_split_media_result: the bytes arrived
+        # fine, ffmpeg is what failed. Feeding this to the health breaker
+        # would auto-disable the split tunnel over a disk-full or a bad
+        # ffmpeg build - a failure it has nothing to do with.
+        record_path_attempt("direct_media", False)
+        logger.warning(
+            "[SPLIT] Media downloaded but postprocessing failed - not "
+            "retrying via proxy (ffmpeg would fail identically)."
+        )
+        raise
+
+    except Exception as media_error:
+        record_path_attempt("direct_media", False)
+        media_error_text = str(media_error)
+
+        if is_permanent_error(media_error_text):
+            # Also not counted - see above. The video is the blocker.
+            raise
+
+        record_split_media_result(False)
+
+        fallback_proxy = extract_opts.get("proxy")
+        if not fallback_proxy:
+            raise
+
+        logger.info(
+            f"[SPLIT] Direct media fetch failed - the signed URL is likely "
+            f"IP-bound. Retrying media through the extraction exit: "
+            f"{media_error_text[:200]}"
+        )
+
+    # Reuses `info` from phase 1 - no second extraction, so the expensive
+    # part is never paid twice. This branch is what keeps the success
+    # rate flat: worst case is exactly the pre-split behaviour plus one
+    # wasted direct attempt.
+    retry_opts = dict(media_opts)
+    retry_opts["proxy"] = extract_opts["proxy"]
+    # continuedl=False is NOT cosmetic. yt-dlp resumes .part files by
+    # default, so without this the proxy retry would send a Range request
+    # for the tail of a file whose head was fetched from a DIFFERENT IP.
+    # Best case googlevideo 403s the Range and the retry fails for a
+    # reason that has nothing to do with the proxy; worst case it serves
+    # it and the two halves are stitched into a corrupt file that
+    # postprocesses without error. Start clean.
+    retry_opts["continuedl"] = False
+    try:
+        with yt_dlp.YoutubeDL(retry_opts) as ydl:
+            result = ydl.process_ie_result(info, download=True)
+    except Exception:
+        record_path_attempt("proxy_media", False)
+        raise
+    record_path_attempt("proxy_media", True)
+    logger.info("[SPLIT] Media fetched through the proxy fallback.")
+    return result
+
+
+def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict] = None):
     """
     NOTE: this function is fully synchronous/blocking (yt_dlp + time.sleep
     backoff). It must always be called via utils.run_blocking() from an
@@ -1312,7 +1612,15 @@ def extract_info_with_retry(ydl_opts: dict, url: str):
                     )
                     raise VideoTooLongError(duration, MAX_VIDEO_DURATION_SECONDS)
 
-                info = ydl.process_ie_result(info, download=True)
+                if media_opts is None:
+                    info = ydl.process_ie_result(info, download=True)
+                else:
+                    # Extraction survived, so the proxy already did its one
+                    # job. Recorded here rather than in the caller so the
+                    # counter reflects attempts that actually got past the
+                    # bot-check, not attempts that were merely started.
+                    record_path_attempt("proxy_extract", True)
+                    info = _process_media_split(info, ydl_opts, media_opts)
             logger.info(f"yt_dlp extract_info succeeded on attempt {attempt}")
             return info
         except VideoTooLongError:
@@ -1591,7 +1899,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         """
         remaining_accounts = get_cookie_accounts()
         proxied_opts = dict(base_ydl_opts)
-        proxied_opts["proxy"] = proxy_url
+        # One session id shared by both phases - see _sticky_proxy_url.
+        # With no template configured this is just proxy_url unchanged.
+        session_id = uuid.uuid4().hex[:12]
+        proxied_opts["proxy"] = _sticky_proxy_url(proxy_url, session_id)
         proxy_account = remaining_accounts[0] if remaining_accounts else None
         if proxy_account:
             proxied_opts["cookiefile"] = proxy_account
@@ -1616,8 +1927,30 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 "attempt - a bot-check is near-certain. Check whether accounts "
                 "were recently disabled (see [COOKIES] lines above)."
             )
+        # Media phase differs from the extraction phase in exactly ONE
+        # way: no proxy. cookiefile is deliberately KEPT even though a
+        # signed googlevideo URL does not need it - this rollout is a
+        # measurement, and adding a second variable (cookies present vs
+        # absent) would make any success-rate movement impossible to
+        # attribute. Drop it later, once the numbers are in.
+        media_opts = None
+        if split_tunnel_available() and proxied_opts.get("proxy"):
+            media_opts = dict(proxied_opts)
+            media_opts.pop("proxy", None)
+            # Bounds the added latency. A failed direct media attempt is
+            # pure overhead on top of the request's existing budget, and
+            # DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS in the parent will
+            # SIGKILL the whole process group when that budget runs out -
+            # turning a request that would have succeeded via proxy into
+            # a timeout. youtube_chain.py's opts set no socket_timeout at
+            # all (only routes/youtube.py's /download does), so this is
+            # the one place that guarantees a floor for both callers.
+            media_opts["socket_timeout"] = min(
+                media_opts.get("socket_timeout") or 10, 10
+            )
+
         try:
-            result = extract_info_with_retry(proxied_opts, url)
+            result = extract_info_with_retry(proxied_opts, url, media_opts)
             logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
             record_account_result(proxy_account, True, "proxy")
             record_path_attempt("proxy", True)
@@ -1964,6 +2297,8 @@ def apply_events(events: list):
                 )
             elif kind == "path_attempt":
                 record_path_attempt(ev.get("via", "direct"), ev.get("ok", False))
+            elif kind == "split_media":
+                record_split_media_result(ev.get("ok", False))
             elif kind == "cookie_warning":
                 _set_active_account(ev.get("path"))
                 _maybe_alert_cookie_expiry("cookies are no longer valid")
@@ -1983,12 +2318,15 @@ def export_breaker_state() -> dict:
         cdn_until = _direct_degraded_until
     with _proxy_botcheck_lock:
         botcheck_until = _proxy_botcheck_until
+    with _split_lock:
+        split_until = _split_disabled_until
     with _cookie_accounts_lock:
         disabled = dict(_cookie_account_disabled_until)
     return {
         "proxy_disabled_until": proxy_until,
         "direct_degraded_until": cdn_until,
         "proxy_botcheck_until": botcheck_until,
+        "split_disabled_until": split_until,
         "cookie_disabled": disabled,
     }
 
@@ -1996,6 +2334,7 @@ def export_breaker_state() -> dict:
 def import_breaker_state(state: dict):
     """Worker-side: adopt the parent's breakers before doing any work."""
     global _proxy_disabled_until, _direct_degraded_until, _proxy_botcheck_until
+    global _split_disabled_until
     if not state:
         return
     try:
@@ -2005,6 +2344,11 @@ def import_breaker_state(state: dict):
             _direct_degraded_until = float(state.get("direct_degraded_until") or 0.0)
         with _proxy_botcheck_lock:
             _proxy_botcheck_until = float(state.get("proxy_botcheck_until") or 0.0)
+        with _split_lock:
+            # Without this the worker never sees a tripped split breaker,
+            # so every download would keep paying the wasted direct
+            # attempt the parent already decided to stop paying.
+            _split_disabled_until = float(state.get("split_disabled_until") or 0.0)
         with _cookie_accounts_lock:
             _cookie_account_disabled_until.clear()
             _cookie_account_disabled_until.update(state.get("cookie_disabled") or {})
