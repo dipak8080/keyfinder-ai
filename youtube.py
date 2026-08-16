@@ -42,6 +42,7 @@ from config import (
     COOKIE_ACCOUNT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
+import cookie_health
 
 
 class VideoTooLongError(Exception):
@@ -1390,12 +1391,33 @@ def _maybe_alert_cookie_expiry(message: str):
     COOKIE_ALERT_COOLDOWN_SECONDS suppresses repeats - a different account
     going bad later still alerts on its own schedule, it isn't silenced by
     an unrelated account's recent alert.
+
+    UPDATED 2026-08-16: the verdict is now WRITTEN DOWN as well as sent.
+
+    Everything below used to be fire-and-forget: the finding went to
+    Discord and died with the process, so /admin/cookies/status kept
+    reporting "13mo left" on cookies_3.txt for hours after this function
+    had already concluded the session was dead. The expiry date in the
+    file is static and says nothing about server-side revocation, so the
+    status endpoint had no way to ever learn this on its own.
+
+    THIS IS THE ONLY CORRECT PLACE FOR THAT WRITE. It sits after the
+    threshold AND the cooldown, so a flag can only appear when an alert
+    also fires - the panel and Discord can never disagree.
+    _disable_cookie_account() is the tempting alternative and is wrong:
+    it triggers on _was_cookie_flagged(), the same heuristic that
+    disabled all three accounts in ~40s during the 2026-08-08 CDN
+    cascade, and would paint every slot dead from a network blip.
     """
     if _record_events_enabled:
         # In worker mode: the rolling-window counter here is per-process
         # and would reset every download, so it could never reach the
         # alert threshold. Hand the occurrence to the parent instead.
-        _record_event("cookie_warning", path=_get_active_account())
+        #
+        # The raw warning text rides along now so the parent can store it
+        # as the revocation reason - without it the sidecar (and the
+        # dashboard) can only ever show a generic placeholder.
+        _record_event("cookie_warning", path=_get_active_account(), message=message[:300])
         return
     global _cookie_alert_last_sent
     account_path = _get_active_account()
@@ -1425,6 +1447,22 @@ def _maybe_alert_cookie_expiry(message: str):
 
         _cookie_alert_last_sent[account_label] = now
 
+    # Persist the verdict BEFORE alerting. If alert_now() throws (Discord
+    # webhook down, network blip) the finding still survives in the panel,
+    # which is the whole point - the previous ordering would have lost it
+    # in exactly the situation where you most need it recorded.
+    #
+    # Guarded on account_path being real: anon-first (2026-08-12) means
+    # the first attempt of every download carries no cookiefile, so this
+    # is None on a routine basis and account_label is a human string, not
+    # a path. cookie_health rejects it too; this keeps the intent local.
+    if account_path:
+        cookie_health.record_revoked(
+            account_path,
+            reason=message.strip()[:300] or "yt-dlp reported the session is no longer valid",
+            hits=recent_count,
+        )
+
     # Best-effort "what's still healthy" snapshot at alert time - this
     # account may not be formally disabled yet (that happens a moment
     # later in download_with_fallback once it sees _was_cookie_flagged()),
@@ -1434,11 +1472,45 @@ def _maybe_alert_cookie_expiry(message: str):
     still_active = [p for p in get_cookie_accounts() if p != account_path]
     still_active_text = ", ".join(still_active) if still_active else "none currently active"
 
-    env_hint = "YT_COOKIES_B64 (primary account)"
-    if account_path == COOKIE_ACCOUNT_2_PATH:
-        env_hint = f"{COOKIE_ACCOUNT_2_B64_ENV} (account 2)"
-    elif account_path == COOKIE_ACCOUNT_3_PATH:
-        env_hint = f"{COOKIE_ACCOUNT_3_B64_ENV} (account 3)"
+    # UPDATED 2026-08-16: this used to tell you to base64-encode the file
+    # and update YT_COOKIES_B64_* in .env, then restart the container.
+    # That workflow was replaced by cookie_upload.py's direct file upload
+    # and has been dead for weeks - the message was walking you into a
+    # restart you don't need, at 3am, in the middle of an incident.
+    #
+    # The cookie-less branch matters more than it looks. Anon-first
+    # (2026-08-12) means the FIRST attempt of every download carries no
+    # cookiefile, so account_path is routinely None here. No flag was
+    # written for it above, so the message must not claim one was -
+    # an alert that lies about the panel is the exact failure this whole
+    # change exists to remove.
+    if account_path is None:
+        fix_text = (
+            "This warning arrived on an attempt with NO cookiefile attached, "
+            "so it can't be pinned to a slot and nothing has been flagged in "
+            "the admin panel. Check which account was in play from the "
+            "surrounding [COOKIES]/[PROXY] log lines before re-exporting anything."
+        )
+    else:
+        primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
+        if account_path == COOKIE_ACCOUNT_2_PATH:
+            slot_hint = "Backup 1 (slot 2)"
+        elif account_path == COOKIE_ACCOUNT_3_PATH:
+            slot_hint = "Backup 2 (slot 3)"
+        elif account_path == primary_path:
+            slot_hint = "Primary (slot 1)"
+        else:
+            # A path that isn't one of the three configured slots. Worth
+            # saying plainly rather than guessing a slot number - it means
+            # config drift, and a wrong slot number sends you to overwrite
+            # a healthy account.
+            slot_hint = f"the slot backed by '{account_path}' (not one of the 3 configured paths)"
+        fix_text = (
+            f"Fix: re-export cookies.txt from a logged-in browser session and "
+            f"upload it to {slot_hint} on the admin cookies page - no base64, "
+            f"no .env edit, no container restart. This slot is now flagged "
+            f"REVOKED there until you do, regardless of what its expiry date claims."
+        )
 
     alert_message = (
         f"[COOKIES] '{account_label}' looks genuinely expired/rotated - "
@@ -1447,10 +1519,7 @@ def _maybe_alert_cookie_expiry(message: str):
         f"specifically (not just a one-off flaky check). "
         f"Still active: {still_active_text}. "
         f"Downloads are still working via the remaining account(s)/proxy "
-        f"fallback, but re-export '{account_label}' from a logged-in browser "
-        f"session, base64-encode it, and update {env_hint} in the server's "
-        f".env (then restart the container) when "
-        f"you get a chance - this alert won't repeat for "
+        f"fallback. {fix_text} This alert won't repeat for "
         f"{COOKIE_ALERT_COOLDOWN_SECONDS // 60} min for THIS account "
         f"regardless of how many more downloads hit it in the meantime."
     )
@@ -1883,7 +1952,7 @@ def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict]
                 raise
 
             if is_not_yet_live_error(error_text):
-                # A scheduled premiere/stream that hasn't started - no
+                # A scheduled premiere/live stream that hasn't started - no
                 # retry count, cookie, or IP makes it start early.
                 logger.warning(
                     f"Attempt {attempt}: video is a premiere/live stream that "
@@ -2403,7 +2472,9 @@ def apply_events(events: list):
                 record_split_media_result(ev.get("ok", False))
             elif kind == "cookie_warning":
                 _set_active_account(ev.get("path"))
-                _maybe_alert_cookie_expiry("cookies are no longer valid")
+                _maybe_alert_cookie_expiry(
+                    ev.get("message") or "cookies are no longer valid"
+                )
         except Exception as e:
             logger.warning(f"[BREAKER] Failed to apply worker event {ev}: {e}")
 

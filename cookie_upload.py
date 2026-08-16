@@ -69,14 +69,61 @@ train you to ignore the warning, and be worse than no signal at all.
 Only the authentication cookies below actually determine whether the
 session still works.
 --------------------------------------------------------------------------
+
+UPDATED 2026-08-16: REVOCATION - the date was never the whole question
+either.
+
+The 2026-08-15 work above closed the "clock ran out" gap. The next
+incident closed the other one, and it is the more common failure by far:
+
+  cookies_3.txt carried a valid expiry of Sep 16 2027. The panel
+  reported "13mo left". Discord had already alerted at 22:30 that
+  yt-dlp saw the session refused three times in ten minutes.
+
+Both were correct. The expiry date is a static string written into the
+file at export time; when Google revokes a session server-side nothing
+in the file changes, so _parse_cookie_expiry() will keep reporting a
+year of headroom on a dead account indefinitely.
+
+The runtime DOES know - _maybe_alert_cookie_expiry() in youtube.py is
+what produced that Discord message. It just had nowhere to put the
+finding. cookie_health.py is that place: a JSON sidecar written at the
+alert site and merged into this endpoint's response by
+cookie_health.apply_to(), surfacing as expiry_status="revoked".
+
+Also fixed here, all pre-existing and unrelated to the above:
+
+  - NO REQUEST SIZE CAP. `await file.read()` pulled the entire upload
+    into memory with no ceiling. The dashboard enforces 1 MB client-side,
+    but this endpoint is directly callable with a key and a curl command,
+    so that limit was decorative. Now streamed in chunks against
+    MAX_COOKIE_BYTES and rejected with a 413.
+
+  - NON-ATOMIC WRITE. `open(path, "wb")` truncates first. A crash, an
+    OOM kill or a full disk between truncate and write left a corrupt
+    cookie file AND destroyed the working one it replaced. Worse, a
+    download running concurrently reads that same path as its
+    cookiefile and could see it half-written. Now written to a temp file
+    in the same directory and swapped in with os.replace().
+
+  - NO WAY BACK FROM A BAD UPLOAD. Uploading a logged-out export over a
+    working primary at 2am destroyed the good file. The previous
+    contents are now kept at <path>.prev, which nothing reads
+    automatically (the slot paths in config.py are fixed) - it exists
+    purely so `mv cookies.txt.prev cookies.txt` gets you out of it.
+--------------------------------------------------------------------------
 """
 
 import os
+import shutil
+import tempfile
 import time
 from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 
+import cookie_health
 from config import (
+    logger,
     YT_COOKIES_PATH_DEFAULT,
     COOKIE_ACCOUNT_2_PATH,
     COOKIE_ACCOUNT_3_PATH,
@@ -123,6 +170,17 @@ CRITICAL_COOKIE_NAMES = {
 EXPIRY_WARNING_DAYS = 14
 EXPIRY_CRITICAL_DAYS = 3
 
+# Hard ceiling on an upload. A real cookies.txt export is 2-10 KB; the
+# largest plausible one with a huge history is still well under 100 KB.
+# 1 MB is deliberately generous - this is a memory guard against an
+# unbounded POST, not a format check. The format check is the
+# youtube.com marker below.
+MAX_COOKIE_BYTES = 1024 * 1024
+
+# Read granularity for the streamed upload. Small enough that the size
+# check fires long before anything meaningful is buffered.
+_CHUNK_BYTES = 64 * 1024
+
 
 def _parse_cookie_expiry(path: str) -> dict:
     """
@@ -141,6 +199,11 @@ def _parse_cookie_expiry(path: str) -> dict:
       - expiry 0 means a session cookie (dies with the browser). Those
         carry no useful deadline and are excluded rather than treated as
         "expired in 1970", which would report every file as long dead.
+
+    IMPORTANT LIMIT, see this module's 2026-08-16 note: a future date
+    here proves only that the clock has not run out. It says nothing
+    about whether Google still honours the session. That question is
+    answered by cookie_health, not by this function.
 
     Never raises. A malformed or unreadable cookie file must degrade to
     "unknown" in a status panel, never take down the status endpoint.
@@ -252,6 +315,95 @@ def _cookie_path(slot: int) -> str:
     return _SLOT_PATHS[slot]
 
 
+async def _read_upload_capped(file: UploadFile) -> bytes:
+    """
+    Streams the upload into memory in chunks, aborting the moment it
+    exceeds MAX_COOKIE_BYTES.
+
+    The previous `await file.read()` had no ceiling at all. The dashboard
+    checks 1 MB before sending, but a client-side check is a UX nicety,
+    not a control - this endpoint takes a key and a multipart body, so
+    curl bypasses it entirely. On a 6 GB VPS also running Demucs and a
+    MIDI sidecar, an unbounded POST into RAM is the kind of thing that
+    takes the whole box down rather than just this request.
+
+    413 rather than 400: this is a size problem, not a format problem,
+    and the caller should be able to tell those apart.
+    """
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_COOKIE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Cookie file is larger than "
+                    f"{MAX_COOKIE_BYTES // 1024} KB. A real cookies.txt export "
+                    f"is only a few KB - this is almost certainly the wrong file."
+                ),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _write_cookie_file_atomic(path: str, content: bytes) -> None:
+    """
+    Writes `content` to `path` without ever leaving a partial file there.
+
+    Two reasons this can't be a plain open(path, "wb"):
+
+      1. open(..., "wb") truncates immediately. A crash, OOM kill or full
+         disk between the truncate and the write leaves a corrupt file
+         AND has already destroyed the working one it was replacing.
+
+      2. A download may be reading this exact path as its cookiefile at
+         the same moment - the slot paths here are the same ones
+         get_cookie_accounts() hands to yt-dlp. A truncated read midway
+         through an upload produces a bot-check that looks like a dead
+         session and is impossible to attribute later.
+
+    os.replace() is atomic within a filesystem, so a reader sees either
+    the old file or the new one, never a mixture. The temp file is
+    created in the same directory to guarantee that's a single
+    filesystem.
+
+    The .prev copy is a manual escape hatch, not a rotation scheme.
+    Nothing reads it - the slot paths in config.py are fixed - so it
+    exists only so that overwriting a working primary with a logged-out
+    export at 2am is recoverable with a single mv. Failing to make it is
+    deliberately non-fatal: a missing backup should not block a
+    legitimate upload.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, f"{path}.prev")
+        except OSError as e:
+            logger.warning(f"[COOKIES] Could not back up {path} to .prev (non-fatal): {e}")
+
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cookies.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 @router.post("/admin/upload-cookies")
 async def upload_cookies(
     request: Request,
@@ -261,7 +413,7 @@ async def upload_cookies(
 ):
     _check_admin(request, key)
     path = _cookie_path(slot)
-    content = await file.read()
+    content = await _read_upload_capped(file)
 
     if not content or b"youtube.com" not in content:
         raise HTTPException(
@@ -269,8 +421,17 @@ async def upload_cookies(
             detail="This doesn't look like a valid YouTube cookies.txt file. Upload rejected.",
         )
 
-    with open(path, "wb") as f:
-        f.write(content)
+    _write_cookie_file_atomic(path, content)
+
+    # Any runtime revocation verdict was about the bytes that were just
+    # replaced. Carrying it forward would flag a brand-new working export
+    # as dead, which is the one way this whole mechanism could make things
+    # worse than not having it.
+    #
+    # cookie_health also drops records that predate the file's mtime, so
+    # this is belt-and-braces - but doing it explicitly means the very
+    # next status poll is correct rather than merely self-correcting.
+    cookie_health.clear(path)
 
     # Parsed immediately and returned with the upload response, so a
     # logged-out or already-expired export is caught at upload time
@@ -282,11 +443,22 @@ async def upload_cookies(
     # one with a visible warning.
     expiry = _parse_cookie_expiry(path)
 
+    logger.info(
+        f"[COOKIES] Slot {slot} updated ({len(content)} bytes, "
+        f"status={expiry['expiry_status']}, "
+        f"auth_cookies={expiry['critical_cookies_found']})."
+    )
+
     return JSONResponse({
         "status": "ok",
         "slot": slot,
         "path": path,
         "bytes_written": len(content),
+        # Always null here by construction - the flag was just cleared
+        # above. Present so the response shape matches /admin/cookies/status
+        # and the dashboard can read one interface for both.
+        "revoked_at": None,
+        "revoked_reason": None,
         **expiry,
     })
 
@@ -294,6 +466,12 @@ async def upload_cookies(
 @router.get("/admin/cookies/status")
 def cookies_status(request: Request, key: str = Query(...)):
     _check_admin(request, key)
+
+    # Read the health sidecar ONCE for all three slots rather than once
+    # per slot - the dashboard polls this endpoint, so a per-slot read
+    # would triple the file I/O for no benefit.
+    health = cookie_health.snapshot()
+
     result = {}
     for slot in (1, 2, 3):
         path = _cookie_path(slot)
@@ -304,10 +482,14 @@ def cookies_status(request: Request, key: str = Query(...)):
                 "path": path,
                 "size_bytes": stat.st_size,
                 "last_modified": stat.st_mtime,
-                # See this module's docstring: exists/size/mtime all look
-                # healthy on a file whose session died months ago. This
-                # is the field that actually answers "will this work?".
-                **_parse_cookie_expiry(path),
+                # See this module's docstrings: exists/size/mtime all look
+                # healthy on a file whose session died months ago, and so
+                # does a valid expiry date once Google revokes the session
+                # server-side. _parse_cookie_expiry answers "has the clock
+                # run out"; cookie_health.apply_to layers on what the
+                # runtime actually observed, which is the only source that
+                # can answer "does this still work".
+                **cookie_health.apply_to(path, _parse_cookie_expiry(path), health),
             }
         else:
             result[f"slot_{slot}"] = {
@@ -317,12 +499,21 @@ def cookies_status(request: Request, key: str = Query(...)):
                 "expires_at": None,
                 "expires_in_days": None,
                 "critical_cookies_found": 0,
+                # Included so every slot object has the same keys whether
+                # or not the file exists - the dashboard reads one shape.
+                "revoked_at": None,
+                "revoked_reason": None,
             }
     return JSONResponse(result)
 
 
 @router.get("/admin/upload-cookies", response_class=HTMLResponse)
 def upload_form(request: Request, key: str = Query(...)):
+    """
+    Legacy standalone form. Superseded by the Next.js admin panel, kept
+    as the fallback for when the frontend is down or mid-deploy - which
+    is exactly when a cookie slot tends to need replacing.
+    """
     _check_admin(request, key)
     html = """
 <!DOCTYPE html>
@@ -377,6 +568,9 @@ const KEY = encodeURIComponent("PLACEHOLDER_ADMIN_KEY");
 function expiryCell(info) {
   if (!info.exists) return '<span class="missing">-</span>';
   var s = info.expiry_status;
+  // REVOKED outranks every date-derived state: the file's own expiry
+  // says nothing once Google has killed the session server-side.
+  if (s === "revoked") return '<span class="missing">REVOKED (re-export)</span>';
   if (s === "expired") return '<span class="missing">EXPIRED</span>';
   if (s === "critical") return '<span class="missing">' + info.expires_in_days + 'd left</span>';
   if (s === "warning") return '<span class="warn">' + info.expires_in_days + 'd left</span>';
@@ -395,10 +589,11 @@ async function loadStatus() {
     const cls = info.exists ? "ok" : "missing";
     const sizeInfo = info.exists ? (info.size_bytes / 1024).toFixed(1) + " KB" : "not uploaded";
     const modified = info.exists ? new Date(info.last_modified * 1000).toLocaleString() : "-";
-    return "<tr><td>" + slotName + "</td><td class=\\"" + cls + "\\">" + (info.exists ? "present" : "missing") + "</td><td>" + expiryCell(info) + "</td><td>" + sizeInfo + "</td><td>" + modified + "</td></tr>";
+    const auth = info.exists ? (info.critical_cookies_found != null ? info.critical_cookies_found : "?") : "-";
+    return "<tr><td>" + slotName + "</td><td class=\\"" + cls + "\\">" + (info.exists ? "present" : "missing") + "</td><td>" + expiryCell(info) + "</td><td>" + auth + "</td><td>" + sizeInfo + "</td><td>" + modified + "</td></tr>";
   }).join("");
   document.getElementById("statusTable").innerHTML =
-    "<tr><th>Slot</th><th>File</th><th>Session</th><th>Size</th><th>Last updated</th></tr>" + rows;
+    "<tr><th>Slot</th><th>File</th><th>Session</th><th>Auth</th><th>Size</th><th>Last updated</th></tr>" + rows;
 }
 
 document.getElementById("uploadForm").addEventListener("submit", async function(e) {
@@ -425,7 +620,7 @@ document.getElementById("uploadForm").addEventListener("submit", async function(
     }
     resultDiv.innerHTML = "<span class=\\"ok\\">Uploaded successfully: " + data.bytes_written + " bytes to slot " + data.slot + "</span>" + warn;
   } else {
-    resultDiv.innerHTML = "<span class=\\"missing\\">Error: " + data.detail + "</span>";
+    resultDiv.innerHTML = "<span class=\\"missing\\">Error: " + (data.detail || res.status) + "</span>";
   }
   loadStatus();
 });
