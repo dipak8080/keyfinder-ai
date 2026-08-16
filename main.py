@@ -62,6 +62,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import (
     logger,
@@ -161,7 +162,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"[JOBS] Shutting down with jobs in table: {stats}")
 
 
-app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.6.0", lifespan=lifespan)
+app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.7.0", lifespan=lifespan)
 
 # Logs every HTTP request (timestamp, method, path, status, duration, IP) to SQLite
 app.add_middleware(RequestLoggerMiddleware)
@@ -243,6 +244,75 @@ async def log_validation_errors(request: Request, exc: RequestValidationError):
         logger.warning(f"[VALIDATION] Could not summarise validation error: {e}")
 
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+# ============================================================
+# HTTP EXCEPTION LOGGING (added 2026-08-16, same day as the 422 fix)
+#
+# WHY THIS EXISTS: the 422 handler above only covers FastAPI's own
+# RequestValidationError - it never fires for a manually raised
+# HTTPException(400)/(404)/(409)/(413)/(503), which is most of this
+# app's actual rejections (see midi.py's onset_threshold check,
+# _shared.py's 400/404/409/500/503, save_upload's 413). Those all hit
+# the same blind spot the 422s used to: a row in request_logs, zero
+# lines in system_logs, and the only place the reason ever existed was
+# the HTTP response body sent back to the caller - never visible from
+# the dashboard.
+#
+# This closes that gap the same way: log what actually happened, then
+# return the exact response Starlette's own default handler would have
+# produced, so no existing caller (frontend included) sees any
+# behaviour change.
+#
+# WHY NOT JUST `raise exc`: FastAPI does not re-run its own default
+# exception handling on a re-raised exception from inside a registered
+# handler - doing that turns a clean 400 into an unhandled 500. The
+# response has to be built here explicitly, mirroring what Starlette's
+# default HTTPException handler already returns.
+#
+# WHY 404 AND 429 ARE EXCLUDED: this VPS gets scanned constantly (see
+# NOISE_PATH_MARKERS in config.py - the same list the dashboard's "Hide
+# noise" filter uses). Every one of those hits is a 404. Logging all of
+# them at WARNING would flood system_logs with entries that carry zero
+# diagnostic value and bury the rejections that are actually worth
+# reading. 429 (rate limit) is excluded for the same reason from a
+# different cause - it's the rate limiter working exactly as designed,
+# not a signal of anything wrong.
+#
+# WHY < 500 ONLY: a 5xx raised as an HTTPException would mean something
+# on this server's own side broke, which is a different class of
+# problem than "this server correctly rejected bad input" - that
+# belongs at ERROR with a traceback, not folded into this WARNING-level
+# rejection log. Nothing in this codebase currently raises
+# HTTPException with a 5xx status, so this is a guard for the future,
+# not a case seen today.
+# ============================================================
+@app.exception_handler(StarletteHTTPException)
+async def log_http_exceptions(request: Request, exc: StarletteHTTPException):
+    """
+    Logs manually-raised HTTPExceptions - 400/404/409/413/503 today,
+    whatever routes.py or midi.py raise next tomorrow - the same way
+    log_validation_errors logs 422s. Rebuilds Starlette's own default
+    response shape exactly, so this is purely additive observability
+    with no change to what any caller receives.
+    """
+    if exc.status_code < 500 and exc.status_code not in (404, 429):
+        try:
+            logger.warning(
+                f"[HTTP_EXCEPTION] {request.method} {request.url.path} "
+                f"rejected ({exc.status_code}) - {exc.detail}"
+            )
+        except Exception as e:
+            # Same rule as the 422 handler above: a logging failure must
+            # never be the reason a request fails.
+            logger.warning(f"[HTTP_EXCEPTION] Could not log exception detail: {e}")
+
+    headers = getattr(exc, "headers", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers,
+    )
 
 
 app.include_router(router)
