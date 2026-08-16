@@ -58,8 +58,10 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from config import (
     logger,
@@ -171,6 +173,77 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# VALIDATION ERROR LOGGING (added 2026-08-16)
+#
+# WHY THIS EXISTS: FastAPI's validation layer runs BEFORE the route
+# handler. Every logger.info() call in this codebase lives inside a
+# handler, so a request rejected at validation produces a row in
+# request_logs and ZERO system log lines - which is exactly what the
+# admin dashboard showed for "POST /convert -> 422 - 0 lines". The
+# status code said "malformed request" and nothing anywhere said WHICH
+# FIELD, or whether the caller was a real user or a scanner.
+#
+# That ambiguity is the whole problem. A scanner probing /convert with
+# an empty body and a genuine frontend/backend contract mismatch produce
+# an identical log signature. One is noise to ignore forever; the other
+# is a bug silently breaking a tool for real users. Without the field
+# names there is no way to tell them apart, so either you investigate
+# every scanner hit or you learn to ignore the category entirely -
+# and the second is what actually happens.
+#
+# Confirmed before writing this: no route in this app raises
+# HTTPException(422) on the /convert path. _shared.py uses 400/404/409/
+# 500/503, save_upload uses 413. So a 422 here can ONLY be a
+# RequestValidationError, i.e. a genuinely malformed request body.
+# ============================================================
+@app.exception_handler(RequestValidationError)
+async def log_validation_errors(request: Request, exc: RequestValidationError):
+    """
+    Logs WHY a request was rejected with 422, then returns FastAPI's own
+    default response shape completely unchanged.
+
+    FIELD NAMES ONLY, NEVER VALUES. A rejected request's form fields can
+    carry anything the caller chose to send, and log_stream.py writes
+    these lines into a SQLite table that renders in the admin dashboard.
+    The field NAME is what identifies a contract mismatch; the value adds
+    nothing diagnostic while creating a path for arbitrary
+    caller-controlled data to land in the log store and be displayed
+    back. Not worth it for zero extra signal.
+
+    WARNING, not ERROR, deliberately. A 4xx is this server correctly
+    refusing bad input - not a server fault. Logging routine scanner
+    traffic at ERROR would put it in the same bucket as real failures,
+    and the predictable result is that the bucket stops being read.
+
+    The response body is byte-for-byte FastAPI's default. Anything
+    already parsing 422s - including humanizeError() in the frontend's
+    JobToolForm - keeps working exactly as before. This is purely
+    additive observability, with no behaviour change on any code path.
+    """
+    try:
+        problems = []
+        for err in exc.errors():
+            # loc looks like ("body", "target_format"). The leading
+            # "body"/"query" bucket is noise once the path is known, so
+            # it's dropped - what's left is the field name that matters.
+            location = ".".join(str(p) for p in err.get("loc", ()) if p != "body")
+            problems.append(f"{location or '?'}: {err.get('msg', 'invalid')}")
+        logger.warning(
+            f"[VALIDATION] {request.method} {request.url.path} rejected (422) - "
+            f"{'; '.join(problems) or 'no detail'}"
+        )
+    except Exception as e:
+        # A logging helper must never be the reason a request fails. If
+        # pydantic ever changes the shape of errors(), swallow it and
+        # still return the correct 422 below rather than turning a clean
+        # client error into a 500.
+        logger.warning(f"[VALIDATION] Could not summarise validation error: {e}")
+
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 app.include_router(router)
 app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)

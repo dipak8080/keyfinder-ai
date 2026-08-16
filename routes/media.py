@@ -61,6 +61,7 @@ from silence_splitter import split_on_silence
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
 from ._shared import (
+    spawn_background_task,
     _mb,
     _validated_input_format,
     _accept_upload,
@@ -211,7 +212,7 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
         mark_failed(job_id, e.detail if isinstance(e.detail, str) else "Upload rejected.")
         raise
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool="VIDEO_TO_AUDIO",
         metric="/video-to-audio",
         job_id=job_id,
@@ -304,7 +305,7 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
 
     output_path = build_output_path(job_id, target_format)
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool="JOIN",
         metric="/join",
         job_id=job_id,
@@ -394,7 +395,7 @@ async def silence_split_route(
     input_path, size = await _accept_upload(file, job_id, label="silence_split")
     await _validate_duration_or_reject(job_id, input_path)
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool="SILENCE_SPLIT",
         metric="/silence-split",
         job_id=job_id,

@@ -107,6 +107,7 @@ from audio_effects import apply_fade, convert_channels, resample_audio, make_rin
 from log_stream import set_job_context, remember_job_tags
 
 from ._shared import (
+    spawn_background_task,
     _validated_input_format,
     _submit_audio_tool,
     _tool_status,
@@ -225,7 +226,7 @@ async def trim_audio_route(
             f"end_seconds ({end_seconds}s) exceeds the audio's actual duration ({duration:.1f}s)."
         )
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool="TRIM",
         metric="/trim",
         job_id=job_id,

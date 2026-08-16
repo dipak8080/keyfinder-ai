@@ -56,7 +56,7 @@ from separation import run_separation, run_stem_separation
 from utils import _separation_semaphore
 from log_stream import remember_job_tags, set_job_context, tag_from_job
 
-from ._shared import _accept_upload, _log_queued, _reject_if_separation_queue_full, _run_tool_job
+from ._shared import spawn_background_task, _accept_upload, _log_queued, _reject_if_separation_queue_full, _run_tool_job
 
 router = APIRouter()
 
@@ -129,7 +129,7 @@ async def _queue_separation(
         success_detail = None
         generic_error = "Separation failed unexpectedly."
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool=tool,
         metric=metric_label,
         job_id=job_id,

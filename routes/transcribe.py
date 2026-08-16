@@ -32,6 +32,7 @@ from speech_to_text import transcribe
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
 from ._shared import (
+    spawn_background_task,
     _validated_input_format,
     _accept_upload,
     _validate_duration_or_reject,
@@ -69,7 +70,7 @@ async def speech_to_text_route(file: UploadFile = File(...)):
     # below the other tools' 20 minutes.
     await _validate_duration_or_reject(job_id, input_path, MAX_TRANSCRIPTION_DURATION_SECONDS)
 
-    asyncio.create_task(_run_tool_job(
+    spawn_background_task(_run_tool_job(
         tool="SPEECH_TO_TEXT",
         metric="/speech-to-text",
         job_id=job_id,

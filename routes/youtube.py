@@ -226,7 +226,7 @@ from log_stream import (
     tag_from_job,
 )
 
-from ._shared import _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
+from ._shared import spawn_background_task, _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
 
 router = APIRouter()
 
@@ -690,7 +690,7 @@ async def _run_youtube_separation(
 
     tool/tier: not set here either, same reasoning as _chain_download's
     docstring above - the calling route already set it before
-    asyncio.create_task() spawned this function, so it's already
+    spawn_background_task() spawned this function, so it's already
     inherited by the time this runs.
     """
     suffix = "_HQ" if hq else ""
@@ -761,7 +761,7 @@ async def youtube_analyze_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_analyze", ttl_seconds=YOUTUBE_ANALYZE_JOB_TTL_SECONDS)
 
     remember_job_tags(job_id)
-    asyncio.create_task(_run_youtube_analyze(job_id, url))
+    spawn_background_task(_run_youtube_analyze(job_id, url))
 
     logger.info(f"[YOUTUBE_ANALYZE] job={job_id} queued for {url}")
     return JSONResponse({"job_id": job_id, "status": "processing"})
@@ -809,7 +809,7 @@ async def youtube_separate_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_separate")
 
     remember_job_tags(job_id)
-    asyncio.create_task(_run_youtube_separation(
+    spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=False,
         model=SEPARATION_MODEL,
@@ -866,7 +866,7 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_separate")
 
     remember_job_tags(job_id)
-    asyncio.create_task(_run_youtube_separation(
+    spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=False,
         model=SEPARATION_MODEL_HQ,
@@ -934,7 +934,7 @@ async def youtube_stems_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_stems")
 
     remember_job_tags(job_id)
-    asyncio.create_task(_run_youtube_separation(
+    spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=True,
         model=SEPARATION_MODEL,
@@ -979,7 +979,7 @@ async def youtube_stems_hq_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_stems")
 
     remember_job_tags(job_id)
-    asyncio.create_task(_run_youtube_separation(
+    spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=True,
         model=SEPARATION_MODEL_HQ,

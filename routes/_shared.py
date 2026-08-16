@@ -18,6 +18,12 @@ acquire_slot_or_503() and run_blocking() - see utils.py's own docstring.
 This module imports the ones it needs from there rather than defining
 them, so there is exactly one place all six concurrency limits are
 declared.
+
+--------------------------------------------------------------------------
+ADDED 2026-08-16: spawn_background_task() - see its own docstring for the
+garbage-collection hazard it closes. Every asyncio.create_task() call in
+this package should go through it.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -55,6 +61,70 @@ from audio_common import (
 )
 from monitoring import record_result
 from log_stream import set_job_context, remember_job_tags, tag_from_job
+
+
+# ============================================================
+# BACKGROUND TASK REGISTRY (added 2026-08-16)
+#
+# WHY THIS EXISTS: asyncio's event loop holds only a WEAK reference to
+# the tasks it is running. This is documented behaviour, not a quirk -
+# see the warning in the asyncio.create_task() docs. A task with no
+# strong reference held anywhere can therefore be garbage-collected
+# mid-execution: it simply stops, partway through, with no exception, no
+# traceback, and no log line.
+#
+# Every job-based tool in this package spawned its runner as
+# `asyncio.create_task(...)` used as a bare statement - the returned Task
+# discarded immediately, so nothing anywhere held a reference to it.
+#
+# The failure mode if it ever fires is the worst possible shape: the job
+# row stays at "processing" forever. mark_failed() is never called, the
+# `finally` block in _run_tool_job (including fail_if_unfinished) never
+# runs, because the coroutine was COLLECTED rather than raising anything
+# that a finally could catch. From the outside it is identical to the
+# "it just spun forever" class of report that _chain_download's own
+# docstring describes fixing - same symptom, entirely different
+# mechanism, and this one was still open.
+#
+# It is rare, because it needs a GC cycle to land at exactly the wrong
+# moment. It is also much less rare on a 6GB box that runs Demucs and
+# TensorFlow, which is precisely the environment where GC pressure is
+# real rather than theoretical.
+#
+# The fix is the one the asyncio docs prescribe: keep a strong reference
+# until the task finishes, then drop it. add_done_callback fires whether
+# the task completed, failed, or was cancelled, so the set cannot leak.
+# ============================================================
+_background_tasks: set = set()
+
+
+def spawn_background_task(coro) -> asyncio.Task:
+    """
+    asyncio.create_task() plus a strong reference held until completion.
+
+    Use this instead of a bare asyncio.create_task() for any fire-and-
+    forget task - i.e. anywhere the returned Task isn't already being
+    stored in a variable that outlives the call (main.py's cleanup_task
+    is stored and awaited at shutdown, so it is correctly exempt).
+
+    Returns the Task, so a caller that DOES want to hold it still can.
+
+    No behaviour change beyond preventing the collection hazard above:
+    the coroutine runs identically, exceptions surface identically, and
+    the done-callback only removes the set entry.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def background_task_count() -> int:
+    """How many spawned tasks are currently in flight. Useful from
+    /admin/status if a "why is nothing finishing" question ever comes
+    up - a count that only grows is the signature of tasks starting and
+    never completing."""
+    return len(_background_tasks)
 
 
 def _mb(num_bytes: int) -> str:
@@ -139,7 +209,7 @@ async def _run_tool_job(
 
     NOTE ON tool/tier: this function does NOT call set_job_context()
     itself, deliberately. By the time this runs (inside a task spawned
-    via asyncio.create_task()), the calling route handler has already
+    via spawn_background_task()), the calling route handler has already
     set tool/tier on the contextvar - and since create_task() copies the
     context at the moment it's called, this task already inherited it.
     Setting it again here would be redundant at best; the single call
@@ -153,6 +223,12 @@ async def _run_tool_job(
       Error` or `except Exception` here would catch if it were raised
       before the try). Then file cleanup, then memory release, then the
       metric, then GPU billing - each independent of the others.
+
+      Worth knowing what this does NOT cover: if the task itself is
+      garbage-collected mid-run, none of this executes at all, because
+      collection is not an exception and a `finally` has nothing to
+      unwind. That hazard is closed at the spawn site instead - see
+      spawn_background_task() above.
     """
     started = time.monotonic()
     succeeded = False
@@ -434,7 +510,7 @@ async def _submit_audio_tool(
     voice-clean, echo-remove, silence-remove, fade, channels, resample,
     ringtone), since none of them have a tier. It runs before the job is
     even created, so it's set on the contextvar before
-    asyncio.create_task() below copies the context into the background
+    spawn_background_task() below copies the context into the background
     task - and before the HTTP response is returned, so the request's own
     row in request_logs picks it up too.
     """
@@ -500,7 +576,12 @@ async def _submit_audio_tool(
                 f"Audio is too short ({duration:.1f}s). Minimum is {min_duration_seconds}s.",
             )
 
-    asyncio.create_task(_run_tool_job(
+    # spawn_background_task, not a bare asyncio.create_task - see that
+    # function's docstring for the garbage-collection hazard. A collected
+    # task leaves the job stuck at "processing" forever with no log line,
+    # which is the single hardest failure shape to diagnose after the
+    # fact.
+    spawn_background_task(_run_tool_job(
         tool=tool,
         metric=metric,
         job_id=job_id,
