@@ -162,7 +162,44 @@ async def lifespan(app: FastAPI):
     logger.info(f"[JOBS] Shutting down with jobs in table: {stats}")
 
 
-app = FastAPI(title="Audio Analysis API - ESSENTIA FIXED", version="12.7.0", lifespan=lifespan)
+# ============================================================
+# INTERACTIVE DOCS DISABLED (2026-08-17)
+#
+# docs_url / redoc_url / openapi_url are all None, so this app serves no
+# Swagger UI, no ReDoc, and no machine-readable schema at any path.
+#
+# WHY: /openapi.json is a complete, structured map of every route this
+# service exposes - paths, methods, and the exact shape of every request
+# body - published to anyone who asks. That is precisely the reconnaissance
+# step that precedes targeted probing, and it costs an attacker one GET.
+# There is a Cloudflare rule (block-recon-paths) blocking /docs, /redoc
+# and /openapi.json at the edge, but a WAF rule is a config entry that can
+# be deleted, reordered, or bypassed if the origin is ever reachable
+# directly; not generating the schema at all removes the thing being
+# protected instead of guarding it. Defense in depth, cheapest layer first.
+#
+# NOTHING ELSE CHANGES. These three parameters only control the docs
+# endpoints - route registration, validation, and every response body are
+# completely unaffected. The frontend never touched /docs.
+#
+# TO READ THE SCHEMA DURING DEVELOPMENT: temporarily set openapi_url back
+# to "/openapi.json" locally, or introspect the live app without exposing
+# anything:
+#
+#   docker exec audioforges-api python3 -c \
+#     "from main import app; import json; print(json.dumps(app.openapi()))"
+#
+# The /admin/endpoints route (auth-gated) also already lists every
+# registered route, which covers most of what /docs was actually used for.
+# ============================================================
+app = FastAPI(
+    title="Audio Analysis API - ESSENTIA FIXED",
+    version="12.7.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # Logs every HTTP request (timestamp, method, path, status, duration, IP) to SQLite
 app.add_middleware(RequestLoggerMiddleware)
