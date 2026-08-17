@@ -2067,97 +2067,97 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         fallback at the bottom of this function, and the degraded-path
         short-circuit just below (which skips direct entirely).
 
-        Uses whichever cookie account is still available - proxy fixes IP
-        reputation, cookies fix session identity; the two are independent
-        problems that can combine.
+        RETRIES ON TLS ONLY (added 2026-08-18). A handshake failure is a
+        property of the EXIT NODE, not of YouTube, the cookies, or this
+        server - and it fails in ~1ms with zero bytes transferred, so a
+        fresh exit costs nothing to try. Confirmed in production: direct
+        failed with a media-phase 403, the proxy attempt then died on
+        SSLV3_ALERT_HANDSHAKE_FAILURE at "Downloading webpage" one
+        millisecond later, and the whole download was lost to a bad node
+        that a second draw would have avoided.
+
+        Deliberately narrow. Bot-checks, quota errors, and every other
+        failure keep the single-attempt behaviour, because those fail
+        identically on a new exit - re-rolling them would fight the
+        bot-check breaker and spend real bandwidth confirming a known
+        outcome.
         """
-        remaining_accounts = get_cookie_accounts()
-        proxied_opts = dict(base_ydl_opts)
-        # One session id shared by both phases - see _sticky_proxy_url.
-        # With no template configured this is just proxy_url unchanged.
-        session_id = uuid.uuid4().hex[:12]
-        proxied_opts["proxy"] = _sticky_proxy_url(proxy_url, session_id)
-        proxy_account = remaining_accounts[0] if remaining_accounts else None
-        if proxy_account:
-            proxied_opts["cookiefile"] = proxy_account
-        else:
-            proxied_opts.pop("cookiefile", None)
-        proxied_opts = _apply_player_clients(proxied_opts, has_cookies=bool(proxy_account))  # <-- ADDED
+        PROXY_TLS_MAX_SESSIONS = 3
 
-        _reset_cookie_flag()
-        _set_active_account(proxy_account)
-        if proxy_account:
-            logger.info(f"[PROXY] Using cookie account: {proxy_account}")
-        else:
-            # Worth a WARNING, not an info line: the proxy fixes IP
-            # reputation, not session identity. Without a cookie the
-            # bot-check is close to guaranteed, and during the
-            # 2026-08-08 incident this state was completely silent -
-            # the logs showed a bot-check with no hint that the real
-            # cause was every account having been disabled moments
-            # earlier by unrelated CDN timeouts.
-            logger.warning(
-                "[PROXY] No healthy cookie accounts available for the proxy "
-                "attempt - a bot-check is near-certain. Check whether accounts "
-                "were recently disabled (see [COOKIES] lines above)."
-            )
-        # Media phase differs from the extraction phase in exactly ONE
-        # way: no proxy. cookiefile is deliberately KEPT even though a
-        # signed googlevideo URL does not need it - this rollout is a
-        # measurement, and adding a second variable (cookies present vs
-        # absent) would make any success-rate movement impossible to
-        # attribute. Drop it later, once the numbers are in.
-        media_opts = None
-        if split_tunnel_available() and proxied_opts.get("proxy"):
-            media_opts = dict(proxied_opts)
-            media_opts.pop("proxy", None)
-            # Bounds the added latency. A failed direct media attempt is
-            # pure overhead on top of the request's existing budget, and
-            # DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS in the parent will
-            # SIGKILL the whole process group when that budget runs out -
-            # turning a request that would have succeeded via proxy into
-            # a timeout. youtube_chain.py's opts set no socket_timeout at
-            # all (only routes/youtube.py's /download does), so this is
-            # the one place that guarantees a floor for both callers.
-            media_opts["socket_timeout"] = MEDIA_SOCKET_TIMEOUT_SECONDS
+        for session_attempt in range(1, PROXY_TLS_MAX_SESSIONS + 1):
+            remaining_accounts = get_cookie_accounts()
+            proxied_opts = dict(base_ydl_opts)
+            # One session id shared by both phases - see _sticky_proxy_url.
+            session_id = uuid.uuid4().hex[:12]
+            proxied_opts["proxy"] = _sticky_proxy_url(proxy_url, session_id)
+            proxy_account = remaining_accounts[0] if remaining_accounts else None
+            if proxy_account:
+                proxied_opts["cookiefile"] = proxy_account
+            else:
+                proxied_opts.pop("cookiefile", None)
+            proxied_opts = _apply_player_clients(proxied_opts, has_cookies=bool(proxy_account))
 
-        try:
-            result = extract_info_with_retry(proxied_opts, url, media_opts)
-            logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
-            record_account_result(proxy_account, True, "proxy")
-            record_path_attempt("proxy", True)
-            return result
-        except Exception as proxy_error:
-            proxy_error_text = str(proxy_error)
-            record_account_result(proxy_account, False, "proxy", proxy_error_text)
-            record_path_attempt("proxy", False)
-
-            if is_proxy_quota_error(proxy_error_text):
-                _trip_proxy_circuit_breaker()
-            elif is_bot_check_error(proxy_error_text):
-                # Feed the cost-control breaker. Deliberately does NOT
-                # disable the cookie account: a bot-check here says the
-                # EXIT IP was challenged, not that the session is dead -
-                # and on 2026-08-08 the same account had authenticated
-                # successfully on the direct attempt seconds earlier.
-                # Disabling on this signal would recreate exactly the
-                # false-positive cascade that took all three accounts
-                # offline that morning.
-                record_proxy_botcheck()
-                logger.warning(
-                    f"[PROXY] Bot-check through proxy (phase="
-                    f"{failure_phase(proxy_error_text)}). The exit IP was "
-                    f"challenged - this does NOT mean the cookie is dead."
-                )
-            elif proxy_account and _was_cookie_flagged():
-                _disable_cookie_account(proxy_account)
-                logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
+            _reset_cookie_flag()
+            _set_active_account(proxy_account)
+            if proxy_account:
+                logger.info(f"[PROXY] Using cookie account: {proxy_account}")
             else:
                 logger.warning(
-                    f"[PROXY] Proxy attempt also failed (phase="
-                    f"{failure_phase(proxy_error_text)}): {proxy_error_text[:200]}"
+                    "[PROXY] No healthy cookie accounts available for the proxy "
+                    "attempt - a bot-check is near-certain. Check whether accounts "
+                    "were recently disabled (see [COOKIES] lines above)."
                 )
-            raise
+
+            media_opts = None
+            if split_tunnel_available() and proxied_opts.get("proxy"):
+                media_opts = dict(proxied_opts)
+                media_opts.pop("proxy", None)
+                media_opts["socket_timeout"] = MEDIA_SOCKET_TIMEOUT_SECONDS
+
+            try:
+                result = extract_info_with_retry(proxied_opts, url, media_opts)
+                logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
+                record_account_result(proxy_account, True, "proxy")
+                record_path_attempt("proxy", True)
+                return result
+
+            except Exception as proxy_error:
+                proxy_error_text = str(proxy_error)
+
+                # Checked BEFORE any recording: a handshake that never
+                # completed is not a proxy-path outcome, and counting it
+                # would bury the real success rate under node noise.
+                if (is_proxy_tls_error(proxy_error_text)
+                        and session_attempt < PROXY_TLS_MAX_SESSIONS):
+                    logger.warning(
+                        f"[PROXY] TLS handshake failed on exit session "
+                        f"{session_id} (attempt {session_attempt}/"
+                        f"{PROXY_TLS_MAX_SESSIONS}) - rolling a fresh session. "
+                        f"This is a bad exit node, not a YouTube-side block."
+                    )
+                    continue
+
+                record_account_result(proxy_account, False, "proxy", proxy_error_text)
+                record_path_attempt("proxy", False)
+
+                if is_proxy_quota_error(proxy_error_text):
+                    _trip_proxy_circuit_breaker()
+                elif is_bot_check_error(proxy_error_text):
+                    record_proxy_botcheck()
+                    logger.warning(
+                        f"[PROXY] Bot-check through proxy (phase="
+                        f"{failure_phase(proxy_error_text)}). The exit IP was "
+                        f"challenged - this does NOT mean the cookie is dead."
+                    )
+                elif proxy_account and _was_cookie_flagged():
+                    _disable_cookie_account(proxy_account)
+                    logger.warning(f"[PROXY] Cookie account '{proxy_account}' also failed via proxy - disabled.")
+                else:
+                    logger.warning(
+                        f"[PROXY] Proxy attempt also failed (phase="
+                        f"{failure_phase(proxy_error_text)}): {proxy_error_text[:200]}"
+                    )
+                raise
 
     # DEGRADED-PATH SHORT CIRCUIT. When the direct-path breaker is
     # tripped, every direct attempt is a known ~10s socket_timeout
