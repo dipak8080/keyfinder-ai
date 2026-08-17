@@ -909,11 +909,12 @@ def should_use_proxy(error_text: str) -> bool:
         is_ip_block_error(error_text)
         or is_bot_check_error(error_text)
         or is_cdn_connect_timeout_error(error_text)
-        # Kept escalating, same as before the connect/read split - see
-        # is_cdn_read_timeout_error()'s docstring. Only the breaker and
-        # fail-fast behaviour changed; escalation is untouched so the
-        # success rate is unaffected.
         or is_cdn_read_timeout_error(error_text)
+        # ADDED: a TLS handshake failure is a negotiation this server (or
+        # this exit) couldn't complete. A different exit does its own
+        # handshake and genuinely can succeed - unlike the account-
+        # privilege errors deliberately excluded above.
+        or is_proxy_tls_error(error_text)
     )
 
 
