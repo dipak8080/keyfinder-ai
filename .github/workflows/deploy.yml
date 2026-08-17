@@ -112,6 +112,18 @@ jobs:
 
             # Start new container - now on audioforges-net so it can reach
             # midi-worker by container name.
+            #
+            # PORT BINDING (2026-08-17): published on 127.0.0.1 ONLY, never
+            # 0.0.0.0. Docker writes its port publishing rules into iptables'
+            # nat table, which is evaluated BEFORE ufw's INPUT filter - so a
+            # plain "-p 8000:8000" is reachable from the public internet even
+            # though ufw only allows 443/80 from Cloudflare ranges. That made
+            # http://<vps-ip>:8000 a full bypass of Cloudflare: no WAF rules,
+            # no rate limiting, no TLS, straight to the app. Binding to the
+            # loopback address means only host-local processes can reach it,
+            # which is exactly nginx (proxy_pass http://127.0.0.1:8000) and
+            # the health checks below. If this ever reverts to "8000:8000",
+            # the entire edge perimeter becomes decorative.
             docker run -d \
               --name audioforges-api \
               --restart unless-stopped \
@@ -119,7 +131,7 @@ jobs:
               --env-file .env \
               -e PORT=8000 \
               -v /home/deploy/app/data:/app/data \
-              -p 8000:8000 \
+              -p 127.0.0.1:8000:8000 \
               audioforges-api:latest
 
             # Wait longer + retry health check (model loading is slow)
@@ -152,7 +164,7 @@ jobs:
                 --env-file .env \
                 -e PORT=8000 \
                 -v /home/deploy/app/data:/app/data \
-                -p 8000:8000 \
+                -p 127.0.0.1:8000:8000 \
                 audioforges-api:rollback
 
               sleep 15
