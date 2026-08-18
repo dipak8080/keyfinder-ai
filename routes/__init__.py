@@ -24,12 +24,13 @@ Target structure:
       __init__.py        # this file - imports every sub-router, exposes one `router`
       _shared.py          # helpers used by 2+ route modules
       youtube.py           # /download, /youtube/analyze|separate|stems (+hq)
-      separation.py        # /separate, /stems (+hq)
-      audio_tools.py       # the 13 ffmpeg/rubberband tools + fade/channels/resample/ringtone
-      midi.py               # /audio-to-midi
-      transcribe.py         # /speech-to-text
-      media.py               # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
-      admin.py                # /admin/*, /limits, /health, /
+      tiktok.py             # /tiktok-to-mp3
+      separation.py          # /separate, /stems (+hq)
+      audio_tools.py          # the 13 ffmpeg/rubberband tools + fade/channels/resample/ringtone
+      midi.py                  # /audio-to-midi
+      transcribe.py             # /speech-to-text
+      media.py                   # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
+      admin.py                    # /admin/*, /limits, /health, /
 
 The six concurrency semaphores that used to be module-level globals in
 routes.py now live in utils.py, alongside the two that were already
@@ -60,10 +61,26 @@ which point `router` exists, fully assembled, with every sub-router's
 routes already merged in via include_router().
 
 --------------------------------------------------------------------------
+ADDED 2026-08-18: tiktok.py
+
+/tiktok-to-mp3 is a standalone route rather than a `source` field on
+/download, for the same reason /youtube/separate-hq is its own route
+rather than a `quality` form field: rate-limit dependencies are
+evaluated BEFORE the request body is read, so a Depends() cannot see a
+Form value and per-source limits therefore need per-source routes.
+
+It shares the semaphores, cache, rate limiter and monitoring with the
+YouTube path, but deliberately shares NONE of youtube.py's proxy tier,
+cookie rotation, circuit breakers, or client ladder - TikTok does not
+bot-check, and its one IP-shaped error was proven not to be fixed by a
+different exit IP. See tiktok/core.py's module docstring for the
+evidence behind each of those omissions.
+--------------------------------------------------------------------------
 """
 from fastapi import APIRouter
 
 from .youtube import router as _youtube_router
+from .tiktok import router as _tiktok_router
 from .separation import router as _separation_router
 from .audio_tools import router as _audio_tools_router
 from .midi import router as _midi_router
@@ -78,6 +95,7 @@ router = APIRouter()
 # same order as the target structure list above so this file reads as a
 # table of contents for the whole API.
 router.include_router(_youtube_router)
+router.include_router(_tiktok_router)
 router.include_router(_separation_router)
 router.include_router(_audio_tools_router)
 router.include_router(_midi_router)

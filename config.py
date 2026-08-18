@@ -904,3 +904,31 @@ MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECO
 # back to audioread/ffmpeg for containers soundfile can't read - and
 # midi-worker's Dockerfile installs ffmpeg for exactly this reason.
 MIDI_INPUT_FORMATS = frozenset(ALLOWED_AUDIO_INPUT_FORMATS) | {"opus", "webm"}
+
+
+
+
+
+# ---------- TIKTOK (/tiktok-to-mp3) ----------
+# Its OWN duration cap, not MAX_VIDEO_DURATION_SECONDS. TikTok's own
+# ceiling is 10 min, so this rejects nothing TikTok allows - and
+# coupling it to YouTube's 20 min would mean a future YouTube tuning
+# silently changes TikTok behaviour.
+MAX_TIKTOK_DURATION_SECONDS = int(os.environ.get("MAX_TIKTOK_DURATION_SECONDS", "600"))
+
+# Source audio measured ~64 kbps AAC across sampled posts (64208 and
+# 64544 bps, 2026-08-18). Encoding to 320 gives a 5x larger file with
+# bit-for-bit identical audible quality - the source caps it and no
+# encoder adds information back. The frontend must therefore not
+# advertise a bitrate number; "high quality MP3" is honest.
+TIKTOK_MP3_BITRATE = os.environ.get("TIKTOK_MP3_BITRATE", "128k")
+
+TIKTOK_MAX_ATTEMPTS = int(os.environ.get("TIKTOK_MAX_ATTEMPTS", "3"))
+TIKTOK_BASE_BACKOFF_SECONDS = float(os.environ.get("TIKTOK_BASE_BACKOFF_SECONDS", "1.5"))
+
+# Far more generous than /download's 10/hour, deliberately. That limit
+# exists because a YouTube download can cost paid proxy bandwidth.
+# TikTok has no proxy tier at all (see tiktok/core.py's docstring) and
+# files are ~400 KB, so the only real cost is a semaphore slot.
+TIKTOK_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("TIKTOK_RATE_LIMIT_MAX_REQUESTS", "30"))
+TIKTOK_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("TIKTOK_RATE_LIMIT_WINDOW_SECONDS", "3600"))
