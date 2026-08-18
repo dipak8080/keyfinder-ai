@@ -77,6 +77,42 @@ _STATUS_BY_KIND = {
     "unknown": 503,      # unclassified: assume transient, invite a retry
 }
 
+# Which kinds are worth a retry. THE BACKEND DECIDES THIS, not the
+# frontend - a client hardcoding "retry on 503" has to be redeployed
+# every time this judgement changes, and will drift out of sync the
+# moment it isn't. Shipping the decision in the response body means the
+# retry button appears or disappears based on what the server currently
+# believes, with no client change at all.
+#
+# Everything absent from this set fails identically forever: a photo
+# post, an age-gate, a deleted video and a region block will never
+# succeed on a second attempt, and offering a retry on those trains
+# people to hammer a request that cannot work.
+_RETRYABLE_KINDS = frozenset({"unknown", "crashed", "no_output"})
+
+
+def _error(status: int, kind: str, message: str) -> HTTPException:
+    """Builds every error this route returns, in one shape.
+
+    detail is a DICT rather than a bare string so the response carries
+    machine-readable fields alongside the human one. main.py's
+    StarletteHTTPException handler wraps whatever detail holds as
+    {"detail": ...}, so the client sees:
+
+        {"detail": {"message": "...", "kind": "...", "retryable": false}}
+
+    `message` is the only thing a user should ever see. `kind` exists so
+    a client can branch (e.g. show a "try a different video" link only
+    for photo posts) without string-matching English prose, which breaks
+    the moment the wording is improved or translated.
+    """
+    return HTTPException(status, detail={
+        "message": message,
+        "kind": kind,
+        "retryable": kind in _RETRYABLE_KINDS,
+    })
+
+
 # Cache namespace. MUST differ from the YouTube path's key space -
 # TikTok post IDs are 19-digit numbers and YouTube IDs are 11-char
 # strings so a collision is unlikely today, but relying on "unlikely"
@@ -104,7 +140,7 @@ async def tiktok_to_mp3(url: str = Form(...)):
 
     if not is_valid_tiktok_url(url):
         logger.warning(f"[TIKTOK] Rejected - not a recognizable TikTok URL: {url[:120]}")
-        raise HTTPException(400, "Please provide a valid TikTok video URL.")
+        raise _error(400, "invalid_url", "Please provide a valid TikTok video URL.")
 
     # Rejected here rather than in the worker: this costs 1ms and saves
     # a semaphore slot plus a ~3s failed extraction. Short links that
@@ -112,8 +148,8 @@ async def tiktok_to_mp3(url: str = Form(...)):
     # them, and core.py handles those on the error text instead.
     if is_photo_url(url):
         logger.info(f"[TIKTOK] Rejected photo post: {url[:120]}")
-        raise HTTPException(
-            400,
+        raise _error(
+            400, "photo_post",
             "This is a TikTok photo/slideshow post. Only videos with audio "
             "can be converted - try a video post instead."
         )
@@ -185,12 +221,12 @@ async def tiktok_to_mp3(url: str = Form(...)):
             )
             status = _STATUS_BY_KIND.get(kind, 503)
             logger.warning(f"[TIKTOK] job={job_id} failed kind={kind}: {message}")
-            raise HTTPException(status, message)
+            raise _error(status, kind, message)
 
         if not os.path.exists(mp3_path):
             logger.error(f"[TIKTOK] job={job_id} expected output missing: {mp3_path}")
-            raise HTTPException(
-                500,
+            raise _error(
+                500, "no_output",
                 "The audio file was not produced by the converter. Please try again."
             )
 
@@ -249,8 +285,8 @@ async def tiktok_to_mp3(url: str = Form(...)):
         raise
     except Exception as e:
         logger.error(f"[TIKTOK] job={job_id} unexpected error: {e}", exc_info=True)
-        raise HTTPException(
-            500,
+        raise _error(
+            500, "crashed",
             "Something went wrong while converting this TikTok. Please try again."
         )
     finally:
