@@ -46,6 +46,12 @@ from youtube import (
     is_members_only_error,
     is_not_yet_live_error,
     is_bot_check_error,
+    is_music_premium_error,
+    is_page_reload_error,
+    is_media_forbidden_error,
+    is_format_unavailable_error,
+    is_cdn_connect_timeout_error,
+    is_cdn_read_timeout_error,
     VideoTooLongError,
     proxy_available,
     get_cookie_accounts,
@@ -84,10 +90,33 @@ def classify_download_error(error_text: str) -> str:
     if is_not_yet_live_error(error_text):
         return ("This video is a scheduled premiere or live stream that hasn't started yet - "
                 "try again once it's live.")
+    if is_music_premium_error(error_text):
+        return ("This track is exclusive to YouTube Music Premium subscribers and isn't "
+                "publicly downloadable - try a different video.")
     if is_bot_check_error(error_text):
         return ("YouTube is currently requiring bot verification or restricting available "
                 "formats for this video. Please try again in a few minutes.")
-    return f"Could not download this video: {error_text}"
+    if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text):
+        return ("Couldn't reach YouTube's servers for this video. Please try again in a moment.")
+    if (
+        is_page_reload_error(error_text)
+        or is_media_forbidden_error(error_text)
+        or is_format_unavailable_error(error_text)
+    ):
+        # Every client set on the ladder failed - a YouTube-side
+        # extraction change (SABR stripping format URLs, or a player JS
+        # challenge the current yt-dlp can't solve), not a bug here.
+        # Usually transient: the same video works again once YouTube
+        # rotates its experiment or yt-dlp ships a fix.
+        return ("YouTube is currently blocking downloads for this video. This is usually "
+                "temporary - please try again later, or try a different video.")
+    # Raw yt-dlp text is LOGGED by the caller, never surfaced. It leaks
+    # internals, means nothing to the user, and makes a working system
+    # look broken. The job still fails either way; only the wording
+    # changes.
+    logger.error(f"[YOUTUBE_CHAIN] Unclassified download failure: {error_text}")
+    return ("Something went wrong while downloading this video. Please try again, "
+            "or try a different video.")
 
 
 async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
@@ -217,7 +246,10 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     elif result["kind"] == "timeout":
         raise ChainDownloadError("This download is taking too long. Please try again.")
     elif result["kind"] == "crashed":
-        raise ChainDownloadError(f"Could not download this video: {result['error']}")
+        logger.error(f"[YOUTUBE_CHAIN] Job {job_id}: worker crashed: {result['error']}")
+        raise ChainDownloadError(
+            "Something went wrong while downloading this video. Please try again."
+        )
     else:
         raise ChainDownloadError(classify_download_error(result["error"]))
 
