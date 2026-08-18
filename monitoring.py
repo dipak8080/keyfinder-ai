@@ -9,7 +9,7 @@ webhook when failures spike past a threshold within a time window - with a
 cooldown so an ongoing outage doesn't spam you every few seconds.
 
 Intentionally simple: in-memory, per-instance, no database. If you ever run
-multiple Railway replicas, each instance tracks its own failures
+multiple replicas, each instance tracks its own failures
 independently (not a combined view) - fine for now, worth revisiting if you
 scale horizontally later.
 """
@@ -45,8 +45,8 @@ def _prune_old(endpoint: str, now: float):
 def _send_alert(message: str):
     if not ALERT_WEBHOOK_URL:
         # No webhook configured - still log CRITICAL so it's visible in
-        # Railway's Deploy Logs even without external alerting set up.
-        logger.critical(f"[ALERT] {message} (no ALERT_WEBHOOK_URL set - add one in Railway to get pinged externally)")
+        # `docker logs` even without external alerting set up.
+        logger.critical(f"[ALERT] {message} (no ALERT_WEBHOOK_URL set in .env - add one to get pinged externally)")
         return
     try:
         # Discord webhooks read "content"; Slack webhooks read "text".
@@ -96,7 +96,9 @@ def record_result(endpoint: str, success: bool):
                     message = (
                         f"AudioForges backend: {failures} failures on {endpoint} "
                         f"in the last {FAILURE_ALERT_WINDOW_SECONDS // 60} min. "
-                        f"Check Railway Deploy Logs (search '[COOKIES]', '[PROXY]', or '{endpoint}')."
+                        f"Check the admin log dashboard, or on the VPS: "
+                        f"docker logs audioforges-api 2>&1 | grep -E "
+                        f"'\\[COOKIES\\]|\\[PROXY\\]|\\[CLIENT\\]|Failed after all'"
                     )
                     _send_alert(message)
     except Exception as e:
