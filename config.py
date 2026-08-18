@@ -137,7 +137,7 @@ DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TI
 # controls the whole endpoint (both mp3 and wav) - tighten
 # DOWNLOAD_RATE_LIMIT_MAX_REQUESTS alone to cut proxy spend without
 # touching every other endpoint that still shares the generic default.
-DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "7"))
+DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "10"))
 DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 
