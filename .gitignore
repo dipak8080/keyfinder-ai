@@ -11,3 +11,10 @@ cookies_2.txt
 cookies_3.txt
 cookies*.txt
 data/
+.env
+.env.*
+run_container.sh
+
+.env
+.env.*
+run_container.sh
