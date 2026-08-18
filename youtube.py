@@ -309,7 +309,53 @@ def reset_split_breaker():
     logger.info("[SPLIT] Health breaker manually reset.")
 
 
-def _apply_player_clients(opts: dict, has_cookies: bool) -> dict:
+# CLIENT LADDER (added 2026-08-18).
+#
+# WHY NARROW SETS, ONE AT A TIME: yt-dlp queries EVERY client in a
+# player_client list and merges their formats, then picks the best by
+# quality sorting - NOT by client order. Confirmed in production: with
+# ['android_vr','android','web'] it selected format 251 from `web` and
+# died on "unable to download video data: HTTP Error 403", even though
+# tv_simply alone downloaded the same video fine. A merged list can
+# therefore pick a format whose URL is already dead. Trying one narrow
+# set per rung is what makes the working client's formats actually get
+# used, rather than hoping format sorting prefers them.
+#
+# Root cause of the 403: YouTube's SABR-only experiment (yt-dlp #12482)
+# strips URLs from android formats for affected sessions. Nightly yt-dlp
+# 2026.08.17 hits it too, so this is client selection, not a version fix.
+CLIENT_LADDER_NO_COOKIES = (
+    ['tv_simply'],
+    ['web_embedded'],
+    ['android_vr', 'android'],
+    ['web'],
+)
+CLIENT_LADDER_WITH_COOKIES = (
+    ['web_embedded'],
+    ['tv'],
+    ['web', 'web_safari'],
+)
+
+
+def _client_ladder(has_cookies: bool):
+    return CLIENT_LADDER_WITH_COOKIES if has_cookies else CLIENT_LADDER_NO_COOKIES
+
+
+def _ladder_len(has_cookies: bool) -> int:
+    return len(_client_ladder(has_cookies))
+
+
+class _TryNextClientSet(Exception):
+    """Internal signal, never escapes extract_info_with_retry: this rung
+    failed with something a DIFFERENT client set can plausibly fix.
+    Carries the original exception so ladder exhaustion re-raises the
+    real error, not this wrapper."""
+    def __init__(self, original):
+        self.original = original
+        super().__init__(str(original))
+
+
+def _apply_player_clients(opts: dict, has_cookies: bool, rung: int = 0) -> dict:
     """
     Overrides extractor_args.youtube.player_client on `opts` based on
     whether THIS specific attempt has a cookiefile attached, returning
@@ -319,11 +365,10 @@ def _apply_player_clients(opts: dict, has_cookies: bool) -> dict:
     audio formats) in favor of clients that actually work with cookies
     attached.
     """
+    ladder = _client_ladder(has_cookies)
     extractor_args = dict(opts.get('extractor_args') or {})
     youtube_args = dict(extractor_args.get('youtube') or {})
-    youtube_args['player_client'] = (
-        PLAYER_CLIENTS_WITH_COOKIES if has_cookies else PLAYER_CLIENTS_NO_COOKIES
-    )
+    youtube_args['player_client'] = list(ladder[min(rung, len(ladder) - 1)])
     extractor_args['youtube'] = youtube_args
     opts['extractor_args'] = extractor_args
     return opts
@@ -690,6 +735,19 @@ PAGE_RELOAD_MARKERS = (
 def is_page_reload_error(error_text: str) -> bool:
     normalized = _normalize_error_text(error_text)
     return any(marker in normalized for marker in PAGE_RELOAD_MARKERS)
+
+
+def is_media_forbidden_error(error_text: str) -> bool:
+    """
+    A 403 on the MEDIA fetch specifically. Distinct from a generic
+    IP-block because SABR produces this shape too: the format's URL is
+    dead on arrival for that client, and a different client set fixes it
+    where a different exit IP does not. Checked BEFORE is_ip_block_error
+    so the client ladder gets first refusal; if every rung 403s, the
+    error falls through to the normal IP-block path unchanged.
+    """
+    normalized = _normalize_error_text(error_text)
+    return "unable to download video data" in normalized and "403" in normalized
 
 
 def is_ipv6_unroutable_error(error_text: str) -> bool:
@@ -1745,7 +1803,52 @@ def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
     return result
 
 
-def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict] = None):
+def extract_info_with_retry(
+    ydl_opts: dict,
+    url: str,
+    media_opts: Optional[dict] = None,
+    max_client_rungs: Optional[int] = None,
+):
+    """
+    Walks the client ladder, running the full backoff-retry cycle at each
+    rung. A rung is only advanced for errors a different client set can
+    plausibly fix (format-unavailable, media-phase 403, player JS
+    challenge) - every other failure propagates immediately, exactly as
+    before, so bot-checks and CDN timeouts still reach the proxy tier at
+    the same speed.
+
+    max_client_rungs bounds the walk. _try_proxy passes a low value
+    because each rung there is a PAID extraction; the free direct path
+    walks the whole ladder.
+
+    On exhaustion the ORIGINAL exception is re-raised, so every
+    classifier downstream (routes.py's status-code chain, the skip-proxy
+    block, the breakers) sees exactly the error text it saw before this
+    existed.
+    """
+    has_cookies = bool(ydl_opts.get("cookiefile"))
+    total = _ladder_len(has_cookies)
+    limit = total if max_client_rungs is None else max(1, min(max_client_rungs, total))
+
+    for rung in range(limit):
+        rung_opts = _apply_player_clients(dict(ydl_opts), has_cookies, rung)
+        rung_media = (
+            _apply_player_clients(dict(media_opts), has_cookies, rung)
+            if media_opts is not None else None
+        )
+        try:
+            return _extract_with_backoff(rung_opts, url, rung_media)
+        except _TryNextClientSet as signal:
+            if rung + 1 >= limit:
+                raise signal.original
+            logger.warning(
+                f"[CLIENT] Rung {rung + 1}/{limit} "
+                f"({rung_opts['extractor_args']['youtube']['player_client']}) failed with a "
+                f"client-fixable error - trying the next client set: {str(signal.original)[:160]}"
+            )
+
+
+def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] = None):
     """
     NOTE: this function is fully synchronous/blocking (yt_dlp + time.sleep
     backoff). It must always be called via utils.run_blocking() from an
@@ -1925,7 +2028,7 @@ def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict]
                     f"Attempt {attempt}: player JS challenge failed for this "
                     f"client set - not retrying the same clients: {error_text}"
                 )
-                raise
+                raise _TryNextClientSet(e)
 
             if is_format_unavailable_error(error_text):
                 # No format in the manifest matched the player_client list
@@ -1941,7 +2044,18 @@ def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict]
                     f"Attempt {attempt}: no format available for this "
                     f"client/cookie combo - not retrying on the same combo: {error_text}"
                 )
-                raise
+                raise _TryNextClientSet(e)
+
+            if is_media_forbidden_error(error_text):
+                # SABR shape: this client's format URL is dead. A
+                # different client set genuinely fixes it (confirmed
+                # 2026-08-18). If every rung 403s, the ladder re-raises
+                # this untouched and the normal IP-block/proxy path runs.
+                logger.warning(
+                    f"Attempt {attempt}: media-phase 403 - the format URL for "
+                    f"this client set is dead: {error_text}"
+                )
+                raise _TryNextClientSet(e)
 
             if is_ip_block_error(error_text):
                 # Retrying from the SAME IP (direct-tier or already inside
@@ -2154,7 +2268,11 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 media_opts["socket_timeout"] = MEDIA_SOCKET_TIMEOUT_SECONDS
 
             try:
-                result = extract_info_with_retry(proxied_opts, url, media_opts)
+                # Capped: each rung here is a PAID extraction, unlike
+                # the free direct path which walks the whole ladder.
+                result = extract_info_with_retry(
+                    proxied_opts, url, media_opts, max_client_rungs=2
+                )
                 logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
                 record_account_result(proxy_account, True, "proxy")
                 record_path_attempt("proxy", True)
