@@ -48,7 +48,7 @@ bgutil-ytdlp-pot-provider==1.3.1
 # its anti-bot checks - unlike YouTube there is no client ladder to fall
 # back on there. Also gives yt-dlp an extra request handler for YouTube's
 # web-family clients.
-curl-cffi==0.15.0
+yt-dlp[default]==2026.07.04
 
 # ---------- SEPARATION (Demucs) ----------
 # CPU-only torch build - the default `pip install torch` often pulls a
