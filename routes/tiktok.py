@@ -120,6 +120,12 @@ async def tiktok_to_mp3(url: str = Form(...)):
 
     started = time.monotonic()
 
+    # Logged BEFORE any work, carrying the URL. Without this a failure
+    # further down tells you a TikTok failed but not WHICH one - and the
+    # url is the single most useful thing to have when reproducing a
+    # report by hand. /download logs the same line for the same reason.
+    logger.info(f"[TIKTOK] Request for {url}")
+
     # Only direct URLs carry an id. Short links return None here and are
     # cached AFTER conversion using the resolved id the worker reports -
     # so a vt. link still populates the cache for the next request, it
@@ -141,10 +147,17 @@ async def tiktok_to_mp3(url: str = Form(...)):
                 f"in {time.monotonic() - started:.2f}s"
             )
             record_result("/tiktok-to-mp3", True)
+            # SAME KEY SET as the fresh-conversion response below. A
+            # cache hit returning a different shape is the kind of bug
+            # that only appears on the second request for a given video,
+            # which is exactly when nobody is looking. duration is None
+            # here because the cache stores audio and title only.
             return JSONResponse({
                 "title": cached_title or "TikTok audio",
                 "audio": base64.b64encode(cached_audio).decode("utf-8"),
                 "format": "mp3",
+                "duration": None,
+                "id": post_id,
             })
 
     job_id = str(uuid.uuid4())
@@ -220,7 +233,17 @@ async def tiktok_to_mp3(url: str = Form(...)):
             f"in {time.monotonic() - started:.1f}s"
         )
         succeeded = True
-        return JSONResponse({"title": title, "audio": audio_b64, "format": "mp3"})
+        # duration and id are additive - a client that ignores them is
+        # unaffected. They exist so the frontend can show a length
+        # before playback and build a stable download filename without
+        # having to parse the (emoji-laden, arbitrarily long) title.
+        return JSONResponse({
+            "title": title,
+            "audio": audio_b64,
+            "format": "mp3",
+            "duration": result.get("duration"),
+            "id": cache_id,
+        })
 
     except HTTPException:
         raise

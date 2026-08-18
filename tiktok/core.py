@@ -124,10 +124,28 @@ _SHORT_URL_PATTERN = re.compile(r"^https?://(?:vt|vm)\.tiktok\.com/", re.IGNOREC
 _VIDEO_ID_PATTERN = re.compile(r"/(?:video|photo|v)/(\d+)")
 
 
+# Nothing legitimate comes close to this. It exists so a multi-megabyte
+# string cannot be fed to the regex engine (catastrophic backtracking is
+# not possible with these patterns, but the memory copy in .strip() is
+# real) and so absurd input is rejected before a semaphore slot or a
+# subprocess is spent on it.
+MAX_URL_LENGTH = 2048
+
+
 def is_valid_tiktok_url(url: str) -> bool:
     if not url or not isinstance(url, str):
         return False
-    return bool(_TIKTOK_URL_PATTERN.match(url.strip()))
+    if len(url) > MAX_URL_LENGTH:
+        return False
+    stripped = url.strip()
+    # Control characters have no business in a URL and are a classic
+    # way to smuggle a newline into something downstream that logs or
+    # shells out. yt-dlp is passed this value as an argv element, so
+    # there is no shell to inject into - this is defence in depth, and
+    # it also keeps the log lines readable.
+    if any(ord(c) < 32 or ord(c) == 127 for c in stripped):
+        return False
+    return bool(_TIKTOK_URL_PATTERN.match(stripped))
 
 
 def is_photo_url(url: str) -> bool:
