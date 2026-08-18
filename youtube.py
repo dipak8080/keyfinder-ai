@@ -84,7 +84,16 @@ class VideoTooLongError(Exception):
 # proxy attempt) must call _apply_player_clients() right before use,
 # since cookie presence differs attempt to attempt.
 # ============================================================
-PLAYER_CLIENTS_NO_COOKIES = ['android_vr', 'android', 'web']
+# tv_simply and web_embedded lead as of 2026-08-18. YouTube's SABR-only
+# experiment (yt-dlp #12482) strips the URLs from android/android_vr
+# formats for affected sessions, and the web fallback then needs a gvs PO
+# token that googlevideo rejects with a 403 - which surfaced as "The page
+# needs to be reloaded" once the request escalated to the cookie tier.
+# Confirmed by direct download test on two affected videos: android_vr and
+# mweb 403'd, ios had no matching format, while tv_simply and web_embedded
+# both pulled the full file. Nightly yt-dlp (2026.08.17) hits the same 403,
+# so this is a client-selection fix, not a version fix.
+PLAYER_CLIENTS_NO_COOKIES = ['tv_simply', 'web_embedded', 'android_vr', 'android', 'web']
 PLAYER_CLIENTS_WITH_COOKIES = ['tv', 'web', 'web_safari']
 
 
