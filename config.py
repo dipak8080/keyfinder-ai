@@ -888,7 +888,7 @@ MIN_MIDI_DURATION_SECONDS = float(os.environ.get("MIN_MIDI_DURATION_SECONDS", "1
 # HTTP connections.
 MAX_CONCURRENT_MIDI = int(os.environ.get("MAX_CONCURRENT_MIDI", "2"))
 
-MIDI_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_RATE_LIMIT_MAX_REQUESTS", "3"))
+MIDI_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_RATE_LIMIT_MAX_REQUESTS", "5"))
 MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
 # Input formats accepted by /audio-to-midi SPECIFICALLY - a superset of
