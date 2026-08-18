@@ -18,6 +18,19 @@ STATE="/home/deploy/app/data/canary_state.json"
 POT="/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
 HOOK=$(grep -m1 '^ALERT_WEBHOOK_URL=' /home/deploy/app/.env | cut -d= -f2-)
 
+# Skip when the container is mid-deploy. deploy.yml removes the old
+# container before starting the new one, and during that window every
+# `docker exec` fails - which reads as ALL clients failing at once.
+# Confirmed 2026-08-18: a curl-cffi deploy produced exactly that false
+# alarm, followed by "Recovered" on the next run. A real YouTube change
+# breaks clients individually, never all three simultaneously, so this
+# guard costs nothing and removes the one alert that would train you to
+# ignore the others.
+docker exec audioforges-api true 2>/dev/null || {
+  logger -t audioforges-canary "container not ready (deploy in progress?) - skipping run"
+  exit 0
+}
+
 results=""; failed=""; passed=""
 for c in "${CLIENTS[@]}"; do
   if timeout 90 docker exec audioforges-api yt-dlp \
@@ -41,9 +54,9 @@ echo "$current" > "$STATE"
 [ "$current" = "$previous" ] && exit 0
 
 if [ -n "$failed" ] && [ -z "$passed" ]; then
-  msg="[CANARY] ALL extraction clients FAILED ($results) - downloads are down. Check yt-dlp/YouTube changes."
+  msg="[CANARY] ALL extraction clients FAILED ($results) - downloads are down. Check yt-dlp/YouTube changes, and confirm the container is running."
 elif [ -n "$failed" ]; then
-  msg="[CANARY] Client change:$results Working:${passed}. Put a working client FIRST in PLAYER_CLIENTS_NO_COOKIES in youtube.py."
+  msg="[CANARY] Client change:$results Working:${passed}. Promote a working client to rung 0 of CLIENT_LADDER_NO_COOKIES in youtube.py."
 else
   msg="[CANARY] Recovered - all clients healthy again ($results)."
 fi
