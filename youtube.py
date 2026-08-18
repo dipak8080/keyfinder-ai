@@ -94,7 +94,7 @@ class VideoTooLongError(Exception):
 # both pulled the full file. Nightly yt-dlp (2026.08.17) hits the same 403,
 # so this is a client-selection fix, not a version fix.
 PLAYER_CLIENTS_NO_COOKIES = ['tv_simply', 'web_embedded', 'android_vr', 'android', 'web']
-PLAYER_CLIENTS_WITH_COOKIES = ['tv', 'web', 'web_safari']
+PLAYER_CLIENTS_WITH_COOKIES = ['web_embedded', 'tv', 'web', 'web_safari']
 
 
 # ============================================================
