@@ -197,6 +197,9 @@ from youtube import (
     is_permanent_error,
     is_cdn_connect_timeout_error,
     is_cdn_read_timeout_error,
+    is_page_reload_error,
+    is_media_forbidden_error,
+    is_format_unavailable_error,
     is_valid_youtube_url,
     extract_video_id,
     proxy_available,
@@ -378,7 +381,10 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             raise HTTPException(503, "This download is taking too long. Please try again.")
         elif result["kind"] == "crashed":
             logger.error(f"[DOWNLOAD] Worker process crashed: {result['error']}")
-            raise HTTPException(500, f"Failed: {result['error']}")
+            raise HTTPException(
+                500,
+                "Something went wrong while downloading this video. Please try again."
+            )
         else:
             error_text = result["error"]
 
@@ -469,8 +475,36 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
                     "Couldn't reach YouTube's servers for this video. Please try again in a moment."
                 )
 
+            if (
+                is_page_reload_error(error_text)
+                or is_media_forbidden_error(error_text)
+                or is_format_unavailable_error(error_text)
+            ):
+                # Every client set on the ladder failed. These are all
+                # YouTube-side extraction changes (SABR stripping format
+                # URLs, a player JS challenge the current yt-dlp can't
+                # solve), not bugs here and not anything the user did.
+                # 503 rather than 500: it is genuinely transient - the
+                # same video usually works again once YouTube rotates its
+                # experiment or yt-dlp ships a fix.
+                logger.error(
+                    f"[DOWNLOAD] All client sets exhausted for {url}: {error_text}"
+                )
+                raise HTTPException(
+                    503,
+                    "YouTube is currently blocking downloads for this video. This is "
+                    "usually temporary - please try again later, or try a different video."
+                )
+
+            # Raw yt-dlp text is logged, never returned. It leaks internals,
+            # means nothing to the user, and makes a working system look
+            # broken - the failure above is the same either way.
             logger.error(f"[DOWNLOAD] Failed after all attempts: {error_text}")
-            raise HTTPException(500, f"Failed: {error_text}")
+            raise HTTPException(
+                500,
+                "Something went wrong while downloading this video. Please try again, "
+                "or try a different video."
+            )
 
         if not os.path.exists(output_file):
             logger.error(f"[DOWNLOAD] Expected output missing after download: {output_file}")
@@ -500,7 +534,10 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
         raise
     except Exception as e:
         logger.error(f"[DOWNLOAD] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(500, f"Failed: {str(e)}")
+        raise HTTPException(
+            500,
+            "Something went wrong while downloading this video. Please try again."
+        )
     finally:
         cleanup_file(output_file)
         if audio_data is not None:
