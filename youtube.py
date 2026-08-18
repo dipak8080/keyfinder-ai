@@ -665,6 +665,24 @@ def is_not_yet_live_error(error_text: str) -> bool:
     return any(marker in normalized for marker in NOT_YET_LIVE_MARKERS)
 
 
+# yt-dlp's player JS challenge failing for the web-family clients
+# (tv/web/web_safari). Confirmed 2026-08-18 by direct CLI test on two
+# videos: identical failure with the proxy and without it, five runs each,
+# while the anon android_vr/android/web set extracted both fine and
+# selected format 251. A different exit IP demonstrably cannot fix this -
+# same evidence shape as is_format_unavailable_error(). It only ever
+# surfaces on the cookie-attached tier, which is reached because the anon
+# attempt died on the media-phase 403 first.
+PAGE_RELOAD_MARKERS = (
+    "the page needs to be reloaded",
+)
+
+
+def is_page_reload_error(error_text: str) -> bool:
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in PAGE_RELOAD_MARKERS)
+
+
 def is_ipv6_unroutable_error(error_text: str) -> bool:
     """
     True if this failure means the SERVER has no route to the
@@ -1888,6 +1906,18 @@ def extract_info_with_retry(ydl_opts: dict, url: str, media_opts: Optional[dict]
                 )
                 raise
 
+            if is_page_reload_error(error_text):
+                # The JS challenge already failed for this client set.
+                # Retrying the identical clients 2 more times re-runs the
+                # same challenge against the same player and fails the
+                # same way - and inside _try_proxy each of those is a PAID
+                # extraction. Fail fast: 3 paid round trips become 1.
+                logger.warning(
+                    f"Attempt {attempt}: player JS challenge failed for this "
+                    f"client set - not retrying the same clients: {error_text}"
+                )
+                raise
+
             if is_format_unavailable_error(error_text):
                 # No format in the manifest matched the player_client list
                 # active for THIS attempt - retrying with the IDENTICAL
@@ -2298,6 +2328,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         or is_music_premium_error(first_error)
         or is_not_yet_live_error(first_error)
         or is_format_unavailable_error(first_error)
+        or is_page_reload_error(first_error)
     ):
         # Every available cookie/no-cookie combination hit the same
         # account-privilege/timing wall, or the same client/cookie combo
@@ -2309,8 +2340,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         # proxy) that proved this specific addition.
         logger.warning(
             "[PROXY] Skipping proxy tier - failure is an age-restriction/"
-            "members-only/Music-Premium/not-yet-live/format-unavailable "
-            "requirement, not an IP/bot-check problem: no available "
+            "members-only/Music-Premium/not-yet-live/format-unavailable/"
+            "player-JS-challenge requirement, not an IP/bot-check problem: no available "
             "client/cookie combination satisfies it for this video."
         )
         raise last_error
