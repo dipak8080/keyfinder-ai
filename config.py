@@ -639,6 +639,23 @@ WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 # a hosted transcription API, not raising this number.
 MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "1"))
 
+# Bounded queue for BOTH transcription endpoints (/speech-to-text and
+# /youtube/transcribe), mirroring MAX_QUEUED_SEPARATIONS.
+#
+# MAX_CONCURRENT_TRANSCRIPTIONS caps how many run at once, but that
+# semaphore is acquired INSIDE the background task - so before this
+# existed, submissions were never refused, they queued in memory with no
+# ceiling. Each waiting job holds an uploaded file on disk and a job-table
+# row, and the person watching the spinner has no way to know they are
+# tenth in line.
+#
+# Deliberately tighter than MAX_QUEUED_SEPARATIONS: CPU transcription runs
+# at roughly 1x realtime, so four queued 20-minute jobs is already over an
+# hour of invisible waiting for whoever is last. The rate limiter does NOT
+# cover this - it is per-IP, so N different visitors each submitting their
+# allowance still stacks without bound.
+MAX_QUEUED_TRANSCRIPTIONS = int(os.environ.get("MAX_QUEUED_TRANSCRIPTIONS", "4"))
+
 # ---------- TRANSCRIPTION OPTIONS ----------
 # Whisper's `task` argument. "translate" makes the model emit English
 # regardless of the spoken language - it is a free parameter on the

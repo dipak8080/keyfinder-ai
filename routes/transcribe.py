@@ -22,11 +22,12 @@ VALIDATION ORDER matters here and is deliberate:
     1. model availability   (503 - no point accepting anything)
     2. option validation    (400 - free, no I/O)
     3. filename/format      (400 - free, no I/O)
-    4. create job + accept upload   (writes to disk)
-    5. duration check       (spawns ffprobe)
+    4. queue depth          (503 - server at capacity, not caller error)
+    5. create job + accept upload   (writes to disk)
+    6. duration check       (spawns ffprobe)
 
-Steps 1-3 are pure CPU on already-parsed values, so rejecting there
-costs nothing. Doing them after step 4 would burn a job ID, a disk
+Steps 1-4 are pure CPU on already-parsed values, so rejecting there
+costs nothing. Doing them after step 5 would burn a job ID, a disk
 write, and a cleanup cycle to tell someone they typo'd a language code.
 """
 from functools import partial
@@ -70,6 +71,7 @@ from ._shared import (
     _log_queued,
     _run_tool_job,
     _tool_status,
+    _reject_if_transcription_queue_full,
 )
 
 router = APIRouter()
@@ -155,6 +157,17 @@ async def speech_to_text_route(
 
     _validated_input_format(file.filename)
     original_filename = file.filename
+
+    # Capacity gate - last of the free checks, and deliberately last of
+    # them. Everything above is the CALLER's input being wrong (400);
+    # this is the SERVER being full (503). Ordering it after the input
+    # checks means someone with a typo'd language code is told about the
+    # typo rather than being turned away for capacity, fixing nothing,
+    # and hitting the 400 on their retry.
+    #
+    # Before create_job, so a refused submission leaves no job row, no
+    # temp file, and nothing to clean up.
+    _reject_if_transcription_queue_full()
 
     # --- 4: from here on we own resources that need cleaning up ---
     job_id = create_job(job_type="transcribe", ttl_seconds=TRANSCRIPTION_JOB_TTL_SECONDS)

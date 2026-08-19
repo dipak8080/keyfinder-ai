@@ -69,7 +69,11 @@ from speech_to_text import (
     _normalize_mode,
 )
 
-from ._shared import spawn_background_task, _tool_status
+from ._shared import (
+    spawn_background_task,
+    _tool_status,
+    _reject_if_transcription_queue_full,
+)
 from .youtube import _chain_download
 
 router = APIRouter()
@@ -226,6 +230,16 @@ async def youtube_transcribe_route(
     # Validated before the job exists: a bad language code should cost a
     # 400, not a job row and a full YouTube download.
     language, task, mode = _validated_options(language, task, mode)
+
+    # Same whole-server capacity gate as /speech-to-text. Both endpoints
+    # share ONE transcription semaphore, so both must respect one queue
+    # bound - guarding only the upload route would let YouTube jobs fill
+    # the queue unnoticed, and vice versa.
+    #
+    # Checked here, before create_job, which also means before any
+    # YouTube download starts: a refused submission costs no proxy
+    # bandwidth, no yt-dlp subprocess, and no disk.
+    _reject_if_transcription_queue_full()
 
     # Set BEFORE spawn_background_task(): create_task() copies the context
     # at the moment it is called, and this is also what tags the POST's

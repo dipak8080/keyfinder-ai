@@ -24,6 +24,16 @@ ADDED 2026-08-16: spawn_background_task() - see its own docstring for the
 garbage-collection hazard it closes. Every asyncio.create_task() call in
 this package should go through it.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-19: _reject_if_transcription_queue_full() - the second
+bounded-queue guard in this file. It sits directly below the separation
+one, and the two must BOTH stay: separation.py and youtube.py import the
+separation guard, transcribe.py and youtube_transcribe.py import the
+transcription one. Removing either breaks module import at startup, which
+surfaces as a failed health check and an automatic rollback rather than
+anything that names the missing function.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -33,7 +43,12 @@ from typing import Callable, Optional, Sequence
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from config import logger, MAX_UPLOAD_BYTES, MAX_QUEUED_SEPARATIONS
+from config import (
+    logger,
+    MAX_UPLOAD_BYTES,
+    MAX_QUEUED_SEPARATIONS,
+    MAX_QUEUED_TRANSCRIPTIONS,
+)
 from upload import save_upload
 from utils import (
     cleanup_file,
@@ -49,6 +64,7 @@ from jobs import (
     get_job,
     count_processing,
     SEPARATION_JOB_TYPES,
+    TRANSCRIPTION_JOB_TYPES,
 )
 from separation import SeparationError
 from audio_common import (
@@ -373,6 +389,11 @@ def _reject_if_separation_queue_full():
     """
     The bounded queue for every Demucs-backed route.
 
+    IMPORTED BY routes/separation.py AND routes/youtube.py. Deleting it
+    breaks both at import time, which surfaces as a failed startup health
+    check and an automatic rollback - not as anything that names this
+    function.
+
     MAX_CONCURRENT_SEPARATIONS bounds how many separations RUN at once,
     but the semaphore enforcing it is acquired inside the background
     task - so before this check existed, submissions were never refused,
@@ -400,6 +421,47 @@ def _reject_if_separation_queue_full():
             503,
             "The separation queue is full right now - each job takes several "
             "minutes and only one runs at a time. Please try again in a few minutes.",
+        )
+
+
+def _reject_if_transcription_queue_full():
+    """
+    The bounded queue for both transcription routes.
+
+    IMPORTED BY routes/transcribe.py AND routes/youtube_transcribe.py.
+    Same deletion hazard as the separation guard above.
+
+    Same mechanism and same reasoning as
+    _reject_if_separation_queue_full() above - see that docstring for the
+    full argument. Two things differ and both matter:
+
+    COUNTS BOTH ENDPOINTS TOGETHER. /speech-to-text and
+    /youtube/transcribe share a single semaphore, so counting one in
+    isolation would let the other fill the queue unnoticed. A user
+    uploading a file genuinely is behind everyone who pasted a YouTube
+    link, and the guard has to reflect that.
+
+    THE RATE LIMITER DOES NOT ALREADY COVER THIS. That limit is per-IP;
+    this is a whole-server capacity bound. Ten visitors each submitting
+    their permitted two requests is twenty queued jobs and zero rate-limit
+    violations - which is exactly the case that makes the site look broken
+    while every individual limit is being respected.
+
+    503, not 429, for the same reason as separation: this is the server
+    being at capacity, not the caller misbehaving, and the two mean
+    different things to a client deciding whether to retry.
+    """
+    depth = count_processing(TRANSCRIPTION_JOB_TYPES)
+    if depth >= MAX_QUEUED_TRANSCRIPTIONS:
+        logger.warning(
+            f"[TRANSCRIPTION] Rejected submission - queue full "
+            f"({depth}/{MAX_QUEUED_TRANSCRIPTIONS} jobs in flight)"
+        )
+        raise HTTPException(
+            503,
+            "The transcription queue is full right now - only one file is "
+            "processed at a time and each takes several minutes. Please try "
+            "again shortly.",
         )
 
 
