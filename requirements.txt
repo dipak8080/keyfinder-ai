@@ -40,15 +40,18 @@ urllib3==2.6.2
 uvicorn==0.40.0
 
 # ---------- YOUTUBE / TIKTOK EXTRACTION ----------
+# NOTE: this line previously appeared TWICE - once here and once again a
+# few lines below, under a comment describing browser TLS/JA3
+# impersonation. The duplicate has been removed because it did not do
+# what its comment claimed: `yt-dlp[default]` pulls brotli, certifi,
+# mutagen, pycryptodomex, requests, urllib3 and websockets, but NOT
+# curl-cffi, which is what actually provides impersonation. The result
+# was a comment promising a capability that was never installed.
+#
+# Impersonation is still NOT enabled here - see the block at the bottom
+# of this file for the reasoning and the one-line change that turns it on.
 yt-dlp[default]==2026.07.04
 bgutil-ytdlp-pot-provider==1.3.1
-# Browser TLS/JA3 impersonation for yt-dlp. Required by the TikTok
-# extractor, which otherwise warns "attempting impersonation, but no
-# impersonate target is available" and works only until TikTok tightens
-# its anti-bot checks - unlike YouTube there is no client ladder to fall
-# back on there. Also gives yt-dlp an extra request handler for YouTube's
-# web-family clients.
-yt-dlp[default]==2026.07.04
 
 # ---------- SEPARATION (Demucs) ----------
 # CPU-only torch build - the default `pip install torch` often pulls a
@@ -60,4 +63,65 @@ torch==2.5.1+cpu
 torchaudio==2.5.1+cpu
 demucs==4.0.1
 
-faster-whisper
+# ---------- SPEECH TO TEXT (faster-whisper) ----------
+# Pinned like everything else in this file. Two reasons beyond general
+# reproducibility:
+#
+#   1. speech_to_text.py reads faster_whisper.tokenizer's PRIVATE
+#      _LANGUAGE_CODES to build the language list served by
+#      GET /speech-to-text/languages. That import is wrapped in a
+#      try/except so an upstream rename degrades gracefully rather than
+#      breaking the module - but it degrades to a hardcoded 35-code
+#      subset, silently dropping ~64 languages from the UI. Pinning is
+#      what stops that happening on an unrelated deploy.
+#
+#   2. The deploy workflow runs `docker builder prune -af` before every
+#      build, so there is no layer cache and pip re-resolves from
+#      scratch each time. Unpinned, two deploys of byte-identical source
+#      could produce materially different images.
+faster-whisper==1.2.1
+
+# The inference engine underneath faster-whisper, and where int8
+# quantization actually happens. Pinned explicitly rather than left
+# transitive because it versions independently of faster-whisper, and a
+# mismatch surfaces as a model-load failure at container STARTUP - not a
+# dependency-resolution error at build time, where it would be obvious.
+ctranslate2==4.8.1
+
+# Required for vad_filter=True. Arrives transitively today, but pinning
+# makes VAD a declared dependency rather than a lucky one. If this ever
+# goes missing, speech_to_text.py's import probe disables VAD and
+# transcription just gets slower - no error, no failed build, only a
+# WARNING in the startup log. Declared here so that can't happen quietly.
+onnxruntime==1.29.0
+
+# huggingface_hub and tokenizers are deliberately left UNPINNED. They are
+# transitive dependencies of faster-whisper, which already constrains
+# them, and over-pinning transitives on a no-cache build is a reliable
+# way to produce a resolution conflict during some future, unrelated
+# dependency bump.
+
+# ---------- NOT INSTALLED: yt-dlp browser impersonation ----------
+# Deliberately left out for now, documented so the gap is a decision
+# rather than an oversight.
+#
+# `yt-dlp --list-impersonate-targets` currently reports every target
+# (Chrome, Edge, Safari, Firefox, Tor) as "unavailable", because
+# curl-cffi - which supplies the TLS/JA3 impersonation - is not
+# installed. Enabling it is one line:
+#
+#     yt-dlp[default,curl-cffi]==2026.07.04
+#
+# Why this is not urgent for YouTube: yt-dlp has a client ladder there
+# (android / ios / tv / web), so a blocked client falls through to
+# another. Impersonation is a nice-to-have on top of that.
+#
+# Why it matters for TikTok: there is no equivalent ladder. Extraction
+# currently works because TikTok accepts plain requests - the day it
+# tightens JA3 fingerprinting, there is nothing to fall back to and the
+# TikTok path breaks outright.
+#
+# Kept as a SEPARATE change from the transcription work on purpose:
+# curl-cffi ships compiled binaries and changes yt-dlp's request handler,
+# so if it destabilises extraction the cause should be unambiguous rather
+# than tangled up with a Whisper deploy.

@@ -40,6 +40,34 @@ jobs:
             docker network create audioforges-net || true
 
             # ============================================================
+            # WHISPER BUILD ARGS - read from .env so the model BAKED into
+            # the image always matches the model the container is RUN with.
+            #
+            # These are two different mechanisms that used to be able to
+            # disagree: the Dockerfile hardcoded 'small' at build time while
+            # WHISPER_MODEL_SIZE was configurable at runtime. Setting a
+            # different size in .env therefore produced an image without
+            # those weights, so the container downloaded them at STARTUP -
+            # blowing past the health-check window below and triggering a
+            # rollback for what was only a slow first boot.
+            #
+            # Reading .env here means changing the model is a one-line .env
+            # edit plus a redeploy, and the two can never drift.
+            # ============================================================
+            _read_env() {
+              # $1 = key, $2 = default. Tolerates quotes, inline spaces and
+              # commented-out lines.
+              local v
+              v=$(grep -E "^[[:space:]]*$1[[:space:]]*=" .env 2>/dev/null \
+                  | tail -n1 | cut -d= -f2- | tr -d "\"'" | xargs || true)
+              echo "${v:-$2}"
+            }
+
+            WHISPER_MODEL_SIZE=$(_read_env WHISPER_MODEL_SIZE small)
+            WHISPER_COMPUTE_TYPE=$(_read_env WHISPER_COMPUTE_TYPE int8)
+            echo "Whisper build args: model=$WHISPER_MODEL_SIZE compute_type=$WHISPER_COMPUTE_TYPE"
+
+            # ============================================================
             # MIDI-WORKER (isolated sidecar) - built and deployed FIRST,
             # and DELIBERATELY NON-FATAL to this whole workflow.
             #
@@ -103,8 +131,12 @@ jobs:
               echo "No existing container found - skipping rollback tag."
             fi
 
-            # Build latest image
-            docker build -t audioforges-api:latest .
+            # Build latest image. The Whisper build args make the baked
+            # model match .env - see the block above for why this matters.
+            docker build \
+              --build-arg WHISPER_MODEL_SIZE="$WHISPER_MODEL_SIZE" \
+              --build-arg WHISPER_COMPUTE_TYPE="$WHISPER_COMPUTE_TYPE" \
+              -t audioforges-api:latest .
 
             # Replace existing container
             docker stop audioforges-api || true
@@ -140,6 +172,25 @@ jobs:
               sleep 10
               if curl -sf http://localhost:8000/health > /dev/null; then
                 echo "Health check passed - deploy successful."
+
+                # ----------------------------------------------------
+                # TRANSCRIPTION CHECK - non-fatal by design, same
+                # philosophy as midi-worker above. speech_to_text.py
+                # deliberately survives a failed model load so one bad
+                # download degrades ONE endpoint instead of taking the
+                # whole app down. The cost of that choice is that /health
+                # stays green while /speech-to-text returns 503, so the
+                # failure is otherwise invisible until a user hits it.
+                # Surface it in the deploy log instead.
+                # ----------------------------------------------------
+                if docker logs audioforges-api 2>&1 | grep -q "FAILED to load Whisper model"; then
+                  echo "WARNING: Whisper model failed to load - /speech-to-text will return 503."
+                  echo "         Every other tool is unaffected. Relevant logs:"
+                  docker logs audioforges-api 2>&1 | grep -A5 "FAILED to load Whisper model" | tail -20 || true
+                else
+                  docker logs audioforges-api 2>&1 | grep -E "Whisper model loaded successfully|VAD filter|language codes from faster_whisper" | tail -5 || true
+                fi
+
                 docker image prune -f
                 docker builder prune -af
                 echo "Cleaned up old images and build cache."
