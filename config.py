@@ -126,7 +126,7 @@ IP_BLOCK_MARKERS = YT_BOT_CHECK_MARKERS + (
 )
 
 # ---------- YOUTUBE DOWNLOAD DURATION CAP ----------
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2400"))  # 20 min
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "2400"))  # 40 min
 
 # ---------- DOWNLOAD WALL-CLOCK CAP (frees a stuck semaphore slot) ----------
 DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS", "180"))
@@ -663,7 +663,7 @@ DEFAULT_TRANSCRIPTION_MODE = os.environ.get("DEFAULT_TRANSCRIPTION_MODE", "balan
 # is a meaningful speedup for free, and it also reduces Whisper's
 # tendency to hallucinate text during long silences. Kept as a flag
 # because it can clip very quiet speech on badly-recorded input.
-WHISPER_VAD_FILTER = os.environ.get("WHISPER_VAD_FILTER", "true").lower() == "true"
+WHISPER_VAD_FILTER = os.environ.get("WHISPER_VAD_FILTER", "false").lower() == "true"
 
 # Transcription jobs don't produce a file (output is inline text, not
 # audio) - result_data lives directly in the job dict (see jobs.py) and
@@ -680,7 +680,13 @@ MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURAT
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
-
+# ---------- YOUTUBE TO TEXT ----------
+# Stricter than the other /youtube/* chained tools: this one chains a
+# download onto a near-realtime CPU transcription, so a single accepted
+# job can occupy the one transcription slot for the length of the video.
+# The limiter is what stops a queue forming that nobody can see.
+YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
+YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))
 
 
 

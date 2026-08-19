@@ -87,6 +87,7 @@ from .midi import router as _midi_router
 from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
+from . import youtube_transcribe
 
 router = APIRouter()
 
@@ -102,3 +103,4 @@ router.include_router(_midi_router)
 router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)
+router.include_router(youtube_transcribe.router)
