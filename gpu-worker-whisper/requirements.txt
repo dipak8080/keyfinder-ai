@@ -1,0 +1,18 @@
+# RunPod Serverless SDK - provides runpod.serverless.start()
+runpod==1.7.7
+
+# Pinned to EXACTLY what the VPS runs. This is not tidiness: the two
+# backends must produce identical transcripts for identical input, and a
+# version skew between them would show up as "the site got worse after
+# we switched to GPU" with no other symptom and nothing in the logs.
+# When you bump these on the VPS, bump them here in the same commit.
+#
+# onnxruntime 1.29.0 in particular is why the Dockerfile installs Python
+# 3.11 rather than using the base image's 3.10 - there is no cp310 wheel
+# for it (3.10 tops out at 1.23.2).
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+onnxruntime==1.29.0
+
+# Used to stream the input audio from the VPS.
+requests==2.32.5

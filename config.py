@@ -137,7 +137,7 @@ DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TI
 # controls the whole endpoint (both mp3 and wav) - tighten
 # DOWNLOAD_RATE_LIMIT_MAX_REQUESTS alone to cut proxy spend without
 # touching every other endpoint that still shares the generic default.
-DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "10"))
+DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "15"))
 DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 
@@ -722,6 +722,30 @@ VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TRANSCRIB
 # The limiter is what stops a queue forming that nobody can see.
 YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))
+
+# ---------- TRANSCRIPTION BACKEND ----------
+# "local" = faster-whisper in this process (CPU). "gpu" = RunPod
+# serverless worker. See transcription.py for the dispatch, and note the
+# local model is NOT loaded at all when this is "gpu".
+#
+# Env-driven so reverting is one line and a restart. That matters: if the
+# GPU path misbehaves at 2am, "set this back to local" is a decision you
+# can make tired.
+TRANSCRIPTION_BACKEND = os.environ.get("TRANSCRIPTION_BACKEND", "local").strip().lower()
+if TRANSCRIPTION_BACKEND not in ("local", "gpu"):
+    logger.error(
+        f"[TRANSCRIPTION] TRANSCRIPTION_BACKEND='{TRANSCRIPTION_BACKEND}' is not "
+        f"'local' or 'gpu' - falling back to 'local'."
+    )
+    TRANSCRIPTION_BACKEND = "local"
+
+RUNPOD_WHISPER_ENDPOINT_ID = os.environ.get("RUNPOD_WHISPER_ENDPOINT_ID", "")
+
+# Both sides of the deadline - see run_worker_job(). Generous enough for
+# a cold start (15-30s) plus a large file transfer plus inference on a
+# 20-minute file, and no more: an over-long timeout is billed GPU time
+# for a result nobody is waiting for.
+GPU_TRANSCRIBE_TIMEOUT_SECONDS = int(os.environ.get("GPU_TRANSCRIBE_TIMEOUT_SECONDS", "900"))  # 15 min
 
 
 

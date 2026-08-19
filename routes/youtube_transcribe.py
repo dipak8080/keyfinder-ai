@@ -59,8 +59,8 @@ from audio_common import AudioToolError, validate_duration
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 from youtube import is_valid_youtube_url
 
+from transcription import transcribe_job
 from speech_to_text import (
-    transcribe,
     # Same normalizers transcribe() runs internally - see the note in
     # routes/transcribe.py. Reusing them is what stops this route and the
     # upload route drifting on what counts as a valid language code.
@@ -148,9 +148,10 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
             f"({duration:.1f}s audio) language={language or 'auto'}, task={task}, mode={mode}"
         )
 
-        # Positional args, matching transcribe()'s signature - run_blocking
-        # forwards *args and is not guaranteed to pass keywords through.
-        result = await run_blocking(transcribe, file_path, language, task, mode)
+        # Backend dispatcher - see transcription.py. Awaited directly
+        # because the GPU path is network-bound and the local path
+        # already wraps itself in run_blocking internally.
+        result = await transcribe_job(file_path, language, task, mode)
 
         # title, not a filename: for a chained job the video title IS the
         # user-facing name, and it is what mark_transcription_complete

@@ -92,8 +92,8 @@ from video_to_audio import (
     _COPY_COMPATIBLE,
 )
 
+from transcription import transcribe_job
 from speech_to_text import (
-    transcribe,
     # Same normalizers transcribe() runs internally - see the note in
     # routes/transcribe.py. Reusing them is what stops the three
     # transcription endpoints drifting on what counts as a valid
@@ -234,9 +234,8 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
             f"language={language or 'auto'}, task={task}, mode={mode}"
         )
 
-        # Positional args, matching transcribe()'s signature - run_blocking
-        # forwards *args and is not guaranteed to pass keywords through.
-        result = await run_blocking(transcribe, audio_path, language, task, mode)
+        # Backend dispatcher - see transcription.py.
+        result = await transcribe_job(audio_path, language, task, mode)
 
         mark_transcription_complete(job_id, original_filename, result)
         succeeded = True
@@ -316,7 +315,7 @@ async def video_to_text_route(
     set_job_context(tool=TOOL, tier="standard")
 
     # --- free checks, before anything is written to disk ---
-    from speech_to_text import is_available as transcription_available
+    from transcription import is_available as transcription_available
     if not transcription_available():
         logger.error(f"[{TOOL}] Request rejected - model unavailable (see startup logs).")
         raise HTTPException(

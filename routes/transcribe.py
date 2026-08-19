@@ -42,16 +42,15 @@ from config import (
     MAX_TRANSCRIPTION_DURATION_SECONDS,
     logger,
 )
-from utils import run_blocking, _transcription_semaphore
+from utils import _transcription_semaphore
 from rate_limit import check_rate_limit
 from jobs import create_job, mark_transcription_complete, get_job
 from audio_common import AudioToolError
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
+from transcription import transcribe_job, is_available as transcription_available
 from speech_to_text import (
-    transcribe,
     get_language_options,
-    is_available as transcription_available,
     # Private by name, imported deliberately: these are the SAME
     # normalizers transcribe() runs internally. Reusing them here rather
     # than re-implementing the checks means the route and the worker can
@@ -185,11 +184,11 @@ async def speech_to_text_route(
         metric="/speech-to-text",
         job_id=job_id,
         semaphore=_transcription_semaphore,
-        # Positional, not keyword: run_blocking forwards *args to the
-        # executor and is not guaranteed to pass keywords through.
-        # Order must stay (path, language, task, mode) to match
-        # transcribe()'s signature.
-        work=lambda: run_blocking(transcribe, input_path, language, task, mode),
+        # transcribe_job() is the backend dispatcher - it awaits the GPU
+        # worker or dispatches the local model to a thread, depending on
+        # TRANSCRIPTION_BACKEND. _run_tool_job does `await work()`, so a
+        # coroutine is exactly what belongs here.
+        work=lambda: transcribe_job(input_path, language, task, mode),
         on_success=lambda result: mark_transcription_complete(job_id, original_filename, result),
         generic_error="Transcription failed unexpectedly.",
         cleanup_paths=[input_path],
