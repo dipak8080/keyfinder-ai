@@ -639,6 +639,32 @@ WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 # a hosted transcription API, not raising this number.
 MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "1"))
 
+# ---------- TRANSCRIPTION OPTIONS ----------
+# Whisper's `task` argument. "translate" makes the model emit English
+# regardless of the spoken language - it is a free parameter on the
+# same forward pass, NOT a second model or a second pass, so it costs
+# nothing extra beyond normal inference.
+ALLOWED_TRANSCRIPTION_TASKS = ("transcribe", "translate")
+
+# Speed tiers are implemented via beam_size, deliberately NOT via
+# loading multiple model sizes. speech_to_text.py holds its model as a
+# module-level singleton, so a second resident model would cost real
+# RAM for the entire process lifetime on a 6GB box that also runs
+# torch/demucs/essentia. beam_size is a per-CALL argument: same one
+# resident model, different quality/latency trade per request.
+TRANSCRIPTION_MODE_BEAM_SIZES = {
+    "fast": 1,
+    "balanced": 5,
+}
+DEFAULT_TRANSCRIPTION_MODE = os.environ.get("DEFAULT_TRANSCRIPTION_MODE", "balanced")
+
+# Voice-activity detection: drops silent regions before they reach the
+# model. On real-world speech (interviews, lectures, voice memos) this
+# is a meaningful speedup for free, and it also reduces Whisper's
+# tendency to hallucinate text during long silences. Kept as a flag
+# because it can clip very quiet speech on badly-recorded input.
+WHISPER_VAD_FILTER = os.environ.get("WHISPER_VAD_FILTER", "true").lower() == "true"
+
 # Transcription jobs don't produce a file (output is inline text, not
 # audio) - result_data lives directly in the job dict (see jobs.py) and
 # just needs its own TTL, same reasoning as AUDIO_TOOL_JOB_TTL_SECONDS.
@@ -649,7 +675,7 @@ TRANSCRIPTION_JOB_TTL_SECONDS = int(os.environ.get("TRANSCRIPTION_JOB_TTL_SECOND
 # conservatively than the other audio tools (20 min) to keep worst-case
 # wait times bounded. Raise only after confirming your VPS's actual
 # throughput.
-MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "900"))  # 15 min
+MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "1200"))  # 20 min
 
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
