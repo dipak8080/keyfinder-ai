@@ -637,7 +637,7 @@ WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 # doesn't parallelize meaningfully, it just makes both slower. If usage
 # grows enough to need more than 1, the right fix is a GPU instance or
 # a hosted transcription API, not raising this number.
-MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "1"))
+MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get("MAX_CONCURRENT_TRANSCRIPTIONS", "2"))
 
 # Bounded queue for BOTH transcription endpoints (/speech-to-text and
 # /youtube/transcribe), mirroring MAX_QUEUED_SEPARATIONS.

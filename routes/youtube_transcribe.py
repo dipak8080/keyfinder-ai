@@ -59,7 +59,7 @@ from audio_common import AudioToolError, validate_duration
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 from youtube import is_valid_youtube_url
 
-from transcription import transcribe_job
+from transcription import transcribe_job, is_available as transcription_available
 from speech_to_text import (
     # Same normalizers transcribe() runs internally - see the note in
     # routes/transcribe.py. Reusing them is what stops this route and the
@@ -225,6 +225,25 @@ async def youtube_transcribe_route(
         task     - "transcribe" (source language) or "translate" (English).
         mode     - speed tier; see GET /speech-to-text/languages.
     """
+    # Availability FIRST, before anything else is spent.
+    #
+    # This endpoint is the one where skipping the check is most expensive.
+    # /speech-to-text and /video-to-text fail on an upload the user has
+    # already sent; this one would accept the job and then spend a
+    # download slot, up to DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS of wall
+    # clock, and paid residential proxy bandwidth fetching a video that
+    # was never going to be transcribed - failing only at the handoff.
+    #
+    # Matters more on the GPU backend than it ever did on CPU: "available"
+    # there means a set of env vars is present, so a typo'd endpoint id
+    # makes EVERY request take this path.
+    if not transcription_available():
+        logger.error("[%s] Request rejected - transcription unavailable "
+                     "(see startup logs)." % TOOL)
+        raise HTTPException(
+            503, "Transcription is temporarily unavailable. Please try again later."
+        )
+
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 

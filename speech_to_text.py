@@ -37,6 +37,7 @@ from faster_whisper import WhisperModel
 
 from config import (
     logger,
+    TRANSCRIPTION_BACKEND,
     WHISPER_MODEL_SIZE,
     WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
@@ -118,26 +119,47 @@ logger.info(
 _model = None
 _model_load_error = None
 
-try:
-    _load_started = time.monotonic()
-    _model = WhisperModel(
-        WHISPER_MODEL_SIZE,
-        device=WHISPER_DEVICE,
-        compute_type=WHISPER_COMPUTE_TYPE,
-    )
+# SKIPPED ENTIRELY WHEN THE GPU BACKEND IS ACTIVE.
+#
+# Not an optimisation - a requirement on a 6GB box. The model is ~1GB
+# resident for the whole process lifetime, and on the GPU backend it
+# would never serve a single request: transcription.py routes every call
+# to speech_to_text_gpu.py instead. That gigabyte is the difference
+# between Demucs having room and being OOM-killed mid-separation.
+#
+# The rest of this module stays importable and useful either way -
+# speech_to_text_gpu.py imports the normalizers and the language list
+# from here, so this file is still the single source of truth for what
+# counts as a valid language code no matter which backend runs.
+if TRANSCRIPTION_BACKEND == "gpu":
     logger.info(
-        f"[SPEECH_TO_TEXT] Whisper model loaded successfully in "
-        f"{time.monotonic() - _load_started:.1f}s."
+        "[SPEECH_TO_TEXT] TRANSCRIPTION_BACKEND=gpu - skipping the local model "
+        "load. Language validation and the language list still come from this "
+        "module; only inference happens elsewhere."
     )
-except Exception as _model_exc:
-    _model_load_error = f"{_model_exc.__class__.__name__}: {_model_exc}"
-    logger.critical(
-        f"[SPEECH_TO_TEXT] FAILED to load Whisper model '{WHISPER_MODEL_SIZE}' "
-        f"(device={WHISPER_DEVICE}, compute_type={WHISPER_COMPUTE_TYPE}): "
-        f"{_model_load_error}. The /speech-to-text endpoint will return 503 "
-        f"until this is fixed; all other tools are unaffected.",
-        exc_info=True,
-    )
+    _model_load_error = "Local model not loaded (TRANSCRIPTION_BACKEND=gpu)."
+
+else:
+    try:
+        _load_started = time.monotonic()
+        _model = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+        logger.info(
+            f"[SPEECH_TO_TEXT] Whisper model loaded successfully in "
+            f"{time.monotonic() - _load_started:.1f}s."
+        )
+    except Exception as _model_exc:
+        _model_load_error = f"{_model_exc.__class__.__name__}: {_model_exc}"
+        logger.critical(
+            f"[SPEECH_TO_TEXT] FAILED to load Whisper model '{WHISPER_MODEL_SIZE}' "
+            f"(device={WHISPER_DEVICE}, compute_type={WHISPER_COMPUTE_TYPE}): "
+            f"{_model_load_error}. The /speech-to-text endpoint will return 503 "
+            f"until this is fixed; all other tools are unaffected.",
+            exc_info=True,
+        )
 
 
 # Whether VAD is actually usable. faster-whisper's vad_filter needs

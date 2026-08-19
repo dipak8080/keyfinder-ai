@@ -92,7 +92,7 @@ from video_to_audio import (
     _COPY_COMPATIBLE,
 )
 
-from transcription import transcribe_job
+from transcription import transcribe_job, is_available as transcription_available
 from speech_to_text import (
     # Same normalizers transcribe() runs internally - see the note in
     # routes/transcribe.py. Reusing them is what stops the three
@@ -315,7 +315,6 @@ async def video_to_text_route(
     set_job_context(tool=TOOL, tier="standard")
 
     # --- free checks, before anything is written to disk ---
-    from transcription import is_available as transcription_available
     if not transcription_available():
         logger.error(f"[{TOOL}] Request rejected - model unavailable (see startup logs).")
         raise HTTPException(
