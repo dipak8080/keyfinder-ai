@@ -88,6 +88,7 @@ from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
 from . import youtube_transcribe
+from . import video_transcribe
 
 router = APIRouter()
 
@@ -104,3 +105,4 @@ router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)
 router.include_router(youtube_transcribe.router)
+router.include_router(video_transcribe.router)

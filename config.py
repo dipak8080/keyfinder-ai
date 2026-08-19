@@ -697,6 +697,24 @@ MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURAT
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
+# ---------- VIDEO TO TEXT ----------
+# Own byte cap, well above MAX_UPLOAD_BYTES' 80MB (video is ~10x audio
+# for the same running time) but well below MAX_VIDEO_UPLOAD_BYTES' 200MB.
+#
+# 200MB would be actively misleading here: a video that large is almost
+# certainly longer than MAX_TRANSCRIPTION_DURATION_SECONDS, so accepting
+# the upload only to reject it on duration wastes the user's entire
+# transfer. 100MB is roughly where a 20-minute video lands at ordinary
+# bitrates, so the two limits agree instead of contradicting each other.
+MAX_VIDEO_TRANSCRIBE_BYTES = int(os.environ.get("MAX_VIDEO_TRANSCRIBE_BYTES", str(100 * 1024 * 1024)))  # 100 MB
+
+# Matched to the other two transcription endpoints rather than to
+# /video-to-audio's looser 5-per-5-min: the binding cost here is the
+# single transcription slot, not the ffmpeg extraction, so this belongs
+# with its siblings.
+VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
+VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))
+
 # ---------- YOUTUBE TO TEXT ----------
 # Stricter than the other /youtube/* chained tools: this one chains a
 # download onto a near-realtime CPU transcription, so a single accepted

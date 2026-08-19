@@ -130,10 +130,10 @@ _LONG_TTL_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems
 # queue-depth check - see count_processing() below.
 SEPARATION_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
 
-# Both transcription flows share ONE semaphore, so they must be counted
-# together for the queue guard - counting only one endpoint would let the
-# other fill the queue invisibly.
-TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe")
+# All three transcription flows share ONE semaphore, so they must be
+# counted together for the queue guard - counting any one endpoint in
+# isolation would let the other two fill the queue invisibly.
+TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe", "video_transcribe")
 
 
 def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) -> str:
