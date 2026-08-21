@@ -38,6 +38,26 @@ WHAT CHANGED (2026-08-15): SPLIT-TUNNEL OBSERVABILITY + AN EVENT-LOOP FIX
    stall. Now dispatched through run_blocking like every other blocking
    call in the app.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-21): PER-TOOL YOUTUBE CHAIN LIMITS IN /limits
+
+The two YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS / _HQ_ constants this file
+imported no longer exist - config.py now defines one pair per tool
+(YOUTUBE_ANALYZE_*, YOUTUBE_SEPARATE_*, YOUTUBE_STEMS_* and the two HQ
+variants). See that block's comment for why: the three chained tools
+already had independent per-IP buckets (rate_limit.py keys on
+(ip, path)), but were forced to share a single NUMBER despite
+/youtube/analyze costing ~30s on a 4-slot semaphore while
+/youtube/separate and /youtube/stems each hold the single separation
+slot for 3-5 minutes.
+
+/limits gains one key per tool as a result. `youtube_chain` and
+`youtube_chain_hq` are KEPT in the response, both pointing at the
+separation numbers, because this endpoint is a public contract that the
+frontend reads - removing a key it might still be indexing would turn a
+config change into a runtime undefined. They are marked for removal
+below once lib/data/rate-limits.ts is confirmed to be off them.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -54,8 +74,11 @@ from config import (
     SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
     STEMS_RATE_LIMIT_MAX_REQUESTS,
     STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
-    YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-    YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
     MAX_QUEUED_SEPARATIONS,
@@ -576,8 +599,25 @@ async def limits():
             "separate_hq": SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
             "stems": STEMS_RATE_LIMIT_MAX_REQUESTS,
             "stems_hq": STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
-            "youtube_chain": YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-            "youtube_chain_hq": YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
+            # One key per chained YouTube tool (2026-08-21). These used
+            # to be a single youtube_chain / youtube_chain_hq pair, back
+            # when all three standard chained routes shared one constant.
+            "youtube_analyze": YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_separate": YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_stems": YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+            # LEGACY, kept deliberately. /limits is a public contract the
+            # frontend reads, and dropping a key it may still index would
+            # turn a backend config change into `undefined` rendered in a
+            # UI string. Both point at the SEPARATION numbers, since that
+            # is what a caller reading "youtube_chain" while sizing a
+            # separation job would want - not the looser analyze figure.
+            #
+            # Remove once lib/data/rate-limits.ts is confirmed to be on
+            # the per-tool keys above and nothing else reads these.
+            "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
             "window_seconds": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
         },
         "features": {

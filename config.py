@@ -862,13 +862,54 @@ LOUDNORM_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOUDNORM_RATE_LIMIT_WIN
 # ---------- YOUTUBE CHAINED TOOLS (paste a URL, skip the manual re-upload) ----------
 # These stack TWO of the app's heaviest subsystems in one request - a
 # YouTube download (yt-dlp + proxy/cookie logic) followed by either
-# Essentia analysis or Demucs separation. The rate limit here is
-# deliberately the strictest in the app: a single request can occupy
-# BOTH the download semaphore and the separation semaphore in sequence,
-# so this is the one tool whose abuse potential touches almost every
-# other subsystem at once.
-YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "15"))
-YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+# Essentia analysis or Demucs separation. A single request can occupy
+# BOTH the download semaphore and the analysis/separation semaphore in
+# sequence, so these are the tools whose abuse potential touches almost
+# every other subsystem at once.
+#
+# SPLIT PER TOOL (2026-08-21). These used to share ONE pair of constants
+# (YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS / _WINDOW_SECONDS) across
+# /youtube/analyze, /youtube/separate and /youtube/stems.
+#
+# Worth being precise about what that did and didn't do, because it's
+# easy to assume it was worse than it was: the rate limiter keys on
+# (ip, path) - see _requests in rate_limit.py - so the three routes
+# ALREADY had independent per-IP buckets. One IP spending its allowance
+# on the key finder never consumed the vocal remover's. What they shared
+# was the NUMBER, not the bucket.
+#
+# That's still wrong, just for a different reason. The three tools have
+# nothing like the same cost profile:
+#
+#   /youtube/analyze  - download, then ~30s of Essentia on a 3-min trim
+#                       (ANALYSIS_MAX_SECONDS). Holds _analysis_semaphore,
+#                       which has 4 slots. Cheap.
+#   /youtube/separate - download, then a full Demucs run, ~3-5 min holding
+#                       the SINGLE _separation_semaphore slot.
+#   /youtube/stems    - identical Demucs cost to /youtube/separate (same
+#                       model, same run - only the output files differ,
+#                       see SEPARATION_MODEL's comment above).
+#
+# 15/hour is a reasonable allowance for the analyze path and a bad one
+# for the two separation paths: 15 accepted separation jobs from one IP
+# is over an hour of the single separation slot, which every /separate,
+# /stems and /youtube/* job on the server then queues behind. The shared
+# constant meant the loosest tool's needs set the limit for the most
+# expensive ones.
+#
+# Matched to their non-chained equivalents instead: the separation
+# limits sit near SEPARATION_RATE_LIMIT_MAX_REQUESTS' 3/hour (a little
+# looser, since the chained versions are the primary entry point for
+# these tools from the site), and analyze keeps the old 15/hour it was
+# effectively already running under.
+YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS", "15"))
+YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS", "6"))
+YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS", "6"))
+YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # TTL for /youtube/analyze jobs specifically - result is inline JSON, not
 # a file, so this can be short. Mirrors TRANSCRIPTION_JOB_TTL_SECONDS'
@@ -894,12 +935,16 @@ GPU_WORKER_SHARED_SECRET = os.environ.get("GPU_WORKER_SHARED_SECRET", "")
 VPS_PUBLIC_BASE_URL = os.environ.get("VPS_PUBLIC_BASE_URL", "")
 
 # High-quality YouTube chain routes (/youtube/separate-hq,
-# /youtube/stems-hq). Much stricter than the standard chain limit above
-# for the same reason SEPARATION_HQ_RATE_LIMIT is stricter than
+# /youtube/stems-hq). Much stricter than the standard limits above for
+# the same reason SEPARATION_HQ_RATE_LIMIT is stricter than
 # SEPARATION_RATE_LIMIT: the standard chain holds the single separation
-# slot for roughly 5 minutes, HQ holds it for 15-20. At the standard
-# chain's 2-per-10-min allowance, one IP could keep that slot occupied
-# for most of an hour and starve every other user's job behind it.
+# slot for roughly 5 minutes, HQ holds it for 15-20.
+#
+# Also split per tool (2026-08-21), same reasoning as the standard tier -
+# though here the two values genuinely are identical, since /separate-hq
+# and /stems-hq are the same Demucs run. Split anyway so that stays a
+# choice rather than a coincidence: tuning one down later shouldn't
+# require first untangling which routes share the constant.
 #
 # Matched to SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS (1/hour) because the
 # cost profile is nearly identical - it's the same Demucs work with a
@@ -911,8 +956,20 @@ VPS_PUBLIC_BASE_URL = os.environ.get("VPS_PUBLIC_BASE_URL", "")
 # MAX_CONCURRENT_SEPARATIONS slot and the same MAX_QUEUED_SEPARATIONS
 # depth check, so the practical ceiling remains wait time, not
 # throughput.
-YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
-YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
+YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
+YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+# NOTE: the old YOUTUBE_CHAIN_RATE_LIMIT_* / YOUTUBE_CHAIN_HQ_RATE_LIMIT_*
+# names are GONE, not aliased. The only two importers were
+# routes/youtube.py (the five route decorators) and routes/admin.py (the
+# /limits payload), and both moved to the per-tool names in the same
+# commit. A compatibility alias would only have preserved the ambiguity
+# this change exists to remove - and any module added later that reaches
+# for the old name should fail loudly at import, not silently inherit
+# whichever tool's number the alias happened to point at.
 
 
 # ---------- AUDIO EFFECTS: FADE / CHANNELS / RESAMPLE / RINGTONE ----------

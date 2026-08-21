@@ -135,6 +135,34 @@ added line is a single set_job_context(...) call with no side effects
 beyond what gets written to the log tables.
 --------------------------------------------------------------------------
 
+WHAT CHANGED (2026-08-21): PER-TOOL RATE LIMITS
+
+The five /youtube/* POST routes below used to share exactly two pairs of
+constants between them - YOUTUBE_CHAIN_RATE_LIMIT_* across analyze,
+separate and stems, and YOUTUBE_CHAIN_HQ_RATE_LIMIT_* across the two HQ
+routes. Each now names its own pair.
+
+What this does NOT change, and is worth stating so nobody re-derives it
+under pressure later: the per-IP BUCKETS were already separate. See
+rate_limit.py's `_requests`, keyed on (ip, path) - one IP burning its
+allowance on /youtube/analyze never consumed /youtube/separate's. The
+shared constants only meant the three tools were forced to agree on a
+number, not that they drew from a common pool.
+
+The number was the problem. /youtube/analyze holds _analysis_semaphore
+(4 slots) for ~30s of Essentia on a 3-minute trim; /youtube/separate and
+/youtube/stems each hold the SINGLE _separation_semaphore slot for 3-5
+minutes of Demucs. 15/hour is fine for the first and far too loose for
+the other two - 15 accepted separation jobs from one IP is over an hour
+of the only separation slot on the box, which every /separate, /stems
+and other /youtube/* job then waits behind. The loosest tool's needs
+were setting the limit for the most expensive ones.
+
+Config knobs are now per tool (see the YOUTUBE CHAINED TOOLS block in
+config.py). Nothing else in this file changed - same handlers, same
+status codes, same response shapes.
+--------------------------------------------------------------------------
+
 NOTE: two names the old routes.py imported from youtube.py -
 `download_with_fallback` and `VideoTooLongError` - are not referenced
 anywhere in the route handlers below (or anywhere else in the old
@@ -170,10 +198,16 @@ from config import (
     DEMUCS_TIMEOUT_SECONDS_HQ,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     SEPARATION_HQ_ENABLED,
-    YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-    YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
-    YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
-    YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_ANALYZE_JOB_TTL_SECONDS,
 )
 from utils import (
@@ -567,6 +601,12 @@ def _read_file_bytes(path: str) -> bytes:
 # separation. The download slot is RELEASED before the processing slot
 # is acquired - the two are never held at once, so a slow separation
 # doesn't also tie up a download slot for its whole duration.
+#
+# Each POST route below carries its OWN rate-limit constants (2026-08-21)
+# rather than the single shared YOUTUBE_CHAIN_RATE_LIMIT_* pair they used
+# to share - see the WHAT CHANGED note at the top of this file for why
+# the shared number was wrong even though the per-IP buckets were already
+# separate.
 # ============================================================
 
 async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Optional[tuple]:
@@ -780,12 +820,19 @@ async def _run_youtube_separation(
     "/youtube/analyze",
     dependencies=[Depends(partial(
         check_rate_limit,
-        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_analyze_route(url: str = Form(...)):
-    """Poll GET /youtube/analyze/status/{job_id}, then .../result."""
+    """Poll GET /youtube/analyze/status/{job_id}, then .../result.
+
+    The loosest of the five /youtube/* limits, and the only one that
+    should be: this is the one chained tool that never touches the
+    single separation slot. After the download it holds a slot on
+    _analysis_semaphore (4 of them) for roughly 30 seconds of Essentia
+    work on an ANALYSIS_MAX_SECONDS trim, not minutes of Demucs.
+    """
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
@@ -829,13 +876,19 @@ async def youtube_analyze_result(job_id: str):
     "/youtube/separate",
     dependencies=[Depends(partial(
         check_rate_limit,
-        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_separate_route(url: str = Form(...)):
     """Downloads then runs standard-tier vocal/instrumental separation.
-    Stem paths are stored the same way /separate stores them."""
+    Stem paths are stored the same way /separate stores them.
+
+    Its own limit (not shared with /youtube/analyze any more) because
+    each accepted job here holds the SINGLE _separation_semaphore slot
+    for 3-5 minutes, which every other separation job on the box then
+    waits behind.
+    """
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
@@ -863,8 +916,8 @@ async def youtube_separate_route(url: str = Form(...)):
     "/youtube/separate-hq",
     dependencies=[Depends(partial(
         check_rate_limit,
-        max_requests=YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_separate_hq_route(url: str = Form(...)):
@@ -955,12 +1008,18 @@ async def youtube_separate_download(job_id: str, stem: str = Query(...)):
     "/youtube/stems",
     dependencies=[Depends(partial(
         check_rate_limit,
-        max_requests=YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_stems_route(url: str = Form(...)):
-    """Downloads then runs standard-tier full 4-stem separation."""
+    """Downloads then runs standard-tier full 4-stem separation.
+
+    Same Demucs cost as /youtube/separate (same model, same run - only
+    the output files differ), so it gets the same numbers. Kept as its
+    own constant rather than importing /youtube/separate's so that stays
+    a decision, not an assumption baked into a shared name.
+    """
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
@@ -988,8 +1047,8 @@ async def youtube_stems_route(url: str = Form(...)):
     "/youtube/stems-hq",
     dependencies=[Depends(partial(
         check_rate_limit,
-        max_requests=YOUTUBE_CHAIN_HQ_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_CHAIN_HQ_RATE_LIMIT_WINDOW_SECONDS,
+        max_requests=YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_stems_hq_route(url: str = Form(...)):
