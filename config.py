@@ -137,7 +137,7 @@ DOWNLOAD_WALL_CLOCK_TIMEOUT_SECONDS = int(os.environ.get("DOWNLOAD_WALL_CLOCK_TI
 # controls the whole endpoint (both mp3 and wav) - tighten
 # DOWNLOAD_RATE_LIMIT_MAX_REQUESTS alone to cut proxy spend without
 # touching every other endpoint that still shares the generic default.
-DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "15"))
+DOWNLOAD_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_MAX_REQUESTS", "18"))
 DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 
@@ -805,7 +805,7 @@ JOIN_MAX_TOTAL_BYTES = int(os.environ.get("JOIN_MAX_TOTAL_BYTES", str(150 * 1024
 
 # Also a total, for the same reason: ten four-minute files is a
 # forty-minute re-encode however modest each one looks alone.
-JOIN_MAX_TOTAL_DURATION_SECONDS = int(os.environ.get("JOIN_MAX_TOTAL_DURATION_SECONDS", "1800"))  # 30 min
+JOIN_MAX_TOTAL_DURATION_SECONDS = int(os.environ.get("JOIN_MAX_TOTAL_DURATION_SECONDS", "5400"))  # 30 min
 
 # Every input is resampled to this before concatenation. 44100 is the
 # right default for music; the value matters less than the fact that all
@@ -816,7 +816,7 @@ JOIN_OUTPUT_SAMPLE_RATE = int(os.environ.get("JOIN_OUTPUT_SAMPLE_RATE", "44100")
 # Longer than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s, which was
 # scaled for a single short clip - this re-encodes up to 30 minutes of
 # audio through a multi-input filter graph.
-JOIN_TIMEOUT_SECONDS = int(os.environ.get("JOIN_TIMEOUT_SECONDS", "300"))  # 5 min
+JOIN_TIMEOUT_SECONDS = int(os.environ.get("JOIN_TIMEOUT_SECONDS", "900"))  # 5 min
 
 JOIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("JOIN_RATE_LIMIT_MAX_REQUESTS", "5"))
 JOIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("JOIN_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
