@@ -867,7 +867,7 @@ LOUDNORM_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOUDNORM_RATE_LIMIT_WIN
 # BOTH the download semaphore and the separation semaphore in sequence,
 # so this is the one tool whose abuse potential touches almost every
 # other subsystem at once.
-YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "3"))
+YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_MAX_REQUESTS", "15"))
 YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_CHAIN_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # TTL for /youtube/analyze jobs specifically - result is inline JSON, not
