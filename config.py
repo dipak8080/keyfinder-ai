@@ -512,14 +512,14 @@ MAX_CONCURRENT_AUDIO_TOOLS = int(os.environ.get("MAX_CONCURRENT_AUDIO_TOOLS", "4
 # protects a worker slot from being eaten forever by a hung process, same
 # reasoning as DEMUCS_TIMEOUT_SECONDS above but scaled down since these
 # are much lighter operations than Demucs separation.
-AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS", "120"))
+AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS", "600"))
 
 # Tracks longer than this are rejected before any processing starts
 # (checked via ffprobe) - applies to trim/pitch/tempo/volume/reverse,
 # where processing time scales with input duration. Convert is exempt
 # since format conversion is comparatively cheap regardless of length,
 # but still gets a size cap via MAX_UPLOAD_BYTES.
-MAX_AUDIO_TOOL_DURATION_SECONDS = int(os.environ.get("MAX_AUDIO_TOOL_DURATION_SECONDS", "1200"))  # 20 min
+MAX_AUDIO_TOOL_DURATION_SECONDS = int(os.environ.get("MAX_AUDIO_TOOL_DURATION_SECONDS", "3600"))  # 1 hour
 
 # ---------- AUDIO TOOLS: FORMAT VALIDATION ----------
 # Full any-to-any conversion matrix - every supported format can convert
