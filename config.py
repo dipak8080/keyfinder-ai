@@ -467,7 +467,7 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # sessions rather than abuse.
 #
 # Safe to raise because this number was never what protected the server.
-# MAX_QUEUED_SEPARATIONS (3 in flight) is, and it is unchanged - so the
+# MAX_QUEUED_SEPARATIONS is, and it moves with concurrency - so the
 # practical effect of doubling this is that a heavy user hits the queue
 # guard's 503 ("busy, try shortly") instead of the limiter's 429
 # ("you're rate limited"). The first is a better thing to tell someone
@@ -500,15 +500,41 @@ STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SE
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
 STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
-# Caps how many Demucs subprocesses can run at once across ALL users and
-# ALL FOUR separation routes (/separate, /separate-hq, /stems,
-# /stems-hq) - separate from MAX_CONCURRENT_ANALYSIS/DOWNLOADS since
-# Demucs is far more RAM-hungry per job than either of those.
+# Caps how many separation jobs may be IN FLIGHT TO THE GPU WORKER at
+# once, across ALL users and ALL FOUR separation routes (/separate,
+# /separate-hq, /stems, /stems-hq) plus their /youtube/* equivalents.
 #
-# Doubly non-negotiable now: htdemucs_ft holds this slot for 15-20 min at
-# a time, and all four routes share it. Raising this doesn't add
-# throughput on 4 cores, it just makes every concurrent job slower.
-MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "1"))
+# RAISED 1 -> 2 (2026-08-22). The comment that used to sit here read:
+#
+#     "Raising this doesn't add throughput on 4 cores, it just makes
+#      every concurrent job slower."
+#
+# That was correct, and it stopped being correct at the GPU migration
+# without anyone updating it. Demucs does not run on this VPS any more -
+# separation.py submits to a RunPod Serverless worker and awaits an HTTP
+# call (see its module docstring). Verified against the actual code
+# path: the ONLY local work per job is a single ffprobe duration check
+# dispatched through run_blocking, plus os.path.exists checks on files
+# the worker has already POSTed to disk itself. No local decode, no
+# re-encode, no Demucs subprocess. The VPS spends that time waiting on a
+# socket, not burning cores.
+#
+# So this constant was no longer protecting the box - it was serializing
+# jobs that RunPod could run in parallel, which meant a SECOND RunPod
+# worker sat idle by construction: the VPS never issued a second
+# concurrent request for it to pick up. Matching this to the worker
+# count is what actually puts paid capacity to work.
+#
+# KEEP THIS IN SYNC WITH THE RUNPOD WORKER COUNT. Setting it higher than
+# the number of workers doesn't add throughput, it just moves the queue
+# from here (where the job system can report it) into RunPod's own
+# queue, where it is invisible to /admin/status.
+#
+# What this does NOT stop bounding: two concurrent jobs mean two workers
+# POSTing full stem sets to /internal/gpu/upload at the same time. That
+# is inbound bandwidth and disk, not CPU - if upload timeouts ever
+# appear there, this is the number to look at, not the GPU.
+MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "2"))
 
 # How many separation jobs may be in flight (running + waiting) before
 # new submissions are rejected with a 503.
@@ -524,7 +550,18 @@ MAX_CONCURRENT_SEPARATIONS = int(os.environ.get("MAX_CONCURRENT_SEPARATIONS", "1
 # ~15 minute wait for the last one. Past that, an immediate "the queue
 # is full, try again shortly" is more honest - and far cheaper - than
 # an open-ended wait that looks identical to the app being broken.
-MAX_QUEUED_SEPARATIONS = int(os.environ.get("MAX_QUEUED_SEPARATIONS", "3"))
+#
+# RAISED 3 -> 6 (2026-08-22), moving in step with
+# MAX_CONCURRENT_SEPARATIONS going 1 -> 2. What matters to a waiting
+# user is WAIT TIME, not queue position, and wait time is depth divided
+# by concurrency: 3-deep on one slot and 6-deep on two slots are the
+# same promise, serving twice the people.
+#
+# The "3-5 min per job" figure above is itself pre-GPU. A standard job
+# now finishes in roughly 20-60 seconds on the RunPod worker, so 6 in
+# flight across 2 slots is on the order of a two-minute worst case -
+# comfortably inside what someone watching a progress bar will tolerate.
+MAX_QUEUED_SEPARATIONS = int(os.environ.get("MAX_QUEUED_SEPARATIONS", "6"))
 
 
 # ---------- AUDIO TOOLS (convert / trim / pitch / tempo / volume / reverse) ----------

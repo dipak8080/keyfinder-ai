@@ -8,12 +8,34 @@ they're grouped with the other YouTube tools rather than here.
 
 Split out of the old monolithic routes.py (2026-08-14 restructure). Pure
 move: every docstring, comment, and line of logic here is unchanged from
-its original location. Nothing in this file changes behaviour.
+its original location.
 
 Four routes sharing one model, one semaphore and one queue. The vocal
 remover is NOT cheaper than the stem splitter: Demucs separates all four
 sources internally either way, and --two-stems just sums three of them
 for us.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): DOCSTRINGS, NOT BEHAVIOUR
+
+Three route docstrings below described separation as CPU work on this
+VPS - "1-5+ minutes on CPU", "roughly 5x the CPU time", "same CPU cost".
+None of that has been true since the GPU migration: separation.py
+submits to a RunPod Serverless worker and awaits an HTTP call, and the
+only local work per job is a single ffprobe duration check. See
+separation.py's own module docstring for the full architecture.
+
+The relative claims were still right - HQ really does cost several times
+what standard costs, and /stems really does cost the same as /separate -
+so only the noun changed. But a docstring naming the wrong machine is
+how a stale assumption survives a migration, which is exactly what
+happened to MAX_CONCURRENT_SEPARATIONS: its comment argued from "4
+cores" long after the cores stopped being involved, and that argument
+kept a second paid RunPod worker idle. Corrected here in the same pass
+that fixed the constant.
+
+No code, status codes, or response shapes changed.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -161,9 +183,14 @@ async def _queue_separation(
 async def separate_audio(file: UploadFile = File(...)):
     """
     Accepts an audio file, returns a job_id immediately, and runs Demucs
-    vocal/instrumental separation in the background - it takes 1-5+
-    minutes on CPU, far beyond a normal request window. Poll
-    GET /separate/status/{job_id}.
+    vocal/instrumental separation in the background on the RunPod GPU
+    worker. Poll GET /separate/status/{job_id}.
+
+    Backgrounded because it still takes longer than a comfortable request
+    window - roughly 20-60 seconds on GPU, plus a cold start when no
+    worker is warm. (This docstring used to say "1-5+ minutes on CPU",
+    which was true before the GPU migration and is the figure a lot of
+    the surrounding copy was originally sized against.)
     """
     return await _queue_separation(
         file,
@@ -189,8 +216,13 @@ async def separate_audio(file: UploadFile = File(...)):
 async def separate_audio_hq(file: UploadFile = File(...)):
     """
     High-quality separation: htdemucs_ft (a 4-model ensemble) at raised
-    overlap. Roughly 5x the CPU time of /separate, so it gets a longer
+    overlap. Roughly 5x the compute of /separate - four forward passes
+    instead of one, plus the overlap increase - so it gets a longer
     timeout, a TIGHTER input duration cap, and a stricter rate limit.
+
+    That 5x is a ratio, not a wall-clock figure: it held when this ran on
+    the VPS CPU and it still holds on the GPU worker, where it works out
+    at roughly 1-2 minutes rather than the 15-20 the CPU path took.
 
     A separate route rather than a `quality` form field because rate-limit
     dependencies are evaluated before the request body is read - a
@@ -275,9 +307,14 @@ async def separation_download(job_id: str, stem: str = Query(...)):
 async def stems_route(file: UploadFile = File(...)):
     """
     Full 4-stem separation (vocals/drums/bass/other). Same model, same
-    semaphore and same CPU cost as /separate - the only difference is
-    that the four internally-separated sources are kept as individual
-    files instead of three being summed into one instrumental.
+    semaphore and the same compute cost as /separate - the only
+    difference is that the four internally-separated sources are kept as
+    individual files instead of three being summed into one
+    instrumental.
+
+    Worth restating because it is genuinely counterintuitive and drives
+    the rate limits: --two-stems does NOT make the vocal remover cheaper.
+    Demucs separates all four sources either way.
     """
     return await _queue_separation(
         file,
