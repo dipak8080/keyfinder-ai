@@ -461,7 +461,25 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # single-slot resource one person may claim. See MAX_QUEUED_SEPARATIONS
 # below - that, not this, is what actually protects the server. This
 # number only decides how often one IP may join the queue.
-SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "3"))
+# RAISED 3 -> 6 (2026-08-22), matching the chained /youtube/separate and
+# /youtube/stems limits set the same week. Demand-driven: the standard
+# tier is what people actually use, and 3/hour was cutting off ordinary
+# sessions rather than abuse.
+#
+# Safe to raise because this number was never what protected the server.
+# MAX_QUEUED_SEPARATIONS (3 in flight) is, and it is unchanged - so the
+# practical effect of doubling this is that a heavy user hits the queue
+# guard's 503 ("busy, try shortly") instead of the limiter's 429
+# ("you're rate limited"). The first is a better thing to tell someone
+# who did nothing wrong.
+#
+# What it DOES change is spend. Separation runs on RunPod GPU, so twice
+# the allowance is potentially twice the billed GPU-seconds from one IP.
+# MAX_CONCURRENT_SEPARATIONS is still 1, which bounds the rate of that
+# spend, but not its total over an hour. Watch the RunPod balance for a
+# week after this lands; if it moves faster than expected, this constant
+# is the first knob to turn back, not the concurrency.
+SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "6"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # Stricter still for HQ: one job can hold the single separation slot for
@@ -476,7 +494,7 @@ SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE
 # on path: one IP can spend its /separate budget AND its /stems budget in
 # the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS
 # regardless, so the practical cap is wait time, not throughput.
-STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "3"))
+STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "6"))
 STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
