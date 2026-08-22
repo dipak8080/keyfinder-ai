@@ -34,6 +34,33 @@ transcription one. Removing either breaks module import at startup, which
 surfaces as a failed health check and an automatic rollback rather than
 anything that names the missing function.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-22: _reject_if_audio_tools_queue_full() - the THIRD and
+final bounded-queue guard, closing the last unbounded pool in the app.
+
+The audio tools were the pool that never got this treatment, almost
+certainly because each individual job is fast. That is true, and it is
+not the same thing as safe: eighteen endpoints feed one 4-slot
+semaphore, and _run_tool_job acquires that semaphore INSIDE the
+background task, so every submission past the fourth queued in memory
+without limit. Same mechanism as the two bugs already fixed above, same
+symptom - a spinner that looks identical to the site being broken.
+
+Rate limits do not cover this and never could: they are per-IP. Fifty
+different visitors each making ONE legitimate /convert request is fifty
+queued jobs and zero rate-limit violations. Good traffic, in other
+words, is exactly the case that produced it.
+
+CALLED FROM TWO PLACES, deliberately:
+  - inside _submit_audio_tool(), covering the fourteen tools that share
+    that path - but ONLY when the caller passed no semaphore of its own,
+    which is what keeps /audio-to-midi (its own semaphore, its own
+    sidecar) out of this pool's accounting.
+  - directly from the four routes with their own submit paths: /trim
+    (routes/audio_tools.py) and /join, /video-to-audio, /silence-split
+    (routes/media.py).
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -48,6 +75,8 @@ from config import (
     MAX_UPLOAD_BYTES,
     MAX_QUEUED_SEPARATIONS,
     MAX_QUEUED_TRANSCRIPTIONS,
+    MAX_QUEUED_AUDIO_TOOLS,
+    AUDIO_TOOL_JOB_TYPES,
 )
 from upload import save_upload
 from utils import (
@@ -465,6 +494,58 @@ def _reject_if_transcription_queue_full():
         )
 
 
+def _reject_if_audio_tools_queue_full():
+    """
+    The bounded queue for the shared ffmpeg/rubberband pool.
+
+    ADDED 2026-08-22, and the last of the three. Called from
+    _submit_audio_tool() below (covering fourteen tools) and directly
+    from the four routes that build their own submit path: /trim in
+    routes/audio_tools.py, and /join, /video-to-audio, /silence-split in
+    routes/media.py.
+
+    Identical mechanism to the two guards above - see
+    _reject_if_separation_queue_full() for the full argument - with one
+    difference worth stating plainly, because it is why this pool was
+    overlooked for so long:
+
+    THESE JOBS ARE FAST, AND THAT IS NOT THE SAME AS SAFE. A /volume runs
+    in seconds, so an unbounded queue behind a 4-slot semaphore looks
+    harmless right up until eighteen endpoints all feed it at once. And
+    the per-IP rate limits offer nothing here by construction: fifty
+    different visitors each making ONE permitted /convert request is
+    fifty queued jobs and zero violations. The good-traffic case IS the
+    failure case.
+
+    COUNTS ALL EIGHTEEN TOOLS TOGETHER, for the same reason the
+    transcription guard counts both its endpoints: one semaphore, one
+    queue. Someone submitting /convert genuinely is behind everyone who
+    submitted /join, and a per-tool count would let any one tool fill the
+    pool while every individual count looked fine.
+
+    EXCLUDES /audio-to-midi by construction. It shares
+    _submit_audio_tool() but passes its own semaphore, and the call site
+    below only invokes this guard when no semaphore was passed - so a
+    busy MIDI sidecar can never reject a /convert. See
+    AUDIO_TOOL_JOB_TYPES in config.py.
+
+    503 rather than 429, same as its two siblings: the server is at
+    capacity, the caller did nothing wrong, and a client deciding whether
+    to retry needs to be able to tell those apart.
+    """
+    depth = count_processing(AUDIO_TOOL_JOB_TYPES)
+    if depth >= MAX_QUEUED_AUDIO_TOOLS:
+        logger.warning(
+            f"[AUDIO_TOOLS] Rejected submission - queue full "
+            f"({depth}/{MAX_QUEUED_AUDIO_TOOLS} jobs in flight)"
+        )
+        raise HTTPException(
+            503,
+            "The server is busy processing other files right now. These jobs "
+            "are usually quick - please try again in a moment.",
+        )
+
+
 def _resolve_tool_output_path(job_id: str, expected_type: str) -> tuple:
     """
     Shared lookup behind every audio tool's preview and download route.
@@ -553,13 +634,16 @@ async def _submit_audio_tool(
     Order of operations is deliberate:
       1. Validate the FILENAME's format first - free, and rejects an
          obviously wrong file before a byte is transferred.
-      2. Create the job, so an upload that fails partway has somewhere to
+      2. Check the queue depth - also free, and the last check before
+         anything is spent. See the call site below for why it sits
+         here rather than first.
+      3. Create the job, so an upload that fails partway has somewhere to
          record why.
-      3. Stream the upload to disk with the size cap enforced per chunk.
-      4. Probe duration (off the event loop) and reject synchronously if
+      4. Stream the upload to disk with the size cap enforced per chunk.
+      5. Probe duration (off the event loop) and reject synchronously if
          it's too long - the caller learns immediately rather than being
          handed a job id that fails a second later.
-      5. Only then queue the background work.
+      6. Only then queue the background work.
 
     build_work(input_path, output_path) returns a zero-arg callable that
     the runner awaits. Passing a builder rather than the paths themselves
@@ -596,6 +680,26 @@ async def _submit_audio_tool(
     else:
         source_format = _validated_input_format(file.filename)
     out_fmt = output_format or source_format
+
+    # Capacity gate. Two things about its placement are deliberate.
+    #
+    # AFTER the format check, matching the ordering argument in
+    # routes/transcribe.py's docstring: everything above is the CALLER's
+    # input being wrong (400), this is the SERVER being full (503).
+    # Someone who uploaded a .txt should be told about the .txt, not
+    # turned away for capacity, fix nothing, and hit the 400 on retry.
+    #
+    # BEFORE create_job and _accept_upload, so a refused submission
+    # leaves no job row, no bytes on disk, and nothing to clean up.
+    #
+    # `semaphore is None` is what scopes this to the SHARED audio-tools
+    # pool. A caller that brought its own semaphore (only
+    # /audio-to-midi today, bounded by MAX_CONCURRENT_MIDI and the
+    # sidecar's own limit) is not queueing for a slot this guard
+    # counts, so applying it there would reject /convert submissions
+    # because an unrelated MIDI worker was busy.
+    if semaphore is None:
+        _reject_if_audio_tools_queue_full()
 
     # Captured NOW, not read inside the background lambda below. The
     # UploadFile is closed once the response is sent, and while .filename

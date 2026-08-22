@@ -8,6 +8,34 @@ its own size cap), /join (the only multi-upload route), /silence-split
 Split out of the old monolithic routes.py (2026-08-14 restructure). Pure
 move: every docstring, comment, and line of logic here is unchanged from
 its original location. Nothing in this file changes behaviour.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): /analyze GOT ITS OWN RATE LIMIT
+
+/analyze was the only route in the routes/ package still carrying a bare
+`Depends(check_rate_limit)` with no arguments. That is not "no limit" -
+it silently inherited check_rate_limit's default arguments, which fall
+back to the generic RATE_LIMIT_MAX_REQUESTS / RATE_LIMIT_WINDOW_SECONDS
+pair in config.py: 20 requests per 60 seconds, or 1200 an hour.
+
+Two problems with that, and the second is the one that actually matters.
+
+The number was wrong. /analyze streams a full upload to disk and then
+holds one of only MAX_CONCURRENT_ANALYSIS (4) slots for an Essentia run
+plus a librosa cross-check. Comparable tools on this server sit at 3-5
+per minute. 1200/hour let a single IP keep most of the analysis pool
+busy indefinitely, and /youtube/analyze - the same Essentia work with a
+download in front - is capped at 15/hour.
+
+The number was also invisible, which is worse. A bare
+Depends(check_rate_limit) names nothing, so neither this file nor
+config.py told you what /analyze allowed; the answer lived in a default
+argument in rate_limit.py. Every other route passes its limits
+explicitly through partial(). This one now does too, which is the real
+point - a limit nobody can find is a limit nobody maintains.
+
+Nothing else in this file changed.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -24,6 +52,8 @@ from config import (
     UPLOAD_DIR,
     MAX_UPLOAD_BYTES,
     ANALYSIS_MAX_SECONDS,
+    ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+    ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
     ALLOWED_AUDIO_INPUT_FORMATS,
     MAX_VIDEO_UPLOAD_BYTES,
     VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS,
@@ -70,6 +100,7 @@ from ._shared import (
     _run_tool_job,
     _tool_status,
     _resolve_tool_output_path,
+    _reject_if_audio_tools_queue_full,
 )
 
 router = APIRouter()
@@ -81,9 +112,20 @@ router = APIRouter()
 # Synchronous rather than job-based because analysis only ever looks at
 # the first ANALYSIS_MAX_SECONDS of audio, so it finishes inside a normal
 # request window even for a long track.
+#
+# Limits passed explicitly (2026-08-22) rather than relying on
+# check_rate_limit's defaults - see this file's WHAT CHANGED note for
+# what the bare version was actually allowing.
 # ============================================================
 
-@router.post("/analyze", dependencies=[Depends(check_rate_limit)])
+@router.post(
+    "/analyze",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=ANALYZE_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
 async def analyze_audio(file: UploadFile = File(...)):
     # Same reasoning as /download above: no job, tagged anyway so this
     # row reports "ANALYZE" consistently.
@@ -195,6 +237,19 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
         raise HTTPException(400, str(e))
 
     original_filename = file.filename
+
+    # /video-to-audio builds its own submit path (its own size cap, its
+    # own format validator), so it doesn't inherit _submit_audio_tool's
+    # capacity gate - it runs on the shared _audio_tools_semaphore all
+    # the same. Placed after the caller's own input has been validated
+    # and before create_job, matching the shared helper exactly.
+    #
+    # It matters more here than on most routes: this endpoint accepts up
+    # to MAX_VIDEO_UPLOAD_BYTES (200MB), so a submission refused at this
+    # line saves an upload an order of magnitude larger than any other
+    # tool's.
+    _reject_if_audio_tools_queue_full()
+
     job_id = create_job(job_type="video_to_audio")
     remember_job_tags(job_id)
 
@@ -285,6 +340,16 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
         _validated_input_format(f.filename)
 
     first_filename = files[0].filename
+
+    # Same shared-pool capacity gate as every other audio tool - /join
+    # has its own submit path (multi-upload, batch size cap) so it
+    # doesn't inherit _submit_audio_tool's.
+    #
+    # The most valuable placement of the four: refusing here saves a
+    # JOIN_MAX_TOTAL_BYTES batch (150MB across up to ten files) that
+    # would otherwise all land on disk before anything noticed the pool
+    # was full.
+    _reject_if_audio_tools_queue_full()
 
     job_id = create_job(job_type="join")
 
@@ -388,6 +453,12 @@ async def silence_split_route(
         )
 
     original_filename = file.filename
+
+    # Shared-pool capacity gate; /silence-split has its own submit path
+    # because it produces MANY outputs rather than one, so it doesn't
+    # inherit _submit_audio_tool's. Same position as the others: after
+    # the caller's input has been validated, before create_job.
+    _reject_if_audio_tools_queue_full()
 
     job_id = create_job(job_type="silence_split")
 

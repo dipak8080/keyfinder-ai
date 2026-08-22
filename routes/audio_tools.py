@@ -26,6 +26,29 @@ Twelve of these fifteen (all but /trim) share one submit path
 (_run_tool_job, also _shared.py) and one semaphore
 (_audio_tools_semaphore, in utils.py). Each POST differs only in what it
 validates and which worker it calls.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): BOUNDED QUEUE FOR THE SHARED POOL
+
+_audio_tools_semaphore had no queue-depth guard - the last pool in the
+app without one. MAX_CONCURRENT_AUDIO_TOOLS caps how many jobs RUN (4),
+but that semaphore is acquired inside the background task, so every
+submission past the fourth queued in memory with no ceiling, each
+holding an uploaded file on disk and a job-table row.
+
+Fourteen of the fifteen tools here inherit the fix for free:
+_submit_audio_tool() now calls _reject_if_audio_tools_queue_full()
+internally. /trim is the exception - it builds its own submit path
+because range validation needs the real duration - so it calls the
+guard explicitly below, in the same position the shared helper uses.
+
+Also in this deploy, and unrelated to the queue: /pitch and /tempo went
+from 3 to 5 per 5 minutes. They are the only ITERATIVE tools in this
+family (try +2, listen, try +3, listen), and 3 locked someone out on
+their third attempt mid-decision. See the note on
+AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS in config.py. No code change here -
+the constants are read from config as before.
+--------------------------------------------------------------------------
 """
 import os
 import asyncio
@@ -116,6 +139,7 @@ from ._shared import (
     _validate_duration_or_reject,
     _log_queued,
     _run_tool_job,
+    _reject_if_audio_tools_queue_full,
 )
 
 router = APIRouter()
@@ -205,6 +229,15 @@ async def trim_audio_route(
 
     source_format = _validated_input_format(file.filename)
     original_filename = file.filename
+
+    # Same reason /trim needs its own set_job_context above: it doesn't
+    # go through _submit_audio_tool, so it doesn't inherit that helper's
+    # capacity gate either. Placed here to match the shared path exactly
+    # - after the caller's own input has been validated (a bad range or
+    # a .txt is a 400 and should be reported as one), and before
+    # create_job/_accept_upload, so a refused submission leaves no job
+    # row and no bytes on disk.
+    _reject_if_audio_tools_queue_full()
 
     job_id = create_job(job_type="trim")
 

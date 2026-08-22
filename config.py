@@ -151,6 +151,31 @@ TYPICAL_BPM_MAX = 180
 KEY_DISAGREEMENT_CONFIDENCE_PENALTY = 0.75
 BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
 
+# ---------- ANALYZE RATE LIMIT ----------
+# Dedicated limit for /analyze, replacing the bare
+# `Depends(check_rate_limit)` it used to carry - which meant it silently
+# inherited the generic RATE_LIMIT_MAX_REQUESTS / _WINDOW_SECONDS
+# default of 20 per 60 seconds.
+#
+# That was the loosest limit on the site by a wide margin - 1200 an hour
+# - on a route that is NOT cheap: it streams a full upload to disk, then
+# holds a slot in MAX_CONCURRENT_ANALYSIS (4) for an Essentia run plus a
+# librosa cross-check. Every other tool of comparable cost sits at 3-5
+# per minute or stricter.
+#
+# It was also invisible. A bare Depends(check_rate_limit) names no
+# number, so reading either config.py or the route told you nothing
+# about what /analyze actually allowed - the value lived in a default
+# argument two files away. Every other route in the app passes its
+# limits explicitly via partial(); this makes /analyze match, which
+# matters more than the number itself.
+#
+# 10 per 5 minutes is still generous for the real workflow (drop a
+# track, read its key, drop the next) while ending the case where one IP
+# can hold most of the analysis pool indefinitely.
+ANALYZE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ANALYZE_RATE_LIMIT_MAX_REQUESTS", "10"))
+ANALYZE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+
 # ---------- CONCURRENCY / LOAD-SHEDDING CONFIG ----------
 THREAD_POOL_WORKERS = int(os.environ.get("THREAD_POOL_WORKERS", "8"))
 
@@ -507,19 +532,176 @@ AUDIO_TOOL_JOB_TTL_SECONDS = int(os.environ.get("AUDIO_TOOL_JOB_TTL_SECONDS", st
 # still real CPU work that shouldn't be allowed unbounded.
 MAX_CONCURRENT_AUDIO_TOOLS = int(os.environ.get("MAX_CONCURRENT_AUDIO_TOOLS", "4"))
 
+# How many audio-tool jobs may be in flight (running + waiting) before
+# new submissions are rejected with a 503.
+#
+# The third bounded queue in this app, and the last pool that didn't have
+# one - MAX_QUEUED_SEPARATIONS and MAX_QUEUED_TRANSCRIPTIONS have existed
+# for a while and their docstrings describe exactly the bug this closes.
+# MAX_CONCURRENT_AUDIO_TOOLS above caps how many RUN at once, but the
+# semaphore enforcing it is acquired INSIDE the background task (see
+# _run_tool_job's `async with semaphore`), so submissions past 4 were
+# never refused: they queued in memory with no ceiling, each holding an
+# uploaded file on disk and a job-table row, while the person watching
+# the spinner had no way to know they were twelfth in line.
+#
+# The audio tools missed out on this guard the first two times almost
+# certainly because each job is fast, which is true right up until the
+# traffic arrives. EIGHTEEN endpoints feed this one 4-slot pool, and
+# rate limits do not help here: those are per-IP, so fifty different
+# visitors each making ONE legitimate /convert request is fifty queued
+# jobs and zero rate-limit violations. That is precisely the shape of
+# "good traffic" - and the shape that makes a working site look broken.
+#
+# 12 = 3 deep per slot. At the few-seconds-to-a-couple-minutes these
+# tools actually take, that is a short, honest wait; past it, an
+# immediate "try again shortly" beats an open-ended spinner.
+MAX_QUEUED_AUDIO_TOOLS = int(os.environ.get("MAX_QUEUED_AUDIO_TOOLS", "12"))
+
+# Every job_type that runs on the shared _audio_tools_semaphore, counted
+# together by _reject_if_audio_tools_queue_full() in routes/_shared.py.
+#
+# One tuple rather than a per-route check, for the same reason the
+# transcription guard counts /speech-to-text and /youtube/transcribe
+# together: they share ONE semaphore, so counting any of them in
+# isolation would let the others fill the queue unnoticed. Someone
+# submitting a /convert genuinely is behind everyone who submitted a
+# /join, and the guard has to reflect that.
+#
+# Lives here rather than in jobs.py alongside SEPARATION_JOB_TYPES /
+# TRANSCRIPTION_JOB_TYPES only because it is config-shaped data with no
+# behaviour attached; count_processing() takes any collection, so
+# nothing in jobs.py needs to change.
+#
+# DELIBERATELY EXCLUDES audio-to-midi. That tool goes through the same
+# _submit_audio_tool() path but passes its OWN semaphore (bounded by
+# MAX_CONCURRENT_MIDI and, on the far side, the worker's own
+# MIDI_WORKER_CONCURRENCY), so it never competes for a slot in this
+# pool. Counting it here would reject /convert submissions because
+# somebody else was transcribing MIDI on a different sidecar entirely.
+# The guard enforces this structurally too - see _submit_audio_tool,
+# which only applies it when the caller passed no semaphore of its own.
+#
+# Strings must match the job_type passed to create_job() exactly. The
+# four that don't route through _submit_audio_tool - trim, join,
+# video_to_audio, silence_split - call the guard directly from their own
+# routes and are listed here for the same reason.
+AUDIO_TOOL_JOB_TYPES = (
+    # via _submit_audio_tool (routes/audio_tools.py)
+    "convert", "volume", "pitch", "tempo", "reverse",
+    "noise_remove", "voice_clean", "echo_remove", "silence_remove",
+    "loudnorm", "fade", "channels", "resample", "ringtone",
+    # own submit path, guard called explicitly
+    "trim",                                    # routes/audio_tools.py
+    "join", "video_to_audio", "silence_split",  # routes/media.py
+)
+
 # Hard ceiling on how long any single ffmpeg/rubberband subprocess spawned
 # by the audio-tools modules is allowed to run before being killed -
 # protects a worker slot from being eaten forever by a hung process, same
 # reasoning as DEMUCS_TIMEOUT_SECONDS above but scaled down since these
 # are much lighter operations than Demucs separation.
+#
+# This is now the FALLBACK, not the universal value - see
+# AUDIO_TOOL_TIMEOUT_SECONDS below for the per-tool overrides and why
+# one number for fifteen tools was the wrong shape.
+#
+# NOTE the stale-comment trail this left: both JOIN_TIMEOUT_SECONDS and
+# VIDEO_TO_AUDIO_TIMEOUT_SECONDS below justify themselves as "longer
+# than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s". It WAS 120s when
+# those were written. It is 600 now, which makes
+# VIDEO_TO_AUDIO_TIMEOUT_SECONDS (300) shorter than the thing it claims
+# to exceed. Both comments corrected in place at their own definitions.
 AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS", "600"))
+
+# ----- Per-tool subprocess timeouts -----
+# Keyed by job_type (the same string passed to create_job / used by
+# _tool_status), falling back to AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS
+# for anything absent.
+#
+# WHY THIS EXISTS: one 600s ceiling covered all fifteen tools, which
+# means it was sized for the slowest (rubberband) and therefore useless
+# for the rest. A hung /volume - a single ffmpeg gain filter that should
+# finish in seconds - held a slot in MAX_CONCURRENT_AUDIO_TOOLS for ten
+# full minutes before the kill fired. With only 4 slots, two hung cheap
+# jobs is half the pool gone for the length of a Demucs run, and the
+# only symptom is that unrelated tools feel slow.
+#
+# A timeout is not a performance target, it's the point at which "still
+# running" stops being credible. That point is genuinely different for
+# a stream-copy trim than for a rubberband pitch shift on a 15-minute
+# file, so it should not be one number.
+#
+# A dict rather than fifteen env-driven constants, matching
+# MODEL_STEM_NAMES' reasoning above: this is data about tools, and
+# adding a sixteenth tool should be one line here, not a new constant
+# plus a new import plus a new call-site argument. Individual entries
+# are deliberately NOT env-overridable - if one of these needs tuning on
+# the VPS at 2am, that is a signal the tool itself has a problem worth
+# looking at, not a knob worth turning blind.
+AUDIO_TOOL_TIMEOUT_SECONDS = {
+    # Stream-copy or a single trivial filter. Seconds of real work; if
+    # one of these is still going after two minutes it is stuck, not
+    # slow.
+    "trim": 120,
+    "volume": 120,
+    "channels": 120,
+    "fade": 120,
+    "ringtone": 120,
+    # One filter pass over the whole file, output re-encoded.
+    "reverse": 180,
+    "resample": 180,
+    # Full re-encode, cost scales with length. Convert is exempt from
+    # the duration cap (see below) so it can legitimately be handed the
+    # longest inputs of any tool here.
+    "convert": 300,
+    # FFT-based filters (afftdn and friends) - heavier per second of
+    # audio than the simple filters above, still far cheaper than
+    # rubberband.
+    "noise_remove": 300,
+    "voice_clean": 300,
+    "echo_remove": 300,
+    "silence_remove": 300,
+    # Two full ffmpeg passes: measure, then re-encode. Has its own
+    # LOUDNORM_ANALYSIS/APPLY timeouts further down that bound each pass
+    # individually; this is the outer ceiling on the pair.
+    "loudnorm": 300,
+    # rubberband. By far the slowest thing in this family and the only
+    # reason the shared ceiling was ever 600.
+    "pitch": 600,
+    "tempo": 600,
+}
 
 # Tracks longer than this are rejected before any processing starts
 # (checked via ffprobe) - applies to trim/pitch/tempo/volume/reverse,
 # where processing time scales with input duration. Convert is exempt
 # since format conversion is comparatively cheap regardless of length,
 # but still gets a size cap via MAX_UPLOAD_BYTES.
+#
+# Now the FALLBACK, same as the timeout above - see
+# AUDIO_TOOL_MAX_DURATION_SECONDS for the per-tool overrides.
 MAX_AUDIO_TOOL_DURATION_SECONDS = int(os.environ.get("MAX_AUDIO_TOOL_DURATION_SECONDS", "3600"))  # 1 hour
+
+# ----- Per-tool input duration caps -----
+# Same keying and fallback behaviour as AUDIO_TOOL_TIMEOUT_SECONDS.
+#
+# The two caps have to move together or they contradict each other. An
+# hour of audio through rubberband cannot finish inside pitch's 600s
+# timeout - so under the old single 3600s cap, a 50-minute file was
+# ACCEPTED, queued, given a slot, processed for ten minutes, and then
+# killed on timeout. The user waited the full ten minutes to be told it
+# failed, and the slot was occupied for all of it.
+#
+# Rejecting at submit time on duration is the honest version of the same
+# decision, and it costs nothing: ffprobe already runs there.
+#
+# Only the tools whose cost genuinely scales steeply with length are
+# listed. Everything else keeps the 1-hour fallback, which is correct
+# for a gain change or a channel downmix regardless of length.
+AUDIO_TOOL_MAX_DURATION_SECONDS = {
+    "pitch": 900,   # 15 min - comfortably inside pitch's 600s timeout
+    "tempo": 900,   # 15 min - same
+}
 
 # ---------- AUDIO TOOLS: FORMAT VALIDATION ----------
 # Full any-to-any conversion matrix - every supported format can convert
@@ -576,10 +758,23 @@ AUDIO_VOLUME_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_VOLUME_RATE_L
 AUDIO_REVERSE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_REVERSE_RATE_LIMIT_MAX_REQUESTS", "5"))
 AUDIO_REVERSE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_REVERSE_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
-AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS", "3"))
+# RAISED 3 -> 5 (2026-08-22). Pitch and tempo are the only ITERATIVE
+# tools in this family: nobody shifts once. The real workflow is +2,
+# listen, +3, listen, -1 - and at 3 per 5 minutes the third attempt
+# locked someone out mid-decision, holding a half-finished idea, for
+# five minutes. Every other tool on this list is one-shot: you convert a
+# file and you are done.
+#
+# The original 3 was justified by rubberband being slower than the
+# ffmpeg tools, which is true and is the wrong lever. What protects the
+# box is MAX_CONCURRENT_AUDIO_TOOLS (4 slots) and now
+# MAX_QUEUED_AUDIO_TOOLS below; the rate limit only decides how often
+# ONE person may join that queue. Five still sits below the 5-per-minute
+# cheap tools by a wide margin.
+AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS", "5"))
 AUDIO_PITCH_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_PITCH_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
-AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS", "3"))
+AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS", "5"))
 AUDIO_TEMPO_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TEMPO_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
 # Noise reduction strength range, passed to ffmpeg's afftdn filter's nr
@@ -604,8 +799,17 @@ AUDIO_ECHO_REMOVE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_ECHO_REM
 SILENCE_THRESHOLD_MIN_DB = float(os.environ.get("SILENCE_THRESHOLD_MIN_DB", "-90"))
 SILENCE_THRESHOLD_MAX_DB = float(os.environ.get("SILENCE_THRESHOLD_MAX_DB", "-10"))
 
-SILENCE_MIN_DURATION_SECONDS = float(os.environ.get("SILENCE_MIN_DURATION_MIN_SECONDS", "0.1"))
-SILENCE_MAX_DURATION_SECONDS = float(os.environ.get("SILENCE_MAX_DURATION_MAX_SECONDS", "10"))
+# FIXED 2026-08-22: the env var names read on these two lines did not
+# match the constants they set - the lookups were for
+# SILENCE_MIN_DURATION_MIN_SECONDS and SILENCE_MAX_DURATION_MAX_SECONDS
+# (note the doubled MIN/MAX), which are names nothing has ever set.
+# Setting SILENCE_MIN_DURATION_SECONDS on the VPS did nothing at all and
+# gave no indication of it: os.environ.get() falls back silently, so the
+# override just never took and the default stayed in force. Both
+# /silence-remove and /silence-split validate their min_duration_seconds
+# form field against these, so the bound was un-tunable in production.
+SILENCE_MIN_DURATION_SECONDS = float(os.environ.get("SILENCE_MIN_DURATION_SECONDS", "0.1"))
+SILENCE_MAX_DURATION_SECONDS = float(os.environ.get("SILENCE_MAX_DURATION_SECONDS", "10"))
 
 AUDIO_SILENCE_REMOVE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_SILENCE_REMOVE_RATE_LIMIT_MAX_REQUESTS", "5"))
 AUDIO_SILENCE_REMOVE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_SILENCE_REMOVE_RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -775,9 +979,16 @@ MAX_VIDEO_UPLOAD_BYTES = int(os.environ.get("MAX_VIDEO_UPLOAD_BYTES", str(200 * 
 # stream-copy path, so this can be generous.
 VIDEO_EXTRACT_MAX_DURATION_SECONDS = int(os.environ.get("VIDEO_EXTRACT_MAX_DURATION_SECONDS", "3600"))  # 60 min
 
-# Longer than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s: re-encoding
-# an hour of audio out of a large container takes real time, and the
-# 120s figure was scaled for short audio clips.
+# Sized for re-encoding up to an hour of audio out of a large video
+# container (VIDEO_EXTRACT_MAX_DURATION_SECONDS below), which takes real
+# time even though the stream-copy path is near-instant.
+#
+# COMMENT CORRECTED 2026-08-22: this used to claim it was "longer than
+# AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s". That constant is 600
+# now, so the claim was not merely stale but backwards - 300 is SHORTER
+# than the fallback it was said to exceed. Value unchanged; 300s is
+# still right for this route, it just doesn't need to justify itself by
+# comparison to a number that moved.
 VIDEO_TO_AUDIO_TIMEOUT_SECONDS = int(os.environ.get("VIDEO_TO_AUDIO_TIMEOUT_SECONDS", "300"))  # 5 min
 
 # Stricter than /convert's 5-per-60s despite similar CPU cost - the
@@ -813,10 +1024,16 @@ JOIN_MAX_TOTAL_DURATION_SECONDS = int(os.environ.get("JOIN_MAX_TOTAL_DURATION_SE
 # instead of playing at the wrong speed.
 JOIN_OUTPUT_SAMPLE_RATE = int(os.environ.get("JOIN_OUTPUT_SAMPLE_RATE", "44100"))
 
-# Longer than AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s, which was
-# scaled for a single short clip - this re-encodes up to 30 minutes of
-# audio through a multi-input filter graph.
-JOIN_TIMEOUT_SECONDS = int(os.environ.get("JOIN_TIMEOUT_SECONDS", "900"))  # 5 min
+# Longer than any per-tool entry in AUDIO_TOOL_TIMEOUT_SECONDS, all of
+# which are scaled for a single clip - this re-encodes up to 30 minutes
+# of audio through a multi-input filter graph.
+#
+# COMMENT CORRECTED 2026-08-22, twice over. It used to read "longer than
+# AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS' 120s" - true when written, but
+# that constant is 600 now, so the comparison had quietly inverted. And
+# the inline unit was wrong from the start: 900 seconds is 15 minutes,
+# not 5. The VALUE is unchanged; only the two claims about it are.
+JOIN_TIMEOUT_SECONDS = int(os.environ.get("JOIN_TIMEOUT_SECONDS", "900"))  # 15 min
 
 JOIN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("JOIN_RATE_LIMIT_MAX_REQUESTS", "5"))
 JOIN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("JOIN_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
