@@ -669,6 +669,20 @@ AUDIO_TOOL_JOB_TYPES = (
 # to exceed. Both comments corrected in place at their own definitions.
 AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS", "600"))
 
+# ----- ffprobe timeout, deliberately NOT the ffmpeg one -----
+# probe_duration_seconds() in audio_common.py used to share the ffmpeg
+# ceiling above. That is the wrong order of magnitude by a factor of
+# twenty: ffprobe reads a container header, it does not decode audio, so
+# it returns in milliseconds on any normal file.
+#
+# A probe still running after 30 seconds is stuck on something
+# pathological, not working hard - and under the shared 600s ceiling
+# such a file could hold a thread-pool worker (THREAD_POOL_WORKERS is 8)
+# for ten full minutes before anything noticed. Every audio tool probes
+# before it processes, so that is a cheap way to lose a meaningful slice
+# of the pool to one bad upload.
+FFPROBE_TIMEOUT_SECONDS = int(os.environ.get("FFPROBE_TIMEOUT_SECONDS", "30"))
+
 # ----- Per-tool subprocess timeouts -----
 # Keyed by job_type (the same string passed to create_job / used by
 # _tool_status), falling back to AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS

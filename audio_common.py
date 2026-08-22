@@ -22,6 +22,7 @@ from config import (
     ALLOWED_AUDIO_INPUT_FORMATS,
     MAX_AUDIO_TOOL_DURATION_SECONDS,
     AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS,
+    FFPROBE_TIMEOUT_SECONDS,
 )
 from utils import safe_extension
 
@@ -77,6 +78,13 @@ def validate_input_format(filename: str) -> str:
     ffprobe) is what actually confirms the file is valid, playable audio
     - a malicious/corrupt file with a spoofed extension will fail there,
     not here.
+
+    Worth being clear about what this does NOT check, because it has been
+    misread as a completeness guarantee: it says nothing about what is
+    INSIDE the container. An .m4a carrying an embedded cover image is a
+    perfectly valid audio file and passes here correctly - handling that
+    is _as_audio_only_ffmpeg()'s job further down, not this function's.
+    Tightening validation would have rejected a file that works.
     """
     ext = get_extension(filename)
     if ext not in ALLOWED_AUDIO_INPUT_FORMATS:
@@ -109,6 +117,12 @@ def probe_duration_seconds(file_path: str) -> float:
     Runs ffprobe to get the audio duration in seconds. Also serves as a
     cheap validity check - a corrupt/non-audio file will fail here with
     a clean AudioToolError rather than wasting a full ffmpeg pass first.
+
+    Uses FFPROBE_TIMEOUT_SECONDS rather than the ffmpeg-sized one this
+    previously shared. ffprobe reads a header; it does not decode. A
+    probe still running after 30 seconds is stuck on a pathological file,
+    not working hard - and the old 600s ceiling meant such a file could
+    hold a thread-pool worker for ten minutes before anyone found out.
     """
     cmd = [
         FFPROBE_PATH,
@@ -122,7 +136,7 @@ def probe_duration_seconds(file_path: str) -> float:
             cmd,
             capture_output=True,
             text=True,
-            timeout=AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
         raise AudioToolError("Timed out while inspecting the audio file.")
@@ -239,6 +253,71 @@ def assert_distinct_paths(input_path: str, output_path: str) -> None:
 
 # ========== SUBPROCESS EXECUTION ==========
 
+# ffmpeg's "-vn" - discard any video stream. Injected into every ffmpeg
+# command this module runs; see _as_audio_only_ffmpeg() below.
+_FFMPEG_NO_VIDEO_FLAG = "-vn"
+
+
+def _as_audio_only_ffmpeg(cmd: list) -> list:
+    """
+    Adds -vn to an ffmpeg command so embedded artwork can't break the mux.
+
+    THE BUG THIS FIXES (production, 2026-08-22). A user submitted an m4a
+    pulled from an Instagram reel to /echo-remove. The file is perfectly
+    valid audio - and it carries its cover image as a SECOND stream:
+
+        Stream #0:0: Audio: aac (HE-AAC), 44100 Hz, stereo
+        Stream #0:1: Video: mjpeg (Progressive), 640x1136 (attached pic)
+
+    ffmpeg maps every stream it finds unless told otherwise, so it tried
+    to transcode that JPEG to H.264 and write it into the .m4a output:
+
+        [ipod] Could not find tag for codec h264 in stream #0, codec not
+        currently supported in container
+        [out#0/ipod] Could not write header (incorrect codec parameters ?)
+        Nothing was written into output file
+
+    The audio side was fine and never got written, because the video
+    stream killed the muxer first. The user was told "the file may be
+    corrupt or in an unsupported format" about a file that is neither.
+
+    WHY THIS IS NOT A VALIDATION PROBLEM, which is the tempting reading:
+    rejecting the upload would be the WRONG fix. Embedded artwork is
+    normal and extremely common - anything saved from Instagram or
+    TikTok, anything tagged in iTunes, most purchased music. Those files
+    should work, and they do. ffmpeg just needed telling that this is an
+    audio job.
+
+    WHY -vn RATHER THAN PRESERVING THE ARTWORK: "-map 0:a -c:v copy"
+    would keep the cover image, at the cost of reopening
+    container-compatibility questions for every format pair this app
+    supports (mp3 art into flac, m4a art into ogg, and so on). Dropping
+    it is the honest, predictable behaviour for a processed audio file,
+    and it cannot fail.
+
+    SAFE FOR EVERY CALLER: every ffmpeg command in this codebase produces
+    AUDIO. Nothing here outputs video - /video-to-audio least of all,
+    since it exists to extract an audio track. There is no invocation for
+    which -vn is wrong.
+
+    NOT APPLIED TO NON-FFMPEG COMMANDS. rubberband (pitch, tempo) takes
+    no such flag and would reject it as an unknown argument, so the guard
+    on cmd[0] below is load-bearing, not defensive decoration.
+
+    POSITION: -vn is an OUTPUT option, so it must sit before the output
+    file - which is the last element of every command this app builds.
+    Inserting at index -1 is therefore correct for all of them.
+    Idempotent as well: a command that already carries -vn is returned
+    untouched, so a tool module adding its own later can never produce a
+    duplicate.
+    """
+    if not cmd or cmd[0] != FFMPEG_PATH:
+        return cmd
+    if _FFMPEG_NO_VIDEO_FLAG in cmd:
+        return cmd
+    return cmd[:-1] + [_FFMPEG_NO_VIDEO_FLAG, cmd[-1]]
+
+
 def run_subprocess(cmd: list, timeout: int = AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS) -> None:
     """
     Runs a subprocess command (ffmpeg, rubberband, etc.), raising a clean
@@ -250,7 +329,15 @@ def run_subprocess(cmd: list, timeout: int = AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECON
     cmd must be a list (never a shell string) - this is a deliberate
     security boundary against shell injection, same principle as the
     conversion-matrix whitelist above.
+
+    ffmpeg commands get -vn added here rather than in each of the sixteen
+    tool modules - see _as_audio_only_ffmpeg() for the incident that
+    motivated it. Doing it at the single choke point is the entire reason
+    this function exists: one edit covers every tool, including any added
+    later by someone who has never heard of the bug.
     """
+    cmd = _as_audio_only_ffmpeg(cmd)
+
     logger.info(f"[AUDIO_TOOLS] Running: {' '.join(cmd)}")
     try:
         result = subprocess.run(
