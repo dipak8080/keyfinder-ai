@@ -33,6 +33,31 @@ this caught in practice:
 Same subprocess-per-call, blocking pattern as the rest of this codebase -
 every public function here MUST be dispatched via utils.run_blocking()
 from the async route.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): EMBEDDED ARTWORK BROKE ALL FOUR TOOLS
+
+_run_ffmpeg() builds and runs its own subprocess rather than going
+through audio_common.run_subprocess(), so when -vn was added there the
+same day, all four tools in this file silently missed the fix.
+
+The failure, first seen on /echo-remove: an audio file carrying its
+cover image as a second stream (normal for anything saved from
+Instagram or TikTok, anything tagged in iTunes, most purchased music)
+makes ffmpeg try to transcode that JPEG to H.264 and mux it into the
+audio output. The strict muxers refuse:
+
+    [ipod] Could not find tag for codec h264 in stream #0, codec not
+    currently supported in container
+
+/ringtone is the worst hit, because it ALWAYS writes m4a - so every
+ringtone made from an artwork-bearing track failed outright, which is
+most tracks anyone would want as a ringtone. fade/channels/resample
+fail the same way whenever the source format is m4a or aac.
+
+Every command here now goes through as_audio_only_ffmpeg(). Nothing else
+changed.
+--------------------------------------------------------------------------
 """
 import math
 import os
@@ -47,7 +72,7 @@ from config import (
     RINGTONE_MAX_DURATION_SECONDS,
     AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS,
 )
-from audio_common import AudioToolError, validate_duration
+from audio_common import AudioToolError, validate_duration, as_audio_only_ffmpeg
 
 _ENCODE_ARGS = {
     "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
@@ -112,7 +137,15 @@ def _require_finite(value: float, field_name: str) -> float:
 def _run_ffmpeg(cmd: list, error_message: str, output_path: str):
     """Shared subprocess-run-and-verify tail end for all four effects
     below - same timeout, same failure/empty-output handling, avoids
-    repeating this six times for what is otherwise a one-line filter."""
+    repeating this six times for what is otherwise a one-line filter.
+
+    as_audio_only_ffmpeg() is applied HERE rather than at each of the
+    four call sites, for exactly the reason this function exists at all:
+    one place to change, and a fifth effect added later inherits it
+    without anyone having to remember. See its docstring in
+    audio_common.py for the artwork bug that made it necessary."""
+    cmd = as_audio_only_ffmpeg(cmd)
+
     try:
         result = subprocess.run(
             cmd,
@@ -280,6 +313,18 @@ def make_ringtone(input_path: str, output_path: str, start_seconds: float, durat
     MAX_AUDIO_TOOL_DURATION_SECONDS - a "ringtone" longer than that
     isn't a ringtone, so the cap is a real constraint of the format,
     not just a server-load guard.
+
+    THE ARTWORK BUG HIT THIS TOOL HARDEST. It always writes m4a, whose
+    muxer is the strictest of the lot, so before _run_ffmpeg() started
+    applying -vn every ringtone made from a track with cover art failed -
+    and a track someone wants as a ringtone is overwhelmingly likely to
+    have cover art. See this module's WHAT CHANGED note.
+
+    Note both -ss and -to sit BEFORE -i, making them INPUT options, so
+    -to is on the source file's own timeline. If either were moved after
+    -i they would become output options, the timestamps would restart at
+    zero after the seek, and -to would cut a clip of length `end` rather
+    than `end - start`. Worth knowing before rearranging this list.
     """
     start_seconds = _require_finite(start_seconds, "start_seconds")
     duration_seconds = _require_finite(duration_seconds, "duration_seconds")

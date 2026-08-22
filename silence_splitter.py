@@ -26,6 +26,36 @@ to a real re-encode only when the output format differs from the input
 Same subprocess-per-call, blocking pattern as the rest of this codebase -
 every public function here MUST be dispatched via utils.run_blocking()
 from the async route.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): TWO FIXES
+
+1. EMBEDDED ARTWORK. Both ffmpeg calls here build their own subprocess
+   rather than going through audio_common.run_subprocess(), so they
+   missed the -vn fix added there the same day. A file carrying its
+   cover image as a second stream (normal for anything saved from
+   Instagram or TikTok, anything tagged in iTunes) made every cut pass
+   try to mux a transcoded JPEG into the audio output, which the m4a and
+   aac muxers refuse outright. Both commands now go through
+   as_audio_only_ffmpeg().
+
+2. THE DETECT PASS NEVER CHECKED ITS EXIT CODE, and the way that failed
+   was genuinely misleading. If pass 1 failed for ANY reason - a corrupt
+   file, the artwork problem above, a decode error - _detect_silences()
+   returned an empty list rather than raising. An empty silence list then
+   flows into _segments_from_silences(), which correctly reports one
+   segment spanning the whole file, which split_on_silence() then reports
+   to the user as:
+
+       "No silence was detected in this file, so there's nothing to
+        split. Try lowering the threshold if you expected a split here."
+
+   So a decode failure was reported as a successful scan that happened to
+   find nothing, complete with advice to adjust a threshold that was
+   never the problem. Someone could tune settings all afternoon against a
+   file ffmpeg couldn't read. The exit code is checked now, and a real
+   failure says so.
+--------------------------------------------------------------------------
 """
 import os
 import re
@@ -41,7 +71,7 @@ from config import (
     SILENCE_SPLIT_DETECT_TIMEOUT_SECONDS,
     SILENCE_SPLIT_CUT_TIMEOUT_SECONDS,
 )
-from audio_common import AudioToolError, validate_duration
+from audio_common import AudioToolError, validate_duration, as_audio_only_ffmpeg
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")
 _SILENCE_END_RE = re.compile(r"silence_end:\s*([\d.]+)")
@@ -69,12 +99,16 @@ def _detect_silences(input_path: str, threshold_db: float, min_duration_seconds:
     segment-boundary logic below only needs to know where NON-silent
     audio is, and an unterminated trailing silence doesn't create a new
     segment boundary either way.
+
+    An EMPTY return means "scanned successfully, found no silence" and
+    nothing else. A failed scan raises. Those two were indistinguishable
+    before - see this module's WHAT CHANGED note for why that mattered.
     """
-    cmd = [
+    cmd = as_audio_only_ffmpeg([
         FFMPEG_PATH, "-i", input_path,
         "-af", f"silencedetect=noise={threshold_db}dB:d={min_duration_seconds}",
         "-f", "null", "-",
-    ]
+    ])
 
     try:
         result = subprocess.run(
@@ -85,6 +119,16 @@ def _detect_silences(input_path: str, threshold_db: float, min_duration_seconds:
         )
     except subprocess.TimeoutExpired:
         raise AudioToolError("Timed out while scanning for silence.")
+
+    if result.returncode != 0:
+        logger.error(
+            f"[SILENCE_SPLIT] Detect pass failed (exit {result.returncode}) on "
+            f"{input_path}: {result.stderr[-1500:]}"
+        )
+        raise AudioToolError(
+            "Could not scan this file for silence. It may be corrupt or in an "
+            "unsupported format."
+        )
 
     silences = []
     pending_start = None
@@ -170,6 +214,10 @@ def split_on_silence(
         )
 
     if len(segments) == 1:
+        # Reachable ONLY on a successful scan now that _detect_silences()
+        # raises on failure, so this advice is finally always the right
+        # advice. Previously a corrupt file landed here too and was told
+        # to adjust a threshold that had nothing to do with it.
         raise AudioToolError(
             "No silence was detected in this file, so there's nothing to split. "
             "Try lowering the threshold if you expected a split here."
@@ -196,13 +244,22 @@ def split_on_silence(
         # rather than decoding from the start of the file - meaningful on
         # a track with many segments, since the Nth cut otherwise re-reads
         # everything before it.
-        cmd = [
-            FFMPEG_PATH, "-y",
-            "-ss", str(start), "-to", str(end),
-            "-i", input_path,
-        ]
-        cmd += _ENCODE_ARGS[target_format]
-        cmd += [output_path]
+        #
+        # -to sits before -i as well, making it an INPUT option on the
+        # source file's own timeline. Moving it after -i would turn it
+        # into an output option, where timestamps restart at zero after
+        # the seek and -to would cut a clip of length `end` instead of
+        # `end - start`. The current order is correct; don't rearrange it
+        # without re-reading this.
+        cmd = as_audio_only_ffmpeg(
+            [
+                FFMPEG_PATH, "-y",
+                "-ss", str(start), "-to", str(end),
+                "-i", input_path,
+            ]
+            + _ENCODE_ARGS[target_format]
+            + [output_path]
+        )
 
         try:
             result = subprocess.run(

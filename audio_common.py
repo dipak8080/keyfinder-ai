@@ -83,7 +83,7 @@ def validate_input_format(filename: str) -> str:
     misread as a completeness guarantee: it says nothing about what is
     INSIDE the container. An .m4a carrying an embedded cover image is a
     perfectly valid audio file and passes here correctly - handling that
-    is _as_audio_only_ffmpeg()'s job further down, not this function's.
+    is as_audio_only_ffmpeg()'s job further down, not this function's.
     Tightening validation would have rejected a file that works.
     """
     ext = get_extension(filename)
@@ -254,13 +254,21 @@ def assert_distinct_paths(input_path: str, output_path: str) -> None:
 # ========== SUBPROCESS EXECUTION ==========
 
 # ffmpeg's "-vn" - discard any video stream. Injected into every ffmpeg
-# command this module runs; see _as_audio_only_ffmpeg() below.
+# command this module runs; see as_audio_only_ffmpeg() below.
 _FFMPEG_NO_VIDEO_FLAG = "-vn"
 
 
-def _as_audio_only_ffmpeg(cmd: list) -> list:
+def as_audio_only_ffmpeg(cmd: list) -> list:
     """
     Adds -vn to an ffmpeg command so embedded artwork can't break the mux.
+
+    PUBLIC, not private, because run_subprocess() below is NOT the only
+    place ffmpeg gets invoked. audio_loudnorm.py builds and runs its own
+    two subprocess calls directly - it needs pass 1's stderr to parse the
+    measurement JSON, which run_subprocess() discards - so it would have
+    silently missed this fix entirely. Any module that calls
+    subprocess.run() on an ffmpeg command itself must pass the command
+    through here first.
 
     THE BUG THIS FIXES (production, 2026-08-22). A user submitted an m4a
     pulled from an Instagram reel to /echo-remove. The file is perfectly
@@ -331,12 +339,12 @@ def run_subprocess(cmd: list, timeout: int = AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECON
     conversion-matrix whitelist above.
 
     ffmpeg commands get -vn added here rather than in each of the sixteen
-    tool modules - see _as_audio_only_ffmpeg() for the incident that
+    tool modules - see as_audio_only_ffmpeg() for the incident that
     motivated it. Doing it at the single choke point is the entire reason
     this function exists: one edit covers every tool, including any added
     later by someone who has never heard of the bug.
     """
-    cmd = _as_audio_only_ffmpeg(cmd)
+    cmd = as_audio_only_ffmpeg(cmd)
 
     logger.info(f"[AUDIO_TOOLS] Running: {' '.join(cmd)}")
     try:

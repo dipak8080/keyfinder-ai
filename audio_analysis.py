@@ -5,6 +5,19 @@ audio_analysis.py - The whole key/BPM detection engine:
 - Relative major/minor correction (bass-register chroma energy)
 - BPM octave (half/double) correction
 - Audio trimming to cap peak memory during analysis
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-22): ONE LINE IN trim_audio_for_analysis()
+
+The trim command carried no -vn, so a file with embedded cover art
+failed to trim and the function fell back to analysing the FULL file.
+See that function's own docstring for why this was the most invisible
+of the artwork bugs found that day - nothing errored, nothing was
+wrong in the result, and the only symptom was memory pressure on a box
+that has none to spare.
+
+The detection engine below is untouched.
+--------------------------------------------------------------------------
 """
 import subprocess
 from typing import Tuple
@@ -33,6 +46,7 @@ from config import (
 # leverage lever to try first; if accuracy doesn't improve on your own
 # test tracks, 'edmm' (a close variant) is worth trying next.
 KEY_PROFILE_TYPE = "bgate"
+from audio_common import as_audio_only_ffmpeg
 from utils import (
     release_memory_to_os,
     cleanup_file,
@@ -304,15 +318,47 @@ def cross_check_with_librosa(audio: np.ndarray, sr: int, key: str, scale: str, k
 # ========== TRIMMING ==========
 
 def trim_audio_for_analysis(src_path: str, max_seconds: int) -> str:
+    """
+    Cuts the first max_seconds of the file to a mono 44.1kHz WAV and
+    returns that path, falling back to the ORIGINAL path if the trim
+    fails for any reason.
+
+    THAT FALLBACK IS WHY THIS NEEDED FIXING (2026-08-22), and why the bug
+    went unnoticed. The command carried no -vn, so a file with embedded
+    cover art - normal for anything saved from Instagram or TikTok,
+    anything tagged in iTunes, most purchased music - made ffmpeg try to
+    mux a transcoded JPEG into a WAV. WAV holds one stream; it refuses.
+    subprocess raised, the except branch caught it, logged at WARNING,
+    and returned src_path.
+
+    Nothing failed. The request succeeded, the key and BPM came back
+    correct, and the ONLY consequence was that analysis then ran on the
+    whole file instead of the first three minutes. On a 6GB box with no
+    swap - where this function exists SPECIFICALLY to cap peak memory -
+    a 40-minute YouTube download was silently loaded end to end into a
+    numpy array, and the sole trace was one WARNING line that reads like
+    a corrupt upload.
+
+    A silent fallback that degrades RESOURCE USE rather than correctness
+    is the hardest kind of bug to catch, because every symptom points
+    somewhere else: memory pressure with no failing request to blame it
+    on.
+
+    The fallback itself is kept, and is still right - analysing the full
+    file is slower and heavier but CORRECT, and refusing a request
+    outright because a trim failed would be a worse trade. What changed
+    is that it should now be rare enough that a run of these WARNING
+    lines means something real.
+    """
     trimmed_path = f"{src_path}.trimmed.wav"
-    cmd = [
+    cmd = as_audio_only_ffmpeg([
         FFMPEG_PATH, "-y",
         "-i", src_path,
         "-t", str(max_seconds),
         "-ac", "1",
         "-ar", "44100",
         trimmed_path,
-    ]
+    ])
     try:
         subprocess.run(
             cmd,
