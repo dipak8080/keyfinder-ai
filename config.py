@@ -795,6 +795,47 @@ TEMPO_MAX_FACTOR = float(os.environ.get("TEMPO_MAX_FACTOR", "2.0"))
 VOLUME_GAIN_MIN_DB = float(os.environ.get("VOLUME_GAIN_MIN_DB", "-30"))
 VOLUME_GAIN_MAX_DB = float(os.environ.get("VOLUME_GAIN_MAX_DB", "30"))
 
+# ---------- TRIM: END-BOUNDARY TOLERANCE ----------
+# How far past the file's reported duration an end_seconds value may sit
+# before /trim rejects it outright. Within this window the value is
+# CLAMPED to the real duration instead.
+#
+# WHY THIS IS NEEDED, and why it is not a frontend bug. Observed in
+# production 2026-08-22, a real user on a 43-second MP3:
+#
+#   POST /trim rejected (400) - end_seconds (43.049795918367344s)
+#   exceeds the audio's actual duration (43.0s).
+#
+# Fifty milliseconds. About two MP3 frames. The two numbers come from
+# genuinely different measurements of the same file:
+#
+#   - The BROWSER reports HTMLAudioElement.duration, derived from the
+#     DECODED sample count. (43.049795918367344 x 44100 = exactly 2196
+#     samples past 43.0 - a sample-count division, not anything a person
+#     typed.) That figure includes the encoder delay and padding every
+#     MP3 carries.
+#   - FFPROBE reports the duration in the CONTAINER header, which does
+#     not.
+#
+# For MP3 these two ALWAYS disagree slightly. It is a property of the
+# format, not a defect in either tool, and no amount of care on the
+# frontend can fix it: the browser cannot know what ffprobe will say.
+# TrimForm hands the full track to the form as its default selection
+# (see its `onChangeRef.current(0, duration)`), so ANY user who trims
+# only the start off a track - an extremely ordinary thing to do - sends
+# an end_seconds a few milliseconds past what ffprobe will report, and
+# gets a 400 for it.
+#
+# Clamping is safe rather than merely lenient: ffmpeg stops at EOF
+# regardless, so asking for 43.05s of a 43.0s file yields exactly the
+# same bytes as asking for 43.0s. Nothing is fabricated.
+#
+# 1 second is far more than MP3 padding needs (~25ms at 44.1kHz) and
+# still small enough that a genuinely wrong request - someone asking for
+# 2:00 of a 43-second file - is rejected with the clear message it
+# deserves. The tolerance absorbs measurement noise, not user error.
+TRIM_END_TOLERANCE_SECONDS = float(os.environ.get("TRIM_END_TOLERANCE_SECONDS", "1.0"))
+
 # ---------- AUDIO TOOLS: RATE LIMITS ----------
 # Each tool gets its own limit, scaled to CPU cost - cheap tools
 # (convert/trim/volume/reverse: mostly stream-copy or a single fast

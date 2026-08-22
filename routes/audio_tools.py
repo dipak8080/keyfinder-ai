@@ -58,11 +58,16 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
+    # audio_tools.py never needed `logger` until /trim's end-boundary
+    # clamp started reporting when it fires - every other route here
+    # delegates its logging to _shared.py's helpers.
+    logger,
     AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_CONVERT_RATE_LIMIT_WINDOW_SECONDS,
     AUDIO_CONVERSION_MATRIX,
     AUDIO_TRIM_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_TRIM_RATE_LIMIT_WINDOW_SECONDS,
+    TRIM_END_TOLERANCE_SECONDS,
     AUDIO_VOLUME_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_VOLUME_RATE_LIMIT_WINDOW_SECONDS,
     VOLUME_GAIN_MIN_DB,
@@ -252,11 +257,50 @@ async def trim_audio_route(
     duration = await _validate_duration_or_reject(job_id, input_path)
 
     if end_seconds > duration:
+        # Small overshoot: the caller measured the same file a different
+        # way, not asked for something impossible. Clamp and carry on.
+        #
+        # This is the common case, not the edge case - see
+        # TRIM_END_TOLERANCE_SECONDS in config.py for the full writeup.
+        # Short version: a browser reports duration from the DECODED
+        # sample count, ffprobe reads it from the CONTAINER header, and
+        # for MP3 those two always differ by the encoder padding. Anyone
+        # trimming only the start off a track sends an end_seconds a few
+        # milliseconds past what ffprobe reports here, and used to eat a
+        # 400 for it.
+        #
+        # Clamping is safe, not just lenient: ffmpeg stops at EOF either
+        # way, so the output bytes are identical to what an exactly
+        # correct request would have produced.
+        overshoot = end_seconds - duration
+        if overshoot <= TRIM_END_TOLERANCE_SECONDS:
+            logger.info(
+                f"[TRIM] job={job_id} end_seconds ({end_seconds}s) is {overshoot * 1000:.0f}ms "
+                f"past the probed duration ({duration:.3f}s) - clamping to the end of the file. "
+                f"Normal for MP3: decoded length vs container header."
+            )
+            end_seconds = duration
+        else:
+            cleanup_file(input_path)
+            mark_failed(job_id, "Requested range is past the end of the audio.")
+            raise HTTPException(
+                400,
+                f"end_seconds ({end_seconds}s) exceeds the audio's actual duration ({duration:.1f}s)."
+            )
+
+    # Re-checked AFTER the clamp above, not before. A file shorter than
+    # MIN would otherwise slip through: clamping end_seconds down to
+    # duration can shrink a selection that was valid as submitted into
+    # one that is too short to cut, and handing ffmpeg a zero- or
+    # negative-length range produces an empty output file rather than an
+    # error anyone can read.
+    if end_seconds <= start_seconds:
         cleanup_file(input_path)
-        mark_failed(job_id, "Requested range is past the end of the audio.")
+        mark_failed(job_id, "The selected range is empty.")
         raise HTTPException(
             400,
-            f"end_seconds ({end_seconds}s) exceeds the audio's actual duration ({duration:.1f}s)."
+            f"The selected range is empty - start_seconds ({start_seconds}s) is at or past "
+            f"the end of the audio ({duration:.1f}s)."
         )
 
     spawn_background_task(_run_tool_job(
