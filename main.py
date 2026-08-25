@@ -75,6 +75,17 @@ from log_stream import RequestLoggerMiddleware, router as logs_router, attach_sy
 from cookie_upload import router as cookie_upload_router
 from gpu_internal_routes import router as gpu_internal_router
 
+# ---------- CREDITS / PAYWALL ----------
+# Self-contained package, inert while PAYWALL_ENABLED is unset: importing
+# it mounts routes that report "paywall off" and never charge anything.
+# See credits/config.py for the full env var list.
+from credits.db import run_migrations as run_credits_migrations
+from credits.ledger import sweep_stale_holds
+from credits.routes import router as credits_router
+from credits.auth import router as credits_auth_router
+from credits.webhook import router as credits_webhook_router
+from credits.admin import router as credits_admin_router
+
 
 # How often the background sweep runs. Jobs are removed based on their
 # own ttl_seconds, so this only controls how promptly an already-expired
@@ -83,6 +94,15 @@ from gpu_internal_routes import router as gpu_internal_router
 # invisible: the sweep is a dict scan plus however many os.remove() calls
 # the expired jobs earned.
 JOB_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("JOB_CLEANUP_INTERVAL_SECONDS", "60"))
+
+# How often orphaned credit holds are swept. Much less frequent than the
+# job sweep because it is a rescue path, not a routine one: every normal
+# outcome (success, failure, cancellation) settles or refunds its own
+# hold immediately. This only catches holds whose job never reached ANY
+# terminal state - a container killed mid-job, or a task garbage-
+# collected before its `finally` could run. See credits/ledger.py's
+# sweep_stale_holds() and CREDIT_HOLD_TIMEOUT_MINUTES.
+CREDIT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("CREDIT_SWEEP_INTERVAL_SECONDS", "900"))
 
 
 async def _job_cleanup_loop():
@@ -127,12 +147,79 @@ async def _job_cleanup_loop():
             logger.error(f"[JOBS] Cleanup sweep failed: {e}", exc_info=True)
 
 
+async def _credit_hold_sweep_loop():
+    """
+    Periodic rescue for credit holds whose job never finished.
+
+    Same structure and the same three reasons as _job_cleanup_loop()
+    above: off the request path, on a schedule, and dispatched to a
+    worker thread because it does blocking SQLite writes.
+
+    WHAT IT ACTUALLY CATCHES, which is narrower than it sounds. A credit
+    is held at submit and released at the job's terminal state - and
+    _run_tool_job's `finally` plus fail_if_unfinished() together make
+    that terminal state near-certain. What neither can cover is the case
+    jobs.py's own docstring names: a task garbage-collected mid-run, or
+    the container being killed outright. Then no `finally` ever runs, the
+    job dies with the process, and a paying user is simply down one
+    credit with nothing to show for it.
+
+    That is a small number of jobs and a real amount of money to someone
+    who bought thirty credits for eight dollars. This loop is what makes
+    "a failed job is refunded automatically" true without an asterisk.
+
+    A failed sweep must never kill the loop, for the same reason as
+    above - the next tick retries, and a persistent failure stays visible
+    in the log rather than silently stranding credits.
+    """
+    while True:
+        try:
+            await asyncio.sleep(CREDIT_SWEEP_INTERVAL_SECONDS)
+            refunded = await asyncio.get_running_loop().run_in_executor(None, sweep_stale_holds)
+            if refunded:
+                logger.warning(f"[CREDITS] Swept {refunded} orphaned credit hold(s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[CREDITS] Hold sweep failed: {e}", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     attach_system_log_capture()  # starts capturing all logger.info()/error() calls app-wide
     ensure_cookies_file()
     logger.info(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
+
+    # Credits schema. Idempotent - every migration in credits/migrations/
+    # is CREATE TABLE IF NOT EXISTS and tracked in schema_migrations, so
+    # this is a no-op on every boot after the first.
+    #
+    # Deliberately NOT wrapped in try/except. A missing or unwritable
+    # credits.db means paid jobs cannot be charged or refunded correctly,
+    # and starting anyway would take money for work the ledger has no
+    # record of. Failing the boot is the safe direction: the health check
+    # fails, the deploy rolls back, and the previous container - which
+    # was working - keeps serving.
+    run_credits_migrations()
+
+    try:
+        from credits.config import get_settings
+
+        _credits = get_settings()
+        logger.info(
+            f"[CREDITS] paywall={'ON' if _credits.paywall_enabled else 'OFF'} "
+            f"provider={_credits.payments_provider} "
+            f"metered={[r.tool for r in _credits.tool_rules.values() if r.enabled] or 'none'} "
+            f"free_ops/month={_credits.free_monthly_ops}"
+        )
+    except Exception as e:
+        # get_settings() raises on genuine misconfiguration (no secret
+        # key, paywall on with no webhook secret). run_credits_migrations()
+        # above already called it, so reaching here means something odd -
+        # log it rather than hiding it, but don't take the app down twice
+        # for the same cause.
+        logger.error(f"[CREDITS] Could not summarise config: {e}")
 
     # One sweep immediately at boot: a redeploy recreates the container
     # while output files persist on the mounted volume, so anything
@@ -143,20 +230,37 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[JOBS] Startup cleanup failed: {e}", exc_info=True)
 
+    # Same argument for credit holds, and stronger: a redeploy is the
+    # single most likely cause of an orphaned hold, since it kills every
+    # in-flight job mid-run. Sweeping at boot returns those credits in
+    # seconds instead of after the first 15-minute interval.
+    try:
+        recovered = sweep_stale_holds()
+        if recovered:
+            logger.warning(f"[CREDITS] Startup sweep refunded {recovered} orphaned hold(s)")
+    except Exception as e:
+        logger.error(f"[CREDITS] Startup hold sweep failed: {e}", exc_info=True)
+
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
+    credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
     logger.info(
         f"[JOBS] Background cleanup running every {JOB_CLEANUP_INTERVAL_SECONDS}s"
+    )
+    logger.info(
+        f"[CREDITS] Hold sweep running every {CREDIT_SWEEP_INTERVAL_SECONDS}s"
     )
 
     yield
 
-    # Shutdown - stop the sweep and wait for it to actually unwind, so a
-    # deletion in progress isn't torn down mid-write.
+    # Shutdown - stop the sweeps and wait for them to actually unwind, so
+    # a deletion in progress isn't torn down mid-write.
     cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
+    credit_sweep_task.cancel()
+    for task in (cleanup_task, credit_sweep_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     stats = get_job_stats()
     logger.info(f"[JOBS] Shutting down with jobs in table: {stats}")
@@ -316,6 +420,14 @@ async def log_validation_errors(request: Request, exc: RequestValidationError):
 # different cause - it's the rate limiter working exactly as designed,
 # not a signal of anything wrong.
 #
+# 402 IS DELIBERATELY NOT EXCLUDED (2026-08-25). "Out of credits" is the
+# single most important rejection this app can issue: it is the exact
+# moment someone is asked to pay, and a sudden run of them means either
+# the paywall is misconfigured or the checkout flow is broken. Both are
+# revenue-affecting and both are invisible without this line. It is also
+# genuinely low-volume by construction - a user sees it once, then
+# either buys or leaves - so it cannot flood the log the way 404s would.
+#
 # WHY < 500 ONLY: a 5xx raised as an HTTPException would mean something
 # on this server's own side broke, which is a different class of
 # problem than "this server correctly rejected bad input" - that
@@ -327,11 +439,18 @@ async def log_validation_errors(request: Request, exc: RequestValidationError):
 @app.exception_handler(StarletteHTTPException)
 async def log_http_exceptions(request: Request, exc: StarletteHTTPException):
     """
-    Logs manually-raised HTTPExceptions - 400/404/409/413/503 today,
+    Logs manually-raised HTTPExceptions - 400/402/404/409/413/503 today,
     whatever routes.py or midi.py raise next tomorrow - the same way
     log_validation_errors logs 422s. Rebuilds Starlette's own default
     response shape exactly, so this is purely additive observability
     with no change to what any caller receives.
+
+    NOTE the detail may be a dict rather than a string - the credits
+    package raises HTTPException(402, detail={...}) carrying the pack
+    list the frontend modal renders. JSONResponse serialises either
+    shape, and the f-string below stringifies a dict harmlessly, so no
+    special case is needed. Worth knowing before someone "fixes" the
+    log line by assuming detail is always text.
     """
     if exc.status_code < 500 and exc.status_code not in (404, 429):
         try:
@@ -356,3 +475,33 @@ app.include_router(router)
 app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)
 app.include_router(cookie_upload_router)  # /admin/upload-cookies - upload cookies.txt directly, no base64
 app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file transfer, shared-secret auth
+
+# ---------- CREDITS ----------
+# Three routers, mounted last so nothing above changes shape.
+#
+#   credits_router          /credits/me, /credits/preview, /credits/claim
+#   credits_auth_router     /auth/magic-link, /auth/verify, /auth/logout
+#   credits_webhook_router  /credits/webhook/{provider}
+#
+# All three are live regardless of PAYWALL_ENABLED, on purpose. With the
+# paywall off, /credits/me reports enabled=false and the frontend renders
+# nothing - but the WEBHOOK still works, so purchases can be accepted and
+# credits banked before enforcement is switched on. That ordering is what
+# makes a soft launch possible: sell first, meter second, and never
+# discover on flip day that the payment path was broken all along.
+#
+# CLOUDFLARE: /credits/webhook/kofi must be in the POST allowlist AND
+# have a bot-fight skip rule. Ko-fi posts server-to-server with no
+# browser, so a JS challenge eats it silently and the payment is simply
+# lost - the failure looks exactly like "the webhook never fired".
+app.include_router(credits_router)
+app.include_router(credits_auth_router)
+app.include_router(credits_webhook_router)
+
+# /admin/credits/* - operator surface: cost economics, user lookup,
+# webhook triage, manual adjust. Guarded by CREDITS_ADMIN_TOKEN, which is
+# deliberately NOT ADMIN_STATUS_KEY: money-touching surfaces get their
+# own credential so rotating one doesn't force rotating the other, and a
+# leaked cookie-upload key can't move credits. Unset => these routes 404
+# rather than 403, so an unconfigured admin surface stays invisible.
+app.include_router(credits_admin_router)

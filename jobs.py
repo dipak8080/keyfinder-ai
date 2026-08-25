@@ -80,6 +80,46 @@ previously see:
    The lock is now held only long enough to pop the expired entries and
    collect their paths; deletion happens after releasing it.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-25: SOURCE INPUT RETENTION (input_path + set_job_input)
+
+A fifth field, and the first one that changes what this table is FOR:
+input_path records the uploaded source file a job was created from,
+rather than only its outputs.
+
+WHY. The paid HQ tier needs an "upgrade this to HQ" button on a finished
+standard separation - re-running the same track through htdemucs_ft
+without asking for a second upload. That is only possible if the source
+file still exists, and until now it did not: _run_tool_job's
+cleanup_paths deleted every job's input in its `finally`, usually within
+seconds of the job finishing.
+
+The alternative was a free HQ preview on a 30-second excerpt, which was
+rejected on cost - see routes/separation_upgrade.py's docstring for that
+reasoning. Retention is the cheaper answer by a wide margin: the demo is
+the standard job that already ran.
+
+SCOPE, DELIBERATELY NARROW. Only the separation routes call
+set_job_input(). Every other tool still passes its input in
+cleanup_paths and still deletes it immediately, because a /convert input
+is worthless the moment its output exists and eighteen tools retaining
+inputs for an hour would be real disk for no reason at all.
+
+WHAT IT COSTS. A separation input now lives for the job's own TTL -
+SEPARATION_JOB_TTL_SECONDS, 2 hours, the same window its OUTPUTS already
+live for. An upgrade offer that outlived the file it needs would be
+worse than no offer. Worst case is "separations in 2 hours" x
+MAX_UPLOAD_BYTES; realistically far less, since most uploads are 5-10MB
+rather than the 80MB ceiling. SEPARATION_JOB_TTL_SECONDS is the knob if
+that ever gets uncomfortable, and shrinking it shortens the upgrade
+window in exactly the same proportion.
+
+THE PART THAT MATTERS MOST is in cleanup_expired_jobs() below:
+input_path is swept alongside the output paths. Without that line every
+separation input would stay on disk permanently - the same leak this
+file's own docstring warns about for the stems dict, in a new place.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -113,6 +153,8 @@ _lock = threading.Lock()
 #   output_format: Optional[str],
 #   # data jobs only (transcribe, youtube_analyze):
 #   result_data: Optional[dict],
+#   # separation-shaped jobs only, set via set_job_input():
+#   input_path: Optional[str],      # the SOURCE upload, retained for upgrades
 # }
 _jobs = {}
 
@@ -173,8 +215,41 @@ def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) 
             "output_path": None,
             "output_format": None,
             "result_data": None,
+            # The uploaded SOURCE file. Stays None for every job type
+            # except the separation routes, which call set_job_input()
+            # so a completed standard job can be re-run at HQ without a
+            # second upload. See this module's 2026-08-25 note.
+            "input_path": None,
         }
     return job_id
+
+
+def set_job_input(job_id: str, input_path: str):
+    """
+    Records the source file a job was created from.
+
+    Separate from create_job() rather than a parameter on it, because
+    the job id is needed to BUILD the input path in the first place
+    (build_temp_input_path(job_id, filename)) - the job must exist
+    before the path does. That is the same ordering _accept_upload()
+    already relies on.
+
+    RETENTION, NOT OWNERSHIP. Setting this does not make the caller
+    responsible for deleting the file - it makes cleanup_expired_jobs()
+    responsible, on the job's own TTL. A route that calls this must
+    therefore NOT also pass the same path in _run_tool_job's
+    cleanup_paths, or the file is deleted seconds after the job
+    finishes and the retention is silently undone.
+
+    Note that an upgrade job and its source job legitimately point at
+    the SAME input_path, so the sweep may try to delete it twice. That
+    is already safe: cleanup_expired_jobs() wraps each os.remove() in
+    try/except and logs a warning, so the second attempt is a harmless
+    no-op rather than an error worth chasing.
+    """
+    with _lock:
+        if job_id in _jobs:
+            _jobs[job_id]["input_path"] = input_path
 
 
 def mark_complete(job_id: str, title: str, vocals_path: str, instrumental_path: str):
@@ -417,6 +492,19 @@ def cleanup_expired_jobs() -> int:
     job with a None path (never got that far, already cleaned up, or a
     data job) is skipped safely.
 
+    ALSO SWEEPS input_path (added 2026-08-25). This is the line that
+    keeps source-input retention bounded rather than permanent. The
+    separation routes deliberately stopped passing their input in
+    _run_tool_job's cleanup_paths so it survives for the upgrade-to-HQ
+    path; if it were not collected HERE instead, every separation input
+    would stay on disk forever - the same leak this docstring already
+    warns about for the stems dict, just in a newer place.
+
+    An upgrade job and its source job share one input_path, so a sweep
+    that expires both will attempt the same delete twice. The per-path
+    try/except below already makes that a no-op with a warning line, not
+    an error.
+
     The stems dict MUST be walked separately from the named path fields -
     a stems job holds 4+ full-length WAVs, so missing them here would
     leak roughly double (or more) a separation job's disk per expired
@@ -445,7 +533,7 @@ def cleanup_expired_jobs() -> int:
                 continue
             expired_count += 1
 
-            for key in ("vocals_path", "instrumental_path", "output_path"):
+            for key in ("vocals_path", "instrumental_path", "output_path", "input_path"):
                 path = job.get(key)
                 if path:
                     paths_to_delete.append(path)

@@ -64,6 +64,42 @@ SEPARATION_HQ_ENABLED kill switch in config.py is the control - a manual
 lever, doing one obvious thing, rather than an estimate pretending to be
 a ledger.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-25: METERING (recorded, never enforced)
+
+credits/metering.py now receives three facts from this file: the input
+duration, the worker's reported gpu_seconds, and the terminal status.
+
+READ THE REMOVED SECTION ABOVE BEFORE ASSUMING THIS IS THE OLD BUDGET
+BREAKER COMING BACK. It is not, and the difference is the entire point:
+
+  - Nothing in this file reads a metering value back. There is no
+    threshold, no cutoff, no branch anywhere that behaves differently
+    because of a recorded number. It is a meter, not a valve.
+  - Every objection in the REMOVED section still stands and is
+    documented in metering.py's own docstring - including that
+    gpu_seconds UNDERCOUNTS the real bill, since RunPod also charges for
+    cold start and both transfers. est_cost_usd is therefore a FLOOR,
+    and metering.py says so.
+  - It survives restarts, because it is rows in SQLite on the mounted
+    volume rather than a counter in process memory. That was the second
+    reason the old breaker was useless.
+
+What it is FOR: setting the credit price from evidence. Shipping with
+PAYWALL_ENABLED=false and no metering would mean collecting nothing
+during the exact window that was supposed to answer "does $0.20 a credit
+cover a job?".
+
+FAILURES ARE METERED TOO. A failed job still burned GPU seconds - often
+MORE than a successful one, since a timeout runs to the wall before
+being killed. Recording only successes would make cost-per-job look
+better than it is, in the same optimistic direction the old counter
+was wrong in.
+
+Every metering call swallows its own exceptions (see metering.py). A
+metering failure must never turn a working separation into a failed one.
+--------------------------------------------------------------------------
 """
 import os
 from typing import Dict, Tuple
@@ -84,6 +120,9 @@ from config import (
 from utils import run_blocking
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
+
+# Recorded, never enforced - see this module's 2026-08-25 note.
+from credits import metering
 
 
 # Wording RunPod and payment providers actually use for "this account is
@@ -166,17 +205,29 @@ async def _run_demucs_on_gpu(
         raise SeparationError("Separation failed: unsupported model requested.")
 
     duration = await run_blocking(get_audio_duration_seconds, input_path)
+
+    # Recorded here rather than at submit because THIS probe runs for
+    # every job, standard included - the submit path only probes on the
+    # billable routes. Without this line input_minutes in the cost report
+    # would describe paid jobs only, which is the subset most likely to
+    # mislead when setting a price. See metering.record_input_duration().
+    metering.record_input_duration(job_id, duration)
+
     if duration > max_duration_seconds:
-        raise SeparationError(
+        message = (
             f"Track is {int(duration // 60)} min long, which exceeds the "
             f"{max_duration_seconds // 60} min limit for separation."
         )
+        metering.record_job_finished(job_id, status="failed", error=message)
+        raise SeparationError(message)
 
     if not RUNPOD_API_KEY or not RUNPOD_DEMUCS_ENDPOINT_ID:
-        raise SeparationError(
+        message = (
             "Separation is temporarily unavailable (GPU worker not configured). "
             "Please try again shortly."
         )
+        metering.record_job_finished(job_id, status="failed", error="gpu_worker_not_configured")
+        raise SeparationError(message)
 
     # Makes input_path fetchable by the worker at
     # /internal/gpu/input/{job_id}, and simultaneously AUTHORISES the
@@ -204,6 +255,17 @@ async def _run_demucs_on_gpu(
             )
         except RunPodJobError as e:
             error_text = str(e)
+
+            # A failed job still burned GPU seconds - often MORE than a
+            # successful one, because a timeout runs to the wall before
+            # being killed. Recording only successes would make the cost
+            # per job look better than it is.
+            metering.record_job_finished(
+                job_id,
+                status="timeout" if "timeout" in error_text.lower() else "failed",
+                error=error_text[:500],
+            )
+
             if _is_insufficient_balance_error(error_text):
                 # This is the ACTUAL ceiling on GPU spend - RunPod's own
                 # account genuinely out of money, not a self-tracked
@@ -232,6 +294,15 @@ async def _run_demucs_on_gpu(
         # what a real job actually costs in GPU time.
         logger.info(f"[SEPARATION] Job {job_id}: {gpu_seconds:.1f}s of GPU compute.")
 
+    # Written down, not acted on. Nothing in this file reads it back.
+    metering.record_job_finished(
+        job_id,
+        status="completed",
+        gpu_seconds=gpu_seconds,
+        gpu_type=output.get("gpu_type"),
+        runpod_job_id=output.get("runpod_job_id"),
+    )
+
     return output
 
 
@@ -249,6 +320,14 @@ def _verify_output_files(job_id: str, expected_paths: dict) -> None:
         logger.error(
             f"[SEPARATION] Job {job_id}: worker reported success but these "
             f"files are missing on disk: {missing}"
+        )
+        # The worker said it succeeded and it did not. Overwrite the
+        # 'completed' status recorded above so the cost report doesn't
+        # count a job the user never received as a success - the GPU
+        # seconds were still spent either way, which is precisely why
+        # this correction matters rather than being cosmetic.
+        metering.record_job_finished(
+            job_id, status="failed", error=f"outputs missing on disk: {missing}"
         )
         raise SeparationError("Separation completed but output files were not found.")
 
