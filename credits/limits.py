@@ -164,6 +164,16 @@ def resolve(route_key: str, request: Request, *, free_max: int, free_window: int
     if rule is None or not rule.enabled:
         return free
 
+    # The free limit for a METERED tool comes from the rule, which the boot
+    # invariant guarantees is >= the monthly allowance. The caller-supplied
+    # free_max is the fallback for unmetered tools, where no rule applies.
+    free = ResolvedLimit(
+        rule.free_rate_limit or free_max,
+        rule.free_rate_window or free_window,
+        None,
+        "free",
+    )
+
     owner_key, balance = peek_owner_and_balance(request)
     if not owner_key or balance < rule.credits:
         # Has an identity but no credits: still free tier. They'll meet
@@ -237,6 +247,18 @@ def summary_for(identity, route_free_limits: dict[str, tuple[int, int]]) -> dict
             tools[route_key] = {
                 "max_requests": rule.paid_rate_limit,
                 "window_seconds": rule.paid_rate_window,
+            }
+        elif rule is not None:
+            # The rule's own free limit, not the caller-supplied one. Those
+            # can differ: the host config.py number is what the route
+            # decorator passes as a fallback, while the rule's is the
+            # allowance-derived number the invariant guarantees is spendable.
+            # Reporting the fallback here would tell a user 1/hour while the
+            # limiter actually enforces 2 - a UI that lies pessimistically is
+            # still a UI that lies.
+            tools[route_key] = {
+                "max_requests": rule.free_rate_limit,
+                "window_seconds": rule.free_rate_window,
             }
         else:
             tools[route_key] = {"max_requests": free_max, "window_seconds": free_window}

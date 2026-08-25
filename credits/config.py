@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any
 
@@ -85,34 +85,79 @@ def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
 # out. Left in the schema because transcription will need it if it's ever
 # metered.
 #
-# paid_rate_limit / paid_rate_window apply ONLY to callers who hold credits;
-# see credits/limits.py for why loosening it for them is safe and why the free
-# numbers stay in the host config.py. 12/hour is deliberately not "unlimited":
-# it bounds a compromised-cookie or shared-account worst case to something
-# recoverable, while being far above any real session (nobody separates twelve
-# tracks an hour by hand).
+# ---------------------------------------------------------------------------
+# RATE LIMITS: THREE GUARDS, THREE JOBS. Do not conflate them.
+#
+# This block exists because the first version DID conflate them, and shipped a
+# free hourly limit of 1/hour alongside a free monthly allowance of 2. That
+# combination is not merely tight, it is CONTRADICTORY: the second free run
+# was unreachable in a single sitting, so half the allowance we advertised
+# could not be spent by a normal person. Nobody comes back an hour later to
+# use a free trial.
+#
+#   1. GPU SPEND is guarded by FREE_MONTHLY_OPS (2/user, 4/IP) and by the
+#      credit balance. This is the guard that actually bounds the bill, and
+#      it is exact: 2 free runs x ~$0.018 = ~$0.036 per user per month.
+#
+#   2. UPLOAD / BANDWIDTH ABUSE cannot be guarded here at all, which is worth
+#      stating plainly because it is easy to assume otherwise. Rate limiting
+#      runs as a FastAPI dependency, and the multipart body has already been
+#      read by then - a 429 arrives AFTER the bytes. The only layer that can
+#      reject before bytes reach the VPS is Cloudflare. See the deployment
+#      notes; that is a WAF rate-limiting rule, not application code.
+#
+#   3. QUEUE FAIRNESS is MAX_CONCURRENT_SEPARATIONS (2, matched to the RunPod
+#      worker count) and MAX_QUEUED_SEPARATIONS (6 in flight before a 503).
+#      Those are global. A per-subject concurrency cap is the precise tool if
+#      one buyer ever starves the queue; an hourly rate limit is the blunt
+#      one, and it hurts the paying customer batching an album far more than
+#      it hurts anyone abusive.
+#
+# What is left for the hourly limit, once those three are placed correctly, is
+# a SAFETY NET - not a primary control. So it should be set for humans.
+#
+# FREE: derived from FREE_MONTHLY_OPS by default rather than hand-set, so the
+# contradiction above cannot be re-introduced by editing one number and
+# forgetting the other. get_settings() enforces free_rate_limit >=
+# free_monthly_ops at boot and refuses to start otherwise - the same fail-at-
+# boot treatment the pack configuration already gets, for the same reason: a
+# limit that silently makes your own free tier unusable is worse than a
+# container that won't start.
+#
+# PAID: 30/hour. For a credit holder the BALANCE is the rate limit - every run
+# is already paid for, so an hourly cap protects nothing financial. Its only
+# job is stopping one buyer from monopolising the queue, and 30/hour is far
+# above any human workflow while still bounding a compromised-cookie worst
+# case to something recoverable. Someone who buys 100 credits to batch an
+# album and gets throttled at 12 has been punished for paying, which is the
+# worst possible moment to add friction.
 DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     "separate-hq": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
-        "paid_rate_limit": 12, "paid_rate_window": 3600,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,  # 0 = derive from FREE_MONTHLY_OPS
     },
     "stems-hq": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
-        "paid_rate_limit": 12, "paid_rate_window": 3600,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
     },
     "youtube/separate-hq": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
-        "paid_rate_limit": 12, "paid_rate_window": 3600,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
     },
     "youtube/stems-hq": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
-        "paid_rate_limit": 12, "paid_rate_window": 3600,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
     },
     # Not metered at launch. Present so the machinery exists the day it is,
     # and so /credits/me reports it as free rather than as unknown.
     "transcribe": {
         "enabled": False, "free_under_seconds": 600, "credits": 1,
-        "paid_rate_limit": 6, "paid_rate_window": 3600,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
     },
 }
 
@@ -131,6 +176,8 @@ class ToolRule:
     credits: int                 # cost per job
     paid_rate_limit: int         # requests/window for callers WITH credits
     paid_rate_window: int        # window in seconds for the above
+    free_rate_limit: int = 0     # 0 = derive from FREE_MONTHLY_OPS, see below
+    free_rate_window: int = 3600
 
 
 @dataclass(frozen=True)
@@ -255,9 +302,17 @@ def _load_tool_rules() -> dict[str, ToolRule]:
             ),
             credits=_int(f"PAYWALL_TOOL_{slug}_CREDITS", int(cfg.get("credits", 1) or 1)),
             paid_rate_limit=_int(f"PAYWALL_TOOL_{slug}_PAID_RATE_LIMIT",
-                                 int(cfg.get("paid_rate_limit", 12) or 12)),
+                                 int(cfg.get("paid_rate_limit", 30) or 30)),
             paid_rate_window=_int(f"PAYWALL_TOOL_{slug}_PAID_RATE_WINDOW",
                                   int(cfg.get("paid_rate_window", 3600) or 3600)),
+            # 0 means "derive from FREE_MONTHLY_OPS" - resolved in
+            # get_settings() once free_monthly_ops is known. Set the env var
+            # only to deliberately exceed the monthly allowance; setting it
+            # BELOW is rejected at boot.
+            free_rate_limit=_int(f"PAYWALL_TOOL_{slug}_FREE_RATE_LIMIT",
+                                 int(cfg.get("free_rate_limit", 0) or 0)),
+            free_rate_window=_int(f"PAYWALL_TOOL_{slug}_FREE_RATE_WINDOW",
+                                  int(cfg.get("free_rate_window", 3600) or 3600)),
         )
     return rules
 
@@ -348,6 +403,44 @@ def get_settings() -> Settings:
         runpod_usd_per_gpu_second=_float("RUNPOD_USD_PER_GPU_SECOND", 0.00019),
         admin_token=os.getenv("CREDITS_ADMIN_TOKEN", ""),
     )
+
+    # ---- Resolve derived free rate limits -------------------------------
+    # A rule with free_rate_limit=0 means "match the monthly allowance".
+    # Done HERE rather than in _load_tool_rules() because it needs
+    # free_monthly_ops, which is a top-level setting - the dependency runs
+    # the wrong way round to resolve it earlier.
+    resolved_rules = {}
+    for key, rule in settings.tool_rules.items():
+        free_limit = rule.free_rate_limit or settings.free_monthly_ops
+        resolved_rules[key] = ToolRule(
+            tool=rule.tool, enabled=rule.enabled,
+            free_under_seconds=rule.free_under_seconds, credits=rule.credits,
+            paid_rate_limit=rule.paid_rate_limit, paid_rate_window=rule.paid_rate_window,
+            free_rate_limit=free_limit, free_rate_window=rule.free_rate_window,
+        )
+    settings = replace(settings, tool_rules=resolved_rules)
+
+    # ---- THE INVARIANT --------------------------------------------------
+    # An hourly free limit BELOW the monthly free allowance makes part of
+    # that allowance unreachable: we would be advertising 2 free runs while
+    # making the second one require an hour's wait. That is not a tight
+    # limit, it is a broken promise, and it is invisible until a user hits
+    # it - which is exactly the class of bug worth refusing to boot over.
+    #
+    # Deliberately checked for EVERY rule including disabled ones. A tool
+    # that is off today gets enabled by flipping one env var, and that flip
+    # should not be the moment a latent contradiction goes live.
+    for rule in settings.tool_rules.values():
+        if rule.free_rate_limit < settings.free_monthly_ops:
+            raise RuntimeError(
+                f"Rate limit contradiction on '{rule.tool}': free tier allows "
+                f"{settings.free_monthly_ops} ops/month but only "
+                f"{rule.free_rate_limit} per {rule.free_rate_window}s. The monthly "
+                f"allowance would be unspendable in a single session. Either raise "
+                f"PAYWALL_TOOL_{rule.tool.upper().replace('-','_').replace('/','_')}"
+                f"_FREE_RATE_LIMIT to >= {settings.free_monthly_ops}, or lower "
+                f"FREE_MONTHLY_OPS."
+            )
 
     # Fail at boot, not at the first checkout.
     if settings.paywall_enabled:
