@@ -223,8 +223,10 @@ class Settings:
 
     # auth
     magic_link_ttl_minutes: int
+    device_link_ttl_minutes: int
     session_ttl_days: int
     magic_links_per_hour: int
+    device_links_per_hour: int
 
     # payments
     payments_provider: str
@@ -378,8 +380,21 @@ def get_settings() -> Settings:
         hold_timeout_minutes=_int("CREDIT_HOLD_TIMEOUT_MINUTES", 90),
 
         magic_link_ttl_minutes=_int("MAGIC_LINK_TTL_MINUTES", 30),
+        # Deliberately MUCH shorter than the emailed link. A device link
+        # is rendered as a QR code on a screen the user is looking at
+        # right now - it is scanned within seconds or not at all. The
+        # 30-minute window that makes sense for an email round-trip is
+        # pure extra exposure here: a screenshot, a shoulder-surfer, or a
+        # shared screen recording would otherwise carry a working
+        # credential for half an hour.
+        device_link_ttl_minutes=_int("DEVICE_LINK_TTL_MINUTES", 5),
         session_ttl_days=_int("SESSION_TTL_DAYS", 365),
         magic_links_per_hour=_int("MAGIC_LINKS_PER_HOUR", 5),
+        # Higher than the email limit because there is no email to spam
+        # and no enumeration surface - the caller must ALREADY hold a
+        # linked account to get one at all. This bounds a compromised
+        # session minting links in bulk, nothing more.
+        device_links_per_hour=_int("DEVICE_LINKS_PER_HOUR", 20),
 
         payments_provider=provider,
         webhook_secret=os.getenv("PAYMENTS_WEBHOOK_SECRET", ""),

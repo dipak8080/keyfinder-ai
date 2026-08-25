@@ -61,6 +61,42 @@ CALLED FROM TWO PLACES, deliberately:
     (routes/audio_tools.py) and /join, /video-to-audio, /silence-split
     (routes/media.py).
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-25: settle_or_refund() IN _run_tool_job's `finally`
+
+One line, and it closes the worst hole the credits system had.
+
+Before it, a credit was returned in exactly two situations: if
+paywall.guard()'s enqueue raised (spawning an asyncio task is not a
+failure-prone operation, so essentially never), or when
+sweep_stale_holds() ran 90 minutes later. Neither covers the case that
+actually happens - the job is accepted, runs, and FAILS on the GPU
+worker. _run_tool_job caught that, called mark_failed(), and left the
+credit held.
+
+So a paying user watched "Separation failed" with their credit gone, for
+up to an hour and a half. Technically recoverable, experientially
+indistinguishable from being robbed, and landing at the single worst
+moment in the product: right after someone paid and did not get the
+thing they paid for.
+
+It sits in the `finally` rather than the except-chain on purpose. The
+`finally` runs on the success path, on every exception path, AND on the
+asyncio.CancelledError a redeploy fires - which is the most likely way a
+paid job really dies. Enumerating except-clauses instead would mean
+missing whichever one gets added next year.
+
+It is UNCONDITIONAL and a silent no-op for the eighteen unmetered tools
+that share this runner, because they have no charge row. That is what
+keeps the call site from growing an "is this tool metered?" branch which
+would go stale the moment a tool is added - the exact drift this
+codebase fights everywhere else.
+
+What it still cannot cover, and why the sweeper stays: a task
+garbage-collected mid-run, or the container killed outright. No Python
+executes in either case.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -106,6 +142,11 @@ from audio_common import (
 )
 from monitoring import record_result
 from log_stream import set_job_context, remember_job_tags, tag_from_job
+
+# Credits. Self-contained and inert while PAYWALL_ENABLED is unset -
+# settle_or_refund() is a no-op for any job with no charge row, which is
+# every job on every unmetered tool.
+from credits.ledger import settle_or_refund
 
 
 # ============================================================
@@ -262,18 +303,21 @@ async def _run_tool_job(
     place instead of two.
 
     The `finally` block runs in a fixed order that matters:
-      fail_if_unfinished() FIRST, so a job is guaranteed terminal even if
-      an exception escaped every except clause above (the acquire_slot_
-      or_503-inside-a-background-task case, which no `except AudioTool
-      Error` or `except Exception` here would catch if it were raised
-      before the try). Then file cleanup, then memory release, then the
-      metric, then GPU billing - each independent of the others.
+      settle_or_refund() FIRST as of 2026-08-25 - see below for why the
+      money moves before anything else. Then fail_if_unfinished(), so a
+      job is guaranteed terminal even if an exception escaped every
+      except clause above (the acquire_slot_or_503-inside-a-background-
+      task case, which no `except AudioToolError` or `except Exception`
+      here would catch if it were raised before the try). Then file
+      cleanup, then memory release, then the metric, then GPU billing -
+      each independent of the others.
 
       Worth knowing what this does NOT cover: if the task itself is
       garbage-collected mid-run, none of this executes at all, because
       collection is not an exception and a `finally` has nothing to
       unwind. That hazard is closed at the spawn site instead - see
-      spawn_background_task() above.
+      spawn_background_task() above, and credits' sweep_stale_holds()
+      for the money side of the same gap.
     """
     started = time.monotonic()
     succeeded = False
@@ -336,6 +380,32 @@ async def _run_tool_job(
             )
 
         finally:
+            # MONEY FIRST, before anything that could itself raise.
+            #
+            # A failed paid job must return its credit even if cleanup,
+            # memory release or the metrics call then goes wrong - the
+            # credit is the part the user notices, and an exception in
+            # any later step must not be able to strand it.
+            #
+            # Unconditional, and a silent no-op for the eighteen
+            # unmetered tools sharing this runner: they have no charge
+            # row, so settle_or_refund() returns immediately. That is
+            # what keeps this line free of an "is this tool metered?"
+            # branch which would go stale the next time a tool is added.
+            #
+            # `succeeded` is the same flag the COMPLETE/FAILED log line
+            # and record_result() already use, so the refund can never
+            # disagree with what the logs say happened.
+            #
+            # Note this also runs on the CancelledError path above,
+            # because that clause re-raises INTO this finally - so a
+            # redeploy that kills an in-flight paid job returns the
+            # credit in that same instant rather than 90 minutes later
+            # via the sweeper. That is the most likely way a paid job
+            # actually dies, which makes it the case most worth getting
+            # right.
+            settle_or_refund(job_id, succeeded, reason=f"{tool.lower()}_failed")
+
             fail_if_unfinished(job_id, generic_error)
             for path in cleanup_paths:
                 cleanup_file(path)
@@ -659,6 +729,13 @@ async def _submit_audio_tool(
     spawn_background_task() below copies the context into the background
     task - and before the HTTP response is returned, so the request's own
     row in request_logs picks it up too.
+
+    NONE OF THESE TOOLS ARE METERED, and none should be: they are
+    ffmpeg/rubberband work costing fractions of a cent, and they are the
+    reason people arrive at the site. _run_tool_job's settle_or_refund()
+    call is a no-op for every job submitted through here, because no
+    charge row exists. See credits/config.py's DEFAULT_TOOL_RULES for
+    what is metered and why.
     """
     set_job_context(tool=tool, tier="standard")
 

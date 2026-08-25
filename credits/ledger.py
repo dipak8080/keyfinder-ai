@@ -267,12 +267,57 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
                      free_remaining_after=free_remaining(conn, identity, period))
 
 
+def settle_or_refund(job_id: str, succeeded: bool, reason: str = "job_failed") -> None:
+    """Close out a job's charge based on its outcome. THE hook that makes
+    "a failed job is refunded automatically" true without an asterisk.
+
+    WHY THIS EXISTS
+    ---------------
+    Before this, refunds happened in exactly two places: paywall.guard()
+    if the ENQUEUE raised (spawning an asyncio task is not a
+    failure-prone operation, so essentially never), and
+    sweep_stale_holds() 90 minutes later. Neither covers the case that
+    actually occurs - the job is accepted, runs, and fails on the GPU
+    worker.
+
+    So a paying user watched their job fail with their credit held for
+    an hour and a half. Technically recoverable, experientially
+    indistinguishable from being robbed, and landing at the single worst
+    moment in the product: right after someone paid and did not get the
+    thing.
+
+    Called from _run_tool_job's `finally` in routes/_shared.py - one
+    call site, every job-based tool, present and future. The `finally`
+    placement is deliberate: it runs on success, on every exception
+    path, AND on the CancelledError a redeploy triggers, so there is no
+    terminal state it can miss.
+
+    NO-OP FOR UNMETERED TOOLS. Eighteen ffmpeg tools share that runner
+    and none have a charge row. Returning quietly is what lets the call
+    site stay unconditional rather than growing an "is this metered?"
+    branch that would go stale the next time a tool is added.
+
+    sweep_stale_holds() stays as the backstop for what no `finally` can
+    cover: a task garbage-collected mid-run, or the container killed
+    outright.
+    """
+    if succeeded:
+        settle_job(job_id)
+    else:
+        refund_job(job_id, reason=reason)
+
+
 def refund_job(job_id: str, reason: str = "job_failed") -> bool:
     """Return the credit or free op. Idempotent — safe from worker, poller and sweeper at once."""
     with connect() as conn, tx(conn):
         row = conn.execute("SELECT * FROM job_charges WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
-            log.warning("refund requested for unknown job %s", job_id)
+            # NOT a warning. Every unmetered tool reaches this on every
+            # failure, because the call site in _run_tool_job is
+            # deliberately unconditional. WARNING here would produce
+            # noise from eighteen tools that have nothing to do with
+            # credits, and noise is how a real warning stops being read.
+            log.debug("no charge row for job %s - nothing to refund", job_id)
             return False
         if row["status"] == "refunded":
             return False

@@ -32,15 +32,17 @@ class MagicLinkRequest(BaseModel):
 
 
 def issue_magic_link(conn: sqlite3.Connection, *, email: str, subject_id: str | None,
-                     ip_hash: str | None) -> str:
+                     ip_hash: str | None, ttl_minutes: int | None = None,
+                     purpose: str = "login") -> str:
     """Create a one-time token, return the full verify URL. Caller emails it."""
     s = get_settings()
     token = new_token(32)
-    expires = (utcnow() + timedelta(minutes=s.magic_link_ttl_minutes)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    ttl = ttl_minutes if ttl_minutes is not None else s.magic_link_ttl_minutes
+    expires = (utcnow() + timedelta(minutes=ttl)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     conn.execute(
         """INSERT INTO magic_links (token_hash, email, subject_id, purpose, ip_hash, created_at, expires_at)
-           VALUES (?,?,?,'login',?,?,?)""",
-        (hash_token(token), email.strip().lower(), subject_id, ip_hash, now_iso(), expires),
+           VALUES (?,?,?,?,?,?,?)""",
+        (hash_token(token), email.strip().lower(), subject_id, purpose, ip_hash, now_iso(), expires),
     )
     return f"{s.api_base_url}/auth/verify?token={quote(token)}"
 
@@ -144,3 +146,96 @@ async def logout(response: Response, identity: Identity = Depends(paywall.get_id
         conn.execute("UPDATE subjects SET account_id=NULL WHERE id=?", (identity.subject_id,))
     clear_session_cookie(response)
     return {"ok": True}
+
+
+@router.post("/device-link")
+async def device_link(identity: Identity = Depends(paywall.get_identity)) -> dict:
+    """A sign-in link for the caller's OWN account, returned in the body
+    instead of emailed - so the frontend can render it as a QR code.
+
+    THE PROBLEM THIS SOLVES
+    -----------------------
+    Credits live on an account, and a browser reaches that account
+    through its af_sid cookie. That makes the buying device work with
+    nothing to type - genuinely less friction than any competitor, who
+    all demand a signup before you can even preview.
+
+    The cost lands entirely on the SECOND device. Someone who buys on a
+    laptop and later opens their phone sees a zero balance, because the
+    phone is a different browser with a different cookie. The receipt
+    email's magic link fixes it, but that is an app switch, an inbox, a
+    search, and a tap - at the exact moment they are trying to use the
+    thing they just paid for.
+
+    A QR code collapses that to roughly four seconds: point the phone
+    camera at the laptop screen, tap the notification, done. No email,
+    no typing, no app switch.
+
+    WHY THIS IS NOT A NEW SECURITY SURFACE
+    --------------------------------------
+    It mints nothing the caller could not already get. To reach this
+    route you must already hold a cookie linked to the account - the
+    same cookie that already displays the balance and can already spend
+    every credit on it. Handing that caller a link to their own account
+    grants zero additional authority.
+
+    Contrast with /auth/magic-link, which anyone may call for any
+    address: that one is emailed precisely because the caller has not
+    proven anything, and delivery to the inbox IS the proof. Here the
+    cookie is the proof, so the body is the right channel.
+
+    Three constraints that do matter:
+
+      1. SHORT TTL (5 min, vs 30 for email). This link is displayed on a
+         screen. A screenshot, a screen share, or someone behind you
+         should not carry a working credential for half an hour.
+      2. SINGLE USE - inherited from the magic_links.used_at check in
+         verify(). Scanning it consumes it.
+      3. RATE LIMITED per account, bounding a compromised session
+         minting links in bulk.
+
+    Returns 401 rather than minting anything for an anonymous caller.
+    That is not a real user path - the frontend only shows this button
+    when a balance is present - but the check has to exist, because
+    without it this route would email-lessly hand a session to whoever
+    asked.
+    """
+    s = get_settings()
+
+    if not identity.account_id or not identity.email:
+        # No account linked to this browser. Nothing to share, and
+        # nothing we could safely invent.
+        raise HTTPException(status_code=401, detail={
+            "kind": "not_linked",
+            "message": "This browser isn't linked to an account yet.",
+        })
+
+    with connect() as conn:
+        recent = conn.execute(
+            """SELECT COUNT(*) AS n FROM magic_links
+               WHERE email=? AND purpose='device_link'
+                 AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour')""",
+            (identity.email,),
+        ).fetchone()
+        if recent["n"] >= s.device_links_per_hour:
+            raise HTTPException(status_code=429, detail={
+                "kind": "rate_limited",
+                "message": "Too many device links. Try again in an hour.",
+            })
+
+        with tx(conn):
+            link = issue_magic_link(
+                conn,
+                email=identity.email,
+                subject_id=None,          # the SCANNING device supplies its own
+                ip_hash=identity.ip_hash,
+                ttl_minutes=s.device_link_ttl_minutes,
+                purpose="device_link",
+            )
+
+    log.info("issued device link for %s (expires in %dm)", identity.email, s.device_link_ttl_minutes)
+    return {
+        "url": link,
+        "expires_in_seconds": s.device_link_ttl_minutes * 60,
+        "email": identity.email,
+    }
