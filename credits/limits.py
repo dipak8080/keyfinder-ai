@@ -80,6 +80,8 @@ from typing import Callable
 
 from fastapi import Request
 
+from .paywall import insufficient_credits_response
+
 from .config import get_settings
 from .db import connect
 from .identity import SUBJECT_COOKIE, SESSION_COOKIE, SUBJECT_PURPOSE, SESSION_PURPOSE
@@ -95,6 +97,53 @@ class ResolvedLimit:
     window_seconds: int
     key: str | None       # None = fall back to rate_limit.py's IP keying
     tier: str             # "free" | "paid" - for logging only
+
+
+def peek_affordability(request: Request, rule) -> tuple[bool, str | None, int, int]:
+    """Can this caller pay for one job, and how?
+
+    Returns (affordable, owner_key, balance, free_remaining).
+
+    Read-only and cheap. Used by the rate-limit dependency to answer a
+    question the limiter cannot: is this request going to be REJECTED
+    for payment anyway? A 402'd request consumes no GPU, no queue slot
+    and no worker time, so counting it against a rate limit protects
+    nothing - and, as production showed, actively prevents the sale.
+    """
+    from .db import connect as _connect
+    from .ledger import free_remaining as _free_remaining
+    from .identity import Identity as _Identity
+
+    subject_id = unsign(request.cookies.get(SUBJECT_COOKIE), purpose=SUBJECT_PURPOSE)
+    if not subject_id:
+        # No cookie at all: a brand-new visitor has their full free
+        # allowance, so they can afford it.
+        return (True, None, 0, get_settings().free_monthly_ops)
+
+    owner_key, balance = peek_owner_and_balance(request)
+
+    try:
+        from .identity import hash_ip, client_ip
+
+        account_id = None
+        with _connect() as conn:
+            row = conn.execute("SELECT account_id FROM subjects WHERE id=?", (subject_id,)).fetchone()
+            account_id = row["account_id"] if row else None
+            identity = _Identity(
+                subject_id=subject_id,
+                ip_hash=hash_ip(client_ip(request)),
+                account_id=account_id,
+            )
+            remaining = _free_remaining(conn, identity)
+    except Exception:  # noqa: BLE001
+        # A credits DB problem must never block a route that worked
+        # before credits existed. Assume affordable and let the route's
+        # own guard make the real decision.
+        log.exception("could not resolve affordability - assuming affordable")
+        return (True, owner_key, balance, 0)
+
+    needed = rule.credits if rule else 1
+    return (remaining >= needed or balance >= needed, owner_key, balance, remaining)
 
 
 def peek_owner_and_balance(request: Request) -> tuple[str | None, int]:
@@ -292,6 +341,48 @@ def tiered_rate_limit(route_key: str, *, free_max: int, free_window: int) -> Cal
     from rate_limit import check_rate_limit  # host app module, imported late so credits/ stays importable standalone
 
     def dependency(request: Request) -> None:
+        settings = get_settings()
+        rule = settings.rule_for(route_key)
+
+        # AFFORDABILITY BEFORE RATE LIMIT. Order matters, and getting it
+        # backwards cost us the conversion moment in production.
+        #
+        # The free allowance is 2/month and the free hourly limit is
+        # 2/hour (derived from it). So the THIRD attempt inside an hour
+        # by someone who has spent both free runs hits the rate limiter
+        # first and is told "try again in 58 minutes" - instead of being
+        # shown the packs. That is precisely the person most likely to
+        # buy: they just used the product twice and immediately wanted
+        # more. Turning them away for an hour is the worst possible
+        # answer, and they can never see the paywall in their first hour
+        # no matter what they do.
+        #
+        # The principle underneath: a rate limit exists to protect a
+        # RESOURCE. A request that will be rejected for payment consumes
+        # no GPU, no queue slot, no worker time - so there is nothing for
+        # the limiter to protect, and counting it only blocks the sale.
+        #
+        # Raising 402 HERE rather than in the route also means it lands
+        # before the upload work in the handler, so someone out of
+        # credits learns it sooner.
+        #
+        # This does NOT charge anything. It is a read-only pre-check; the
+        # actual charge still happens exactly once inside paywall.guard()
+        # in the route body, which re-derives everything under a lock.
+        if settings.paywall_enabled and rule is not None and rule.enabled:
+            affordable, _owner, balance, remaining = peek_affordability(request, rule)
+            if not affordable:
+                from .ledger import InsufficientCredits
+
+                raise insufficient_credits_response(
+                    InsufficientCredits(
+                        balance=balance,
+                        free_remaining=remaining,
+                        tool=route_key,
+                        needed=rule.credits,
+                    )
+                )
+
         limit = resolve(route_key, request, free_max=free_max, free_window=free_window)
         check_rate_limit(
             request,
