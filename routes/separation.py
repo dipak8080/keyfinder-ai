@@ -227,17 +227,27 @@ async def _queue_separation(
         except SeparationError as e:
             cleanup_file(file_path)
             mark_failed(job_id, str(e))
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, {"kind": "unreadable_audio", "message": str(e)})
 
         if duration > max_duration_seconds:
             message = (
-                f"This track is {int(duration // 60)} min long. High quality separation "
-                f"is limited to {max_duration_seconds // 60} min because it costs several "
-                f"times more to run. Standard separation still works at full length."
+                f"This track is {int(duration // 60)} min long. Studio Quality is limited "
+                f"to {max_duration_seconds // 60} min because it costs several times more "
+                f"to run. Standard separation still works at full length."
             )
             cleanup_file(file_path)
             mark_failed(job_id, message)
-            raise HTTPException(400, message)
+            # Structured, not a bare string: the frontend's ApiError.kind
+            # carries an explicit "branch on this, never on message"
+            # contract, and this rejection has to be told apart from
+            # "out of credits" (402) and from a generic 400. A reworded
+            # sentence must never change frontend behaviour.
+            raise HTTPException(400, {
+                "kind": "hq_duration_exceeded",
+                "message": message,
+                "input_seconds": round(duration, 1),
+                "max_seconds": max_duration_seconds,
+            })
 
     is_stems = job_type in ("stems",)
 

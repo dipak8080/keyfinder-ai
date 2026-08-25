@@ -58,6 +58,30 @@ frontend reads - removing a key it might still be indexing would turn a
 config change into a runtime undefined. They are marked for removal
 below once lib/data/rate-limits.ts is confirmed to be off them.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-25): PAYWALL STATE ON THE PUBLIC METADATA ROUTES
+
+Two additive changes, both driven by the same principle this file
+already follows - the backend is the thing that actually knows, so the
+frontend should read rather than repeat.
+
+1. `/` root now reports `paywall_enabled` and `paywall_tools` inside the
+   existing `features` block. See root()'s docstring for why this is
+   worth a route change rather than letting the browser ask
+   /credits/me: it is the difference between zero client requests and
+   one per page load across ~90 static pages, on a site that has
+   already had a Vercel Edge Request incident from navbar prefetching.
+
+2. `/limits` now reports `separation_hq_max_duration_seconds`. The HQ
+   cap (6 min) is TIGHTER than the standard cap (10 min), which is
+   counterintuitive enough that a user will discover it by being
+   rejected unless the UI states it. Exposing it here lets the Studio
+   Quality toggle be greyed out from static data before a file is even
+   picked.
+
+Both fail closed. A credits-package problem must never break the root
+endpoint, which doubles as the health signal for the whole deploy.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -81,6 +105,7 @@ from config import (
     YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
+    MAX_SEPARATION_DURATION_SECONDS_HQ,
     MAX_QUEUED_SEPARATIONS,
     MAX_CONCURRENT_SEPARATIONS,
     MIDI_WORKER_URL,
@@ -178,23 +203,30 @@ def _iter_tool_routes():
     blank, and CI/CD would have deployed it happily.
 
     Walking the sub-routers directly sidesteps the question entirely.
-    Each of the seven modules below owns a plain APIRouter whose routes
-    were all registered by decorator, exactly like the old monolith's
-    single router - so `.routes` on each one is guaranteed to be real
-    APIRoute objects on every FastAPI version, past or future.
+    Each of the modules below owns a plain APIRouter whose routes were
+    all registered by decorator, exactly like the old monolith's single
+    router - so `.routes` on each one is guaranteed to be real APIRoute
+    objects on every FastAPI version, past or future.
 
     admin.py's own router is included too: admin_endpoints() filters
     /admin/* out by path anyway (see its docstring), but leaving it in
     keeps this function honestly "every route in the package" rather
     than quietly depending on that filter to hide an omission.
+
+    separation_upgrade is included as of 2026-08-25. It registers four
+    routes (/separate/upgrade, /stems/upgrade and their upgrade-info
+    partners) and would otherwise be invisible to the dashboard's tool
+    picker - which is exactly the silent-omission failure this function
+    exists to prevent.
     """
     # Imported here, not at module level - see admin_endpoints()'s
     # docstring for the import-order reasoning.
-    from . import youtube, separation, audio_tools, midi, transcribe, media
+    from . import youtube, separation, separation_upgrade, audio_tools, midi, transcribe, media
 
     sub_routers = [
         youtube.router,
         separation.router,
+        separation_upgrade.router,
         audio_tools.router,
         midi.router,
         transcribe.router,
@@ -251,13 +283,13 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
     handful registered on this module's own `router` object above.
     Before the restructure, routes.py had exactly one flat router for
     the whole app, so `for route in router.routes` already meant "every
-    route." Now that routes are split across seven files each with their
-    own local `router = APIRouter()`, this module's own `router` only
-    carries admin.py's own routes.
+    route." Now that routes are split across several files each with
+    their own local `router = APIRouter()`, this module's own `router`
+    only carries admin.py's own routes.
 
-    It walks the SEVEN SUB-ROUTERS directly (see _iter_tool_routes
-    below) rather than the assembled router from routes/__init__.py.
-    That is deliberate and load-bearing, not a stylistic choice - see
+    It walks the SUB-ROUTERS directly (see _iter_tool_routes below)
+    rather than the assembled router from routes/__init__.py. That is
+    deliberate and load-bearing, not a stylistic choice - see
     _iter_tool_routes' docstring for the FastAPI-version behaviour that
     forces it. The short version: a router built with include_router()
     does not reliably expose flattened APIRoute objects on `.routes`
@@ -279,7 +311,14 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
 
     # Trailing segments that mark an ACTION on a job rather than a
     # distinct tool. Anything at/after one of these is stripped.
-    action_segments = {"status", "preview", "download", "result"}
+    #
+    # "upgrade" and "upgrade-info" are here as of 2026-08-25 for exactly
+    # the same reason as "status"/"preview"/"download": they are actions
+    # ON a separation job, not tools of their own. Without them,
+    # /separate/upgrade/{id} would appear in the picker as a separate
+    # "Separate Upgrade" family, splitting one tool's traffic across two
+    # rows for no reader's benefit.
+    action_segments = {"status", "preview", "download", "result", "upgrade", "upgrade-info"}
 
     families: dict = {}
     for route in _iter_tool_routes():
@@ -288,6 +327,12 @@ async def admin_endpoints(request: Request, key: str = Query(...)):
         if not path or not methods:
             continue
         if path.startswith("/admin") or path in ("/", "/health", "/limits"):
+            continue
+        # The credits package mounts its own routers directly on the app
+        # (see main.py), so its paths never reach this loop - but guard
+        # anyway, since a future include_router() here would otherwise
+        # put /credits/me in the product-tool picker.
+        if path.startswith("/credits") or path.startswith("/auth"):
             continue
 
         segments = [s for s in path.split("/") if s]
@@ -484,6 +529,53 @@ def _probe_midi_worker() -> dict:
         return {"reachable": False, "error": str(e)[:200]}
 
 
+def _credits_snapshot() -> dict:
+    """
+    Credits/paywall state for /admin/status.
+
+    Deliberately a SUMMARY, not the full picture. /admin/credits/* is the
+    real operator surface for money - it has its own token, its own
+    lockout, and its own endpoints for cost, user lookup and webhook
+    triage. What belongs HERE is only what someone glancing at the
+    general status page needs in order to know whether to go look there:
+    is the paywall on, is anything stuck, is anyone owed credits.
+
+    webhooks_unprocessed is the one number worth the space. A paid order
+    whose webhook never processed is the failure mode that costs a real
+    customer real money, and it is otherwise invisible until they email.
+
+    Swallows everything: this is a health page, and a credits DB problem
+    must not take down the reporting that covers everything else.
+    """
+    try:
+        from credits.config import get_settings as _credits_settings
+        from credits.db import connect as _credits_connect
+
+        settings = _credits_settings()
+        with _credits_connect() as conn:
+            outstanding = conn.execute(
+                "SELECT COALESCE(SUM(delta),0) AS n FROM credit_ledger"
+            ).fetchone()["n"]
+            held = conn.execute(
+                "SELECT COUNT(*) AS n FROM job_charges WHERE status='held'"
+            ).fetchone()["n"]
+            stuck = conn.execute(
+                "SELECT COUNT(*) AS n FROM webhook_events WHERE processed_at IS NULL"
+            ).fetchone()["n"]
+
+        return {
+            "paywall_enabled": settings.paywall_enabled,
+            "provider": settings.payments_provider,
+            "metered_routes": [r.tool for r in settings.tool_rules.values() if r.enabled],
+            "credits_outstanding": outstanding,
+            "holds_open": held,
+            "webhooks_unprocessed": stuck,
+            "detail_at": "/admin/credits/overview",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
 @router.get("/admin/status")
 async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
@@ -541,6 +633,13 @@ async def admin_status(request: Request, key: str = Query(...)):
     # https://runpod.io (Billing), not estimated here. See
     # separation.py's insufficient-balance handling for what happens
     # when that balance actually runs out mid-request.
+    #
+    # What IS tracked, as of 2026-08-25, is per-job GPU seconds and an
+    # estimated cost - recorded, never enforced. That lives in
+    # /admin/credits/costs rather than here; see credits/metering.py for
+    # why the old self-tracked spend breaker was removed and why nothing
+    # reads those numbers back to make a decision.
+    #
     # Sidecar health. Without this, a dead midi-worker is invisible from
     # the admin panel and only shows up as a run of failed jobs with a
     # generic message. Short timeout, fully swallowed errors - a health
@@ -548,6 +647,10 @@ async def admin_status(request: Request, key: str = Query(...)):
     # Dispatched via run_blocking: see _probe_midi_worker's docstring for
     # why calling requests.get() inline here was freezing the event loop.
     snapshot["midi_worker"] = await run_blocking(_probe_midi_worker)
+
+    # Credits summary. Read-only, swallows its own errors, and points at
+    # /admin/credits/overview for anything more than a glance.
+    snapshot["credits"] = _credits_snapshot()
 
     snapshot["cache"] = {
         "enabled": True,
@@ -579,6 +682,14 @@ async def limits():
     blocking uploads on a tool whose UI advertised a 150MB total. The
     frontend should read these at build time and render from them
     instead of repeating them.
+
+    NOTE on rate_limits (2026-08-25): these are the FREE-tier numbers.
+    Callers holding credits get a looser per-account limit on the four
+    metered HQ routes - see credits/limits.py. The applicable limit for
+    a specific visitor comes from GET /credits/me's `rate_limit` block,
+    which resolves it through the same code the limiter uses. This
+    endpoint stays static and cacheable precisely because it does NOT
+    know who is asking; a per-visitor number does not belong here.
     """
     return {
         "max_upload_bytes": MAX_UPLOAD_BYTES,
@@ -622,6 +733,18 @@ async def limits():
         },
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
+            # ADDED 2026-08-25. The HQ input cap is TIGHTER than the
+            # standard one (6 min vs 10) - counterintuitive, and
+            # deliberately so per config.py: at ~5x the per-minute cost a
+            # 10 min track would eat the entire 30 min timeout budget.
+            #
+            # Exposed here so the frontend can grey out the Studio
+            # Quality toggle from STATIC data before a file is even
+            # picked, rather than accepting an upload and rejecting it at
+            # submit. Same reasoning as every other number in this
+            # endpoint: the backend knows, so the frontend should read
+            # rather than repeat.
+            "separation_hq_max_duration_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
         },
     }
 
@@ -644,7 +767,50 @@ async def root():
     boolean is exposed - not the model name, timeout, or any other
     internal detail - so there is nothing here for a client to learn
     about the feature beyond "on or off".
+
+    --------------------------------------------------------------------
+    PAYWALL FLAGS (added 2026-08-25) follow the same rule, and exist for
+    a specific reason worth stating.
+
+    Without them, the frontend's CreditProvider has to call /credits/me
+    from the BROWSER on every page load just to discover whether the
+    paywall is on at all. That is one client request on ~90 static pages
+    for a feature that is currently disabled - and this site has already
+    had a Vercel Edge Request consumption incident caused by navbar
+    prefetching, so that shape of problem is not hypothetical here.
+
+    Read from here instead, it costs nothing: getFeatureFlags() already
+    fetches this route server-side, cached by Next's fetch cache, and
+    already fails closed. While the paywall is off the provider makes
+    ZERO requests.
+
+    Values are EFFECTIVE state - global AND per-tool - so the frontend
+    never has to combine two flags and cannot get that combination
+    wrong. transcribe is filtered out: it exists in the rules so the
+    machinery is ready the day it is metered, but it is not a paywall
+    concern the frontend should render anything for today.
+
+    FAILS CLOSED, and that matters more than it looks: this route is also
+    the deploy's health signal. A credits-package problem must degrade to
+    "paywall off" rather than take down the endpoint that tells you
+    whether the API is alive at all.
+    --------------------------------------------------------------------
     """
+    try:
+        from credits.config import get_settings as _credits_settings
+
+        _c = _credits_settings()
+        paywall_enabled = _c.paywall_enabled
+        paywall_tools = {
+            key: bool(_c.paywall_enabled and rule.enabled)
+            for key, rule in _c.tool_rules.items()
+            if key != "transcribe"
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[CREDITS] Could not read paywall state for / - reporting off: {e}")
+        paywall_enabled = False
+        paywall_tools = {}
+
     return {
         "status": "AudioForges API",
         "engine": (
@@ -654,6 +820,8 @@ async def root():
         ),
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
+            "paywall_enabled": paywall_enabled,
+            "paywall_tools": paywall_tools,
         },
         "limits": "/limits",
     }

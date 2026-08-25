@@ -100,6 +100,7 @@ def check_rate_limit(
     max_requests: int = None,
     window_seconds: int = None,
     key_override: str = None,
+    tier: str = None,
 ):
     """
     Use as a FastAPI dependency on rate-limited routes:
@@ -116,6 +117,13 @@ def check_rate_limit(
     within window_seconds on this specific path. max_requests/
     window_seconds default to the global RATE_LIMIT_* config values if
     not explicitly overridden, so existing call sites are unaffected.
+
+    tier, when passed, is echoed in the 429 detail as a machine-readable
+    field. Only credits/limits.py passes it. The point is not the limit
+    itself but what the frontend can DO about it: a "free" tier 429 on a
+    metered tool means buying credits raises the ceiling, which is worth
+    saying at exactly that moment. Without it the frontend would have to
+    infer tier from balance, which races against the limit it just hit.
 
     key_override replaces the IP half of the window key. Passing None -
     the default, and what every pre-existing call site does - keys on IP
@@ -155,11 +163,24 @@ def check_rate_limit(
                 + (f" (keyed on {key_override})" if key_override else "")
             )
             retry_after = int(effective_window - (now - timestamps[0])) if timestamps else effective_window
-            raise HTTPException(
-                429,
+            message = (
                 f"Too many requests. Please wait a moment before trying again "
-                f"(limit: {effective_max} request(s) per {_format_duration(effective_window)}).",
-                headers={"Retry-After": str(max(retry_after, 1))},
+                f"(limit: {effective_max} request(s) per {_format_duration(effective_window)})."
+            )
+            # Detail stays a plain STRING when no tier is passed - that is
+            # what all ~35 existing call sites produce today and what the
+            # frontend's parseDetail() already handles. Only the credits
+            # routes get the structured form, so nothing else changes shape.
+            detail = message if tier is None else {
+                "kind": "rate_limited",
+                "message": message,
+                "tier": tier,
+                "max_requests": effective_max,
+                "window_seconds": effective_window,
+                "retry_after_seconds": max(retry_after, 1),
+            }
+            raise HTTPException(
+                429, detail, headers={"Retry-After": str(max(retry_after, 1))},
             )
 
         timestamps.append(now)

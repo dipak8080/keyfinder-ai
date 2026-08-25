@@ -74,15 +74,37 @@ async def request_magic_link(body: MagicLinkRequest, identity: Identity = Depend
 @router.get("/verify")
 async def verify(request: Request, token: str = "") -> RedirectResponse:
     s = get_settings()
-    fail = RedirectResponse(f"{s.frontend_url}/auth/verified?status=invalid", status_code=303)
+
+    def _fail(status: str) -> RedirectResponse:
+        """Four statuses, not two.
+
+        'invalid' reads like an accusation, and for the most common real
+        cause - a link opened 40 minutes after it was emailed - it is
+        simply wrong. 'expired' and 'used' are both RECOVERABLE states
+        with obvious next actions ("send another", "you're already
+        signed in on this device"), and telling them apart is the
+        difference between a user retrying and a user emailing support.
+
+        Enumeration is not a concern here: reaching any of these
+        requires already holding a 256-bit token, so the extra detail
+        reveals nothing to someone who doesn't.
+        """
+        return RedirectResponse(
+            f"{s.frontend_url}/auth/verified?status={status}", status_code=303
+        )
+
     if not token:
-        return fail
+        return _fail("invalid")
 
     token_h = hash_token(token)
     with connect() as conn, tx(conn):
         row = conn.execute("SELECT * FROM magic_links WHERE token_hash=?", (token_h,)).fetchone()
-        if row is None or row["used_at"] is not None or row["expires_at"] <= now_iso():
-            return fail
+        if row is None:
+            return _fail("invalid")
+        if row["used_at"] is not None:
+            return _fail("used")
+        if row["expires_at"] <= now_iso():
+            return _fail("expired")
         conn.execute("UPDATE magic_links SET used_at=? WHERE token_hash=?", (now_iso(), token_h))
 
         account_id = get_or_create_account(conn, row["email"])

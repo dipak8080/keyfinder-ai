@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, EmailStr, Field
 
 from . import claims, ledger, paywall
@@ -37,7 +37,10 @@ class ClaimRequest(BaseModel):
 
 
 @router.get("/me")
-async def me(identity: Identity = Depends(paywall.get_identity)) -> dict:
+async def me(
+    response: Response,
+    identity: Identity = Depends(paywall.get_identity),
+) -> dict:
     """Everything the UI needs in one call: balance, free ops remaining,
     which tools are metered, and the pack list with live buy links.
 
@@ -45,7 +48,16 @@ async def me(identity: Identity = Depends(paywall.get_identity)) -> dict:
     cookie for a first-time visitor, which is why it returns the same
     shape whether the paywall is on or off - the frontend reads
     paywall.enabled and renders nothing when it's false.
+
+    NO-STORE IS LOAD-BEARING, not hygiene. This response contains a
+    per-user balance behind a domain that sits on Cloudflare. A cached
+    copy served to the wrong visitor would show them someone else's
+    credits - and because the identity cookie is set on the same
+    response, a cached Set-Cookie would hand two people the same subject
+    id. Neither is recoverable by a later request.
     """
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
     return ledger.summary(identity)
 
 

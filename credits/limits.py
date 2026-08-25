@@ -179,6 +179,71 @@ def resolve(route_key: str, request: Request, *, free_max: int, free_window: int
     )
 
 
+def summary_for(identity, route_free_limits: dict[str, tuple[int, int]]) -> dict:
+    """The rate-limit block for GET /credits/me.
+
+    WHY THE FRONTEND NEEDS THIS. lib/data/rate-limits.ts is a hardcoded
+    table with a comment calling itself the single source of truth. That
+    was accurate until tier-aware limits: separate-hq is 1/hour for
+    anonymous callers and 12/hour for credit holders, so a static table
+    can only ever be right for one of them and will lie to the other.
+
+    Resolved through the SAME code path the limiter uses, not a parallel
+    reimplementation - if these two ever disagreed, the UI would be
+    confidently wrong, which is worse than having no number at all.
+
+    route_free_limits maps route key -> (max_requests, window_seconds)
+    from the host config.py, so the free numbers still live in the file
+    where every other limit lives.
+    """
+    settings = get_settings()
+    owner_key, balance = (None, 0)
+    if settings.paywall_enabled:
+        # Only look up identity when it can change the answer. With the
+        # paywall off every caller is on free limits by definition, and
+        # this is called on every page load.
+        try:
+            with connect() as conn:
+                row = conn.execute(
+                    "SELECT account_id FROM subjects WHERE id = ?", (identity.subject_id,)
+                ).fetchone()
+                account_id = row["account_id"] if row else None
+                if account_id:
+                    owner_key = f"account:{account_id}"
+                    balance = conn.execute(
+                        """SELECT COALESCE(SUM(delta), 0) AS b FROM credit_ledger
+                           WHERE (owner_type='account' AND owner_id=?)
+                              OR (owner_type='subject' AND owner_id IN
+                                  (SELECT id FROM subjects WHERE account_id=?))""",
+                        (account_id, account_id),
+                    ).fetchone()["b"]
+                else:
+                    owner_key = f"subject:{identity.subject_id}"
+                    balance = conn.execute(
+                        "SELECT COALESCE(SUM(delta),0) AS b FROM credit_ledger"
+                        " WHERE owner_type='subject' AND owner_id=?",
+                        (identity.subject_id,),
+                    ).fetchone()["b"]
+        except sqlite3.Error:
+            log.exception("credits DB unavailable resolving rate-limit summary")
+
+    tools: dict[str, dict] = {}
+    credited = False
+    for route_key, (free_max, free_window) in route_free_limits.items():
+        rule = settings.rule_for(route_key)
+        metered = bool(settings.paywall_enabled and rule and rule.enabled)
+        if metered and owner_key and balance >= rule.credits:
+            credited = True
+            tools[route_key] = {
+                "max_requests": rule.paid_rate_limit,
+                "window_seconds": rule.paid_rate_window,
+            }
+        else:
+            tools[route_key] = {"max_requests": free_max, "window_seconds": free_window}
+
+    return {"tier": "credited" if credited else "free", "tools": tools}
+
+
 def tiered_rate_limit(route_key: str, *, free_max: int, free_window: int) -> Callable:
     """Drop-in replacement for partial(check_rate_limit, ...) on a route.
 
@@ -211,6 +276,12 @@ def tiered_rate_limit(route_key: str, *, free_max: int, free_window: int) -> Cal
             max_requests=limit.max_requests,
             window_seconds=limit.window_seconds,
             key_override=limit.key,
+            # Surfaced in the 429 body so the frontend can turn a rate
+            # limit into a conversion moment ("buy credits to lift this
+            # to 12/hour") rather than a dead end. A free-tier 429 on a
+            # metered tool is the single clearest signal that someone
+            # wants more of this tool than the free tier allows.
+            tier=limit.tier,
         )
 
     dependency.__name__ = f"tiered_rate_limit_{route_key.replace('/', '_')}"

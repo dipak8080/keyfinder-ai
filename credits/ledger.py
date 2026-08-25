@@ -99,6 +99,32 @@ def free_remaining(conn: sqlite3.Connection, identity: Identity, period: str | N
     return max(0, min(s.free_monthly_ops - owner_used, s.free_monthly_ops_per_ip - ip_used))
 
 
+# Route key -> the FREE (anonymous) limit, read from the host config.py
+# so the numbers still live where every other limit lives. Imported
+# lazily inside summary() because credits/ must stay importable without
+# the host app present (the test harness relies on that).
+def _free_route_limits() -> dict:
+    try:
+        from config import (
+            SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
+            SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
+            STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+            STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+            YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+            YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+            YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+            YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+        )
+    except ImportError:
+        return {}
+    return {
+        "separate-hq": (SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS, SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS),
+        "stems-hq": (STEMS_HQ_RATE_LIMIT_MAX_REQUESTS, STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS),
+        "youtube/separate-hq": (YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS, YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS),
+        "youtube/stems-hq": (YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS, YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS),
+    }
+
+
 def summary(identity: Identity) -> dict:
     s = get_settings()
     period = period_key()
@@ -110,6 +136,20 @@ def summary(identity: Identity) -> dict:
             f"SELECT delta, kind, created_at, note FROM credit_ledger WHERE {clause} ORDER BY id DESC LIMIT 10",
             params,
         ).fetchall()
+        # Open holds: credits reserved for jobs that have not reached a
+        # terminal state. The frontend gives up polling an HQ job at 32
+        # minutes but CREDIT_HOLD_TIMEOUT_MINUTES is 90, so between those
+        # two a user can be staring at a stuck job wondering if they were
+        # charged for nothing. Exposing the count lets the UI say
+        # something true at that moment - "still processing, and if it
+        # fails your credit comes back automatically" - instead of going
+        # quiet, which is the worst-feeling failure there is.
+        held = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_charges"
+            " WHERE status='held' AND charge_type='credit'"
+            "   AND owner_type=? AND owner_id=?",
+            identity.owner,
+        ).fetchone()["n"]
 
     return {
         "authenticated": identity.is_authenticated,
@@ -131,8 +171,27 @@ def summary(identity: Identity) -> dict:
              "buy_url": p.resolved_buy_url(s.payments_provider, s.provider_store_slug)}
             for p in s.packs_sorted()
         ],
+        "held_credits": held,
+        "rate_limit": _rate_limit_block(identity),
         "recent": [dict(r) for r in recent],
     }
+
+
+def _rate_limit_block(identity: Identity) -> dict:
+    """Which rate limits actually apply to THIS caller right now.
+
+    Imported lazily: credits.limits imports the host app's rate_limit
+    module, and this keeps ledger.py importable on its own.
+    """
+    free_limits = _free_route_limits()
+    if not free_limits:
+        return {"tier": "free", "tools": {}}
+    try:
+        from .limits import summary_for
+        return summary_for(identity, free_limits)
+    except Exception:  # noqa: BLE001
+        log.exception("could not resolve rate-limit summary")
+        return {"tier": "free", "tools": {}}
 
 
 # --- writes ---------------------------------------------------------------
