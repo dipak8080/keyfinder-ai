@@ -38,8 +38,9 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.2
 uvicorn==0.40.0
+email-validator>=2.0
 
-# ---------- YOUTUBE / TIKTOK EXTRACTION ----------
+# ---------- YOUTUBE / TIKTOK EXTRACTION -----------
 # NOTE: this line previously appeared TWICE - once here and once again a
 # few lines below, under a comment describing browser TLS/JA3
 # impersonation. The duplicate has been removed because it did not do
