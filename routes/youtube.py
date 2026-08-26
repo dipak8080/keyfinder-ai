@@ -163,13 +163,44 @@ config.py). Nothing else in this file changed - same handlers, same
 status codes, same response shapes.
 --------------------------------------------------------------------------
 
-NOTE: two names the old routes.py imported from youtube.py -
-`download_with_fallback` and `VideoTooLongError` - are not referenced
-anywhere in the route handlers below (or anywhere else in the old
-routes.py). They are not imported here. If something outside routes.py
-actually depended on routes.py re-exporting them, that would need a
-separate import added back in - flagging this rather than silently
-carrying two unused imports forward.
+WHAT CHANGED (2026-08-25): CREDITS ON THE TWO HQ ROUTES
+
+This file was MISSED when the paywall shipped. routes/separation.py got
+the guard on /separate-hq and /stems-hq; /youtube/separate-hq and
+/youtube/stems-hq were listed in credits/config.py's tool rules and had
+their env flags turned on - but no guard, no tiered rate limit, and no
+metering. So flipping the flag made them *report* as metered while
+serving Studio Quality separation free to anyone at ~$0.018 of GPU per
+run. Caught in production testing; the flags were turned off within
+minutes and this is the real fix.
+
+TWO STRUCTURAL DIFFERENCES from routes/separation.py, both of which
+change where things can go wrong:
+
+1. THE DOWNLOAD HAPPENS INSIDE THE BACKGROUND TASK. There is no file at
+   submit time, so there is no duration to probe, so the pre-charge
+   duration check that /separate-hq performs is IMPOSSIBLE here. The
+   charge is therefore taken at submit with input_seconds=None, which
+   paywall.decide() treats as billable - unknown duration on a metered
+   tool must never fail open.
+
+   The safety net is the refund, not a pre-check: if the track turns out
+   to exceed MAX_SEPARATION_DURATION_SECONDS_HQ, _run_demucs_on_gpu
+   raises SeparationError, _run_tool_job catches it, and its `finally`
+   calls settle_or_refund() - the credit is back immediately, not in 90
+   minutes. That is a worse experience than /separate-hq's clean 400
+   (the user waits for a download before learning), but it is honest and
+   it costs them nothing.
+
+2. _chain_download RETURNS EARLY ON FAILURE, before _run_tool_job is
+   ever reached - so the `finally` that normally settles the charge does
+   not run on that path. A failed YouTube download would have held the
+   credit for the full sweeper window. _run_youtube_separation now calls
+   settle_or_refund() explicitly on that branch. This is exactly the
+   kind of hole a shared runner hides: the refund looked "handled
+   everywhere" because it was handled in the one place most code goes
+   through.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -262,6 +293,14 @@ from log_stream import (
     remember_job_tags,
     tag_from_job,
 )
+
+# Credits. Inert while PAYWALL_ENABLED is unset; see the 2026-08-25 note
+# in this module's docstring for why these two HQ routes were missed the
+# first time and what that cost.
+from credits import metering, paywall
+from credits.identity import Identity
+from credits.ledger import settle_or_refund
+from credits.limits import tiered_rate_limit
 
 from ._shared import spawn_background_task, _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
 
@@ -607,6 +646,10 @@ def _read_file_bytes(path: str) -> bytes:
 # to share - see the WHAT CHANGED note at the top of this file for why
 # the shared number was wrong even though the per-IP buckets were already
 # separate.
+#
+# The two HQ routes additionally carry a credit charge (2026-08-25) - see
+# the CREDITS note at the top of this file for the two structural
+# differences from routes/separation.py that make this harder here.
 # ============================================================
 
 async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Optional[tuple]:
@@ -633,6 +676,11 @@ async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Opti
     called set_job_context() before spawning this task, so the tag is
     already inherited. Setting it again here would just be a second call
     site for the same information.
+
+    NOTE ON CREDITS: this function does NOT settle or refund. It returns
+    None on failure and the CALLER decides - see
+    _run_youtube_separation, which refunds on that branch. Putting it
+    here would refund for /youtube/analyze too, which is never charged.
     """
     acquired = False
     try:
@@ -776,10 +824,26 @@ async def _run_youtube_separation(
 
     downloaded = await _chain_download(job_id, url, tool, metric)
     if downloaded is None:
+        # THE REFUND HOLE THIS CLOSES: _chain_download returns early here,
+        # so _run_tool_job below is never reached - and _run_tool_job's
+        # `finally` is where every other tool's charge gets settled or
+        # refunded. Without this line, a paid YouTube job whose DOWNLOAD
+        # failed (a private video, a bot check, a queue-wait 503) would
+        # hold the credit until the 90-minute sweeper found it.
+        #
+        # Unconditional and a no-op for the two standard routes, which
+        # have no charge row - same property that lets the call in
+        # _run_tool_job stay unconditional.
+        settle_or_refund(job_id, False, reason=f"{tool.lower()}_download_failed")
         fail_if_unfinished(job_id, "Download failed.")
         return
 
     file_path, title = downloaded
+
+    # Now that the file exists, record what we're actually about to
+    # process. The submit path could not do this - there was no file yet.
+    if hq:
+        metering.record_input_duration_safe(job_id, file_path)
 
     if stems:
         # No run_blocking() - run_stem_separation()/run_separation() are
@@ -800,6 +864,10 @@ async def _run_youtube_separation(
         success_detail = None
         generic_error = "Separation failed unexpectedly."
 
+    # _run_tool_job's `finally` calls settle_or_refund - so a track that
+    # turns out to exceed MAX_SEPARATION_DURATION_SECONDS_HQ, or any
+    # other GPU-side failure, returns the credit immediately rather than
+    # via the sweeper.
     await _run_tool_job(
         tool=tool,
         metric=metric,
@@ -888,6 +956,9 @@ async def youtube_separate_route(url: str = Form(...)):
     each accepted job here holds the SINGLE _separation_semaphore slot
     for 3-5 minutes, which every other separation job on the box then
     waits behind.
+
+    FREE FOREVER. No credits identity, no guard - like /separate, this
+    route has no code path that reaches the ledger regardless of config.
     """
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
@@ -914,13 +985,16 @@ async def youtube_separate_route(url: str = Form(...)):
 
 @router.post(
     "/youtube/separate-hq",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    dependencies=[Depends(tiered_rate_limit(
+        "youtube/separate-hq",
+        free_max=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+        free_window=YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
-async def youtube_separate_hq_route(url: str = Form(...)):
+async def youtube_separate_hq_route(
+    url: str = Form(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """
     High-quality YouTube vocal/instrumental separation - htdemucs_ft at
     raised overlap, same knobs as /separate-hq, with a download bolted
@@ -938,6 +1012,16 @@ async def youtube_separate_hq_route(url: str = Form(...)):
     rate-limit dependencies are evaluated before the request body is
     read - a Depends() cannot see a Form value, so per-tier limits need
     per-tier routes.
+
+    COSTS ONE CREDIT when PAYWALL_TOOL_YOUTUBE_SEPARATE_HQ_ENABLED is on.
+
+    input_seconds=None is not an oversight: there is no file yet, so
+    there is no duration to probe. paywall.decide() treats unknown
+    duration on a metered tool as billable, which is the only safe
+    direction - failing open would give away the expensive tier to
+    anyone whose duration happened to be unreadable. If the track later
+    turns out to exceed the 6-minute HQ cap, _run_tool_job's `finally`
+    refunds the credit immediately.
     """
     if not SEPARATION_HQ_ENABLED:
         raise HTTPException(
@@ -951,23 +1035,48 @@ async def youtube_separate_hq_route(url: str = Form(...)):
 
     set_job_context(tool="YOUTUBE_SEPARATE", tier="hq")
 
+    # Capacity before payment: a 503 must never cost a credit.
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
-
     remember_job_tags(job_id)
-    spawn_background_task(_run_youtube_separation(
-        job_id, url,
-        stems=False,
-        model=SEPARATION_MODEL_HQ,
-        overlap=SEPARATION_OVERLAP_HQ,
-        timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
-        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
-        hq=True,
-    ))
 
-    logger.info(f"[YOUTUBE_SEPARATE_HQ] job={job_id} queued for {url}")
-    return JSONResponse({"job_id": job_id, "status": "processing"})
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/separate-hq",
+        subject_id=identity.subject_id, account_id=identity.account_id,
+        ip_hash=identity.ip_hash,
+    )
+
+    async with paywall.guard(
+        identity, job_id=job_id, tool="youtube/separate-hq", input_seconds=None
+    ) as charge:
+        spawn_background_task(_run_youtube_separation(
+            job_id, url,
+            stems=False,
+            model=SEPARATION_MODEL_HQ,
+            overlap=SEPARATION_OVERLAP_HQ,
+            timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+            max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+            hq=True,
+        ))
+
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/separate-hq",
+        subject_id=identity.subject_id, account_id=identity.account_id,
+        ip_hash=identity.ip_hash, charge_type=charge.charge_type,
+    )
+
+    logger.info(
+        f"[YOUTUBE_SEPARATE_HQ] job={job_id} queued for {url} charged={charge.charge_type}"
+    )
+    payload = {"job_id": job_id, "status": "processing"}
+    if charge.charge_type != "none":
+        payload["billing"] = {
+            "charged": charge.charge_type,
+            "balance": charge.balance_after,
+            "free_remaining": charge.free_remaining_after,
+        }
+    return JSONResponse(payload)
 
 
 @router.get("/youtube/separate/status/{job_id}")
@@ -1019,6 +1128,8 @@ async def youtube_stems_route(url: str = Form(...)):
     the output files differ), so it gets the same numbers. Kept as its
     own constant rather than importing /youtube/separate's so that stays
     a decision, not an assumption baked into a shared name.
+
+    FREE FOREVER, same as /youtube/separate.
     """
     if not is_valid_youtube_url(url):
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
@@ -1045,18 +1156,23 @@ async def youtube_stems_route(url: str = Form(...)):
 
 @router.post(
     "/youtube/stems-hq",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    dependencies=[Depends(tiered_rate_limit(
+        "youtube/stems-hq",
+        free_max=YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+        free_window=YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
-async def youtube_stems_hq_route(url: str = Form(...)):
+async def youtube_stems_hq_route(
+    url: str = Form(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """
     High-quality YouTube 4-stem separation - same knobs and kill switch
     as /stems-hq. Shares job_type="youtube_stems" with the standard
     tier so the existing status/preview/download routes need no changes;
     see youtube_separate_hq_route() for the full reasoning.
+
+    COSTS ONE CREDIT when PAYWALL_TOOL_YOUTUBE_STEMS_HQ_ENABLED is on.
     """
     if not SEPARATION_HQ_ENABLED:
         raise HTTPException(
@@ -1073,20 +1189,44 @@ async def youtube_stems_hq_route(url: str = Form(...)):
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
-
     remember_job_tags(job_id)
-    spawn_background_task(_run_youtube_separation(
-        job_id, url,
-        stems=True,
-        model=SEPARATION_MODEL_HQ,
-        overlap=SEPARATION_OVERLAP_HQ,
-        timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
-        max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
-        hq=True,
-    ))
 
-    logger.info(f"[YOUTUBE_STEMS_HQ] job={job_id} queued for {url}")
-    return JSONResponse({"job_id": job_id, "status": "processing"})
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/stems-hq",
+        subject_id=identity.subject_id, account_id=identity.account_id,
+        ip_hash=identity.ip_hash,
+    )
+
+    async with paywall.guard(
+        identity, job_id=job_id, tool="youtube/stems-hq", input_seconds=None
+    ) as charge:
+        spawn_background_task(_run_youtube_separation(
+            job_id, url,
+            stems=True,
+            model=SEPARATION_MODEL_HQ,
+            overlap=SEPARATION_OVERLAP_HQ,
+            timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+            max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+            hq=True,
+        ))
+
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/stems-hq",
+        subject_id=identity.subject_id, account_id=identity.account_id,
+        ip_hash=identity.ip_hash, charge_type=charge.charge_type,
+    )
+
+    logger.info(
+        f"[YOUTUBE_STEMS_HQ] job={job_id} queued for {url} charged={charge.charge_type}"
+    )
+    payload = {"job_id": job_id, "status": "processing"}
+    if charge.charge_type != "none":
+        payload["billing"] = {
+            "charged": charge.charge_type,
+            "balance": charge.balance_after,
+            "free_remaining": charge.free_remaining_after,
+        }
+    return JSONResponse(payload)
 
 
 @router.get("/youtube/stems/status/{job_id}")

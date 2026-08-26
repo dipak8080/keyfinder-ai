@@ -119,6 +119,34 @@ def record_input_duration(job_id: str, input_seconds: float | None) -> None:
         log.exception("failed to record input duration for %s", job_id)
 
 
+def record_input_duration_safe(job_id: str, file_path: str) -> None:
+    """ffprobe a file and record its duration, swallowing everything.
+
+    For the chained YouTube routes, where the file only exists inside the
+    background task - the submit path had nothing to probe. Without this
+    the two /youtube/*-hq rows would carry a null input_seconds, and the
+    cost report's input_minutes would silently describe uploads only.
+
+    Deliberately best-effort and silent: this runs on a path where the
+    job is already accepted and paid for. A probe failure must not turn
+    a working separation into a failed one over a metrics column.
+    """
+    try:
+        import subprocess
+
+        from config import FFMPEG_PATH
+
+        out = subprocess.run(
+            [FFMPEG_PATH.replace("ffmpeg", "ffprobe"), "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        record_input_duration(job_id, float(out.stdout.strip()))
+    except Exception:  # noqa: BLE001
+        log.debug("could not probe duration for %s", job_id)
+
+
 def record_job_finished(
     job_id: str,
     *,
