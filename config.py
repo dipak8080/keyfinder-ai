@@ -1009,7 +1009,7 @@ TRANSCRIPTION_JOB_TTL_SECONDS = int(os.environ.get("TRANSCRIPTION_JOB_TTL_SECOND
 MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "1200"))  # 20 min
 
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
-AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
+AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # ---------- VIDEO TO TEXT ----------
 # Own byte cap, well above MAX_UPLOAD_BYTES' 80MB (video is ~10x audio
@@ -1027,7 +1027,7 @@ MAX_VIDEO_TRANSCRIBE_BYTES = int(os.environ.get("MAX_VIDEO_TRANSCRIBE_BYTES", st
 # single transcription slot, not the ffmpeg extraction, so this belongs
 # with its siblings.
 VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
-VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))
+VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "3600"))
 
 # ---------- YOUTUBE TO TEXT ----------
 # Stricter than the other /youtube/* chained tools: this one chains a
@@ -1035,7 +1035,7 @@ VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("VIDEO_TRANSCRIB
 # job can occupy the one transcription slot for the length of the video.
 # The limiter is what stops a queue forming that nobody can see.
 YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
-YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "300"))
+YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "3600"))
 
 # ---------- TRANSCRIPTION BACKEND ----------
 # "local" = faster-whisper in this process (CPU). "gpu" = RunPod
