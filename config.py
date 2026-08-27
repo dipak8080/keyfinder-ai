@@ -1006,7 +1006,7 @@ TRANSCRIPTION_JOB_TTL_SECONDS = int(os.environ.get("TRANSCRIPTION_JOB_TTL_SECOND
 # conservatively than the other audio tools (20 min) to keep worst-case
 # wait times bounded. Raise only after confirming your VPS's actual
 # throughput.
-MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "1200"))  # 20 min
+MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "600"))  # 10 min
 
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
 AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
