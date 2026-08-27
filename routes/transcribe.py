@@ -250,7 +250,13 @@ async def speech_to_text_route(
                 # worker or dispatches the local model to a thread, depending on
                 # TRANSCRIPTION_BACKEND. _run_tool_job does `await work()`, so a
                 # coroutine is exactly what belongs here.
-                work=lambda: transcribe_job(input_path, language, task, mode),
+                #
+                # job_id is passed for METERING only: the dispatcher records the
+                # worker's reported GPU seconds against this job's
+                # gpu_job_metrics row. Omit it and the transcript still comes
+                # back fine - the cost column just stays null, which is exactly
+                # what it was before this was wired up.
+                work=lambda: transcribe_job(input_path, language, task, mode, job_id=job_id),
                 on_success=lambda result: mark_transcription_complete(
                     job_id, original_filename, result
                 ),

@@ -26,6 +26,35 @@ threading one through purely for this would change the signature of the
 local backend too, for a reason that has nothing to do with it. A fresh
 uuid4 is a transfer handle, not an identity - and it has the useful
 property of being unguessable even if a job id ever leaked.
+
+--------------------------------------------------------------------------
+CHANGED 2026-08-27: _gpu IS NO LONGER STRIPPED HERE
+
+The worker reports its own timing under a "_gpu" key - fetch_seconds,
+infer_seconds, rtf. This module used to result.pop() that before
+returning, on the reasoning that operator diagnostics are not part of
+the public transcript contract and letting them through would make the
+two backends' responses differ in a way the frontend could accidentally
+start depending on.
+
+That reasoning is still right, and the stripping still happens - just
+one layer up, in transcription.py, which is the module that knows the
+job_id those numbers need to be recorded against. Popping here threw
+away the only measurement of what a transcription actually costs, which
+is why every transcribe row in gpu_job_metrics had a null gpu_seconds
+and a null est_cost_usd while separation rows had real dollars.
+
+The routes still never see "_gpu": transcription.py removes it on the
+way past. The contract the frontend depends on is unchanged, and the
+two backends still return identically-shaped dicts to every caller
+outside this package.
+
+WHY NOT JUST METER HERE. This module has no job_id and should not grow
+one - see the note above on why the transfer token is deliberately not
+the job id. Handing it a second identity purely so it could write a
+metrics row would undo that separation for no gain, when the dispatcher
+one line up already holds both halves.
+--------------------------------------------------------------------------
 """
 import asyncio
 import os
@@ -57,6 +86,12 @@ from speech_to_text import (
     _normalize_mode,
     _validate_input_file,
 )
+
+# The key the worker reports its own timing under. Named here rather
+# than written as a literal in two places, because transcription.py has
+# to strip exactly this key and a typo on either side would silently
+# leak diagnostics into the public transcript.
+GPU_STATS_KEY = "_gpu"
 
 
 def is_available() -> bool:
@@ -97,8 +132,10 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
     """
     Transcribes input_path on the GPU worker.
 
-    Same arguments and same returned dict as speech_to_text.transcribe().
-    Raises AudioToolError with a user-facing message on any failure.
+    Same arguments and same returned dict as speech_to_text.transcribe(),
+    plus a "_gpu" key carrying the worker's own timing - see the module
+    docstring for why that is left in now and who removes it. Raises
+    AudioToolError with a user-facing message on any failure.
 
     Validation happens HERE as well as on the worker, deliberately: a bad
     language code should cost nothing, and discovering it after a submit,
@@ -201,11 +238,10 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
         logger.error(f"[SPEECH_TO_TEXT_GPU] Malformed worker result: {result!r}")
         raise AudioToolError("Transcription failed. Please try again in a moment.")
 
-    # Stripped before returning: this is operator diagnostics, not part of
-    # the public transcript contract, and letting it through would make
-    # the two backends' responses differ in a way the frontend could
-    # accidentally start depending on.
-    gpu_stats = result.pop("_gpu", {}) or {}
+    # READ, not popped - see the 2026-08-27 note in the module docstring.
+    # transcription.py strips this key after recording it against the
+    # job, so nothing outside this package ever sees it.
+    gpu_stats = result.get(GPU_STATS_KEY) or {}
 
     # `mode` is added here rather than on the worker. The worker receives
     # a beam_size, not a mode name - keeping the name->number mapping in

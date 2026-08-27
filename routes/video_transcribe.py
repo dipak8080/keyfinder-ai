@@ -258,8 +258,12 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
             f"language={language or 'auto'}, task={task}, mode={mode}"
         )
 
-        # Backend dispatcher - see transcription.py.
-        result = await transcribe_job(audio_path, language, task, mode)
+        # Backend dispatcher - see transcription.py. job_id is passed for
+        # METERING only: the dispatcher records the worker's reported GPU
+        # seconds against this job's gpu_job_metrics row, which is the
+        # only place that number is visible before it is stripped from
+        # the transcript.
+        result = await transcribe_job(audio_path, language, task, mode, job_id=job_id)
 
         mark_transcription_complete(job_id, original_filename, result)
         succeeded = True

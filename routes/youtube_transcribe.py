@@ -197,7 +197,14 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         # Backend dispatcher - see transcription.py. Awaited directly
         # because the GPU path is network-bound and the local path
         # already wraps itself in run_blocking internally.
-        result = await transcribe_job(file_path, language, task, mode)
+        #
+        # job_id is passed for METERING only: the dispatcher records the
+        # worker's reported GPU seconds against this job's
+        # gpu_job_metrics row. It matters most on THIS route, where the
+        # row is opened at submit with a null input_seconds - without the
+        # cost figure too, a youtube/transcribe row would carry almost no
+        # usable numbers at all.
+        result = await transcribe_job(file_path, language, task, mode, job_id=job_id)
 
         # title, not a filename: for a chained job the video title IS the
         # user-facing name, and it is what mark_transcription_complete
