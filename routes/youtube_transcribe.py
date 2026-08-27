@@ -36,10 +36,28 @@ after the download wastes the fetch; rejecting before would need a
 separate yt-dlp metadata round trip. The download is cached by video_id,
 so the wasted work is paid at most once per video - which is why the
 cheap-and-simple order was chosen here.
+
+--------------------------------------------------------------------------
+METERED (2026-08-27), 1 credit under the shared "transcribe" rule - the
+same key as /speech-to-text and /video-to-text, because all three draw on
+one RunPod endpoint and one MAX_CONCURRENT_TRANSCRIPTIONS pool.
+
+THIS ROUTE CHARGES WITH THE DURATION UNKNOWN, and that is the one real
+asymmetry against the other two. They ffprobe at submit time; here the
+file does not exist until the download finishes inside the background
+task. paywall.decide() handles it correctly by design - "Unknown duration
+on a metered tool is billable - never fail open" - so the charge lands at
+submit with input_seconds=None.
+
+The consequence is that a job charged at submit can still fail its
+duration check, or fail to download at all, AFTER the credit is taken.
+Both paths therefore refund explicitly below. record_input_duration()
+fills the real number in once validate_duration has it, so the cost
+report is not left describing uploads only.
+--------------------------------------------------------------------------
 """
 import asyncio
 import time
-from functools import partial
 
 from fastapi import APIRouter, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
@@ -52,7 +70,6 @@ from config import (
     YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
 )
 from utils import run_blocking, acquire_slot_or_503, _transcription_semaphore
-from rate_limit import check_rate_limit
 from jobs import create_job, mark_transcription_complete, mark_failed, fail_if_unfinished, get_job
 from monitoring import record_result
 from audio_common import AudioToolError, validate_duration
@@ -69,6 +86,13 @@ from speech_to_text import (
     _normalize_mode,
 )
 
+# Credits. settle_or_refund imported directly: this module runs its own
+# background task and does not inherit _run_tool_job's `finally`.
+from credits import paywall, metering
+from credits.identity import Identity
+from credits.limits import tiered_rate_limit
+from credits.ledger import settle_or_refund
+
 from ._shared import (
     spawn_background_task,
     _tool_status,
@@ -81,6 +105,7 @@ router = APIRouter()
 TOOL = "YOUTUBE_TRANSCRIBE"
 METRIC = "/youtube/transcribe"
 JOB_TYPE = "youtube_transcribe"
+TOOL_KEY = "transcribe"   # shared credits rule key - see module docstring
 
 
 def _validated_options(language, task, mode):
@@ -113,6 +138,15 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         # _chain_download already marked the job and recorded the metric.
         # This guard exists only so a future change there that forgets to
         # mark can't leave the job stranded on "processing".
+        #
+        # THE REFUND IS THE PART THAT MATTERS NOW. This route charges at
+        # submit, before the download is attempted, so a YouTube failure
+        # - a blocked video, an expired cookie, a dead CDN edge - lands
+        # AFTER the credit is taken. Returning early without this line
+        # would leave the hold sitting until the 90-minute sweeper found
+        # it, on the single most common failure path this endpoint has.
+        settle_or_refund(job_id, False, reason="youtube_download_failed")
+        metering.record_job_finished(job_id, status="failed", error="download_failed")
         fail_if_unfinished(job_id, "Download failed.")
         return
 
@@ -134,7 +168,19 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
             mark_failed(job_id, str(e))
             logger.warning(f"[{TOOL}] job={job_id} rejected on duration: {e}")
             record_result(METRIC, False)
+            # Charged at submit with the duration unknown, rejected here
+            # once it was known - the credit goes straight back. Handled
+            # inside this except rather than left to the `finally` below
+            # because this path returns early.
+            settle_or_refund(job_id, False, reason="too_long_for_transcription")
+            metering.record_job_finished(job_id, status="failed", error="duration_exceeded")
             return
+
+        # The real input duration, finally available. Without this the
+        # /youtube/transcribe rows would carry a null input_seconds and
+        # the cost report's input_minutes would silently describe direct
+        # uploads only - see credits/metering.py.
+        metering.record_input_duration(job_id, duration)
 
         await acquire_slot_or_503(_transcription_semaphore, "youtube-transcribe")
         acquired = True
@@ -188,6 +234,16 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         logger.error(f"[{TOOL}] job={job_id} FAILED (unexpected): {e}", exc_info=True)
 
     finally:
+        # MONEY FIRST, same ordering rule as _run_tool_job's finally.
+        # Covers the success path, every exception above, and the
+        # CancelledError a redeploy fires - which re-raises INTO this
+        # block, so an in-flight paid job killed by a deploy gets its
+        # credit back in that instant rather than 90 minutes later.
+        settle_or_refund(job_id, succeeded, reason="youtube_transcribe_failed")
+        metering.record_job_finished(
+            job_id, status="completed" if succeeded else "failed"
+        )
+
         fail_if_unfinished(job_id, "Transcription failed unexpectedly.")
         # The downloaded WAV is this job's own temp copy - the shared
         # cache entry in cache.py is separate and untouched by this
@@ -203,10 +259,10 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
 
 @router.post(
     "/youtube/transcribe",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    dependencies=[Depends(tiered_rate_limit(
+        TOOL_KEY,
+        free_max=YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+        free_window=YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def youtube_transcribe_route(
@@ -214,6 +270,7 @@ async def youtube_transcribe_route(
     language: str = Form(None),
     task: str = Form("transcribe"),
     mode: str = Form(None),
+    identity: Identity = paywall.IdentityDep,
 ):
     """Poll GET /youtube/transcribe/status/{job_id}, then
     GET /youtube/transcribe/result/{job_id} once complete.
@@ -269,16 +326,48 @@ async def youtube_transcribe_route(
     job_id = create_job(job_type=JOB_TYPE, ttl_seconds=TRANSCRIPTION_JOB_TTL_SECONDS)
 
     remember_job_tags(job_id)
-    spawn_background_task(_run_youtube_transcribe(job_id, url, language, task, mode))
+
+    # CHARGE, then enqueue. input_seconds=None on purpose - the file does
+    # not exist yet, and paywall.decide() treats unknown duration on a
+    # metered tool as billable rather than failing open. The runner
+    # refunds if the download or the duration check then fails.
+    try:
+        async with paywall.guard(
+            identity, job_id=job_id, tool=TOOL_KEY, input_seconds=None
+        ) as charge:
+            metering.record_job_created(
+                job_id=job_id,
+                tool=TOOL_KEY,
+                subject_id=identity.subject_id,
+                account_id=identity.account_id,
+                ip_hash=identity.ip_hash,
+                input_seconds=None,     # filled in by record_input_duration later
+                charge_type=charge.charge_type,
+            )
+
+            spawn_background_task(
+                _run_youtube_transcribe(job_id, url, language, task, mode)
+            )
+    except HTTPException:
+        # 402. Nothing was downloaded and no file exists yet, so there is
+        # nothing to clean up beyond marking the job.
+        mark_failed(job_id, "Out of credits.")
+        raise
 
     logger.info(
         f"[{TOOL}] job={job_id} queued for {url} "
-        f"(language={language or 'auto'}, task={task}, mode={mode})"
+        f"(language={language or 'auto'}, task={task}, mode={mode}, "
+        f"charge={charge.charge_type})"
     )
     return JSONResponse({
         "job_id": job_id,
         "status": "processing",
         "options": {"language": language, "task": task, "mode": mode},
+        "billing": {
+            "charged": charge.charge_type,
+            "balance": charge.balance_after,
+            "free_remaining": charge.free_remaining_after,
+        },
     })
 
 

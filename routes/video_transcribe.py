@@ -42,11 +42,27 @@ probe_audio_stream() also raises on a video with no audio track at all,
 which is the single most common bad upload for this endpoint (screen
 recordings, silent clips, GIF-derived MP4s) - caught at submit time with
 an immediate 400 rather than a job that fails a minute later.
+
+--------------------------------------------------------------------------
+METERED (2026-08-27), 1 credit under the shared "transcribe" rule - the
+SAME rule key as /speech-to-text and /youtube/transcribe, deliberately.
+All three hit one RunPod endpoint and one MAX_CONCURRENT_TRANSCRIPTIONS
+pool, so they should draw on one bucket rather than handing a single
+caller three independent budgets for one resource. (config.py already
+records that exact complaint about the per-path separation limits.)
+
+REFUNDS ARE **NOT** INHERITED HERE. This module has its own background
+runner - it does not go through _run_tool_job - so the settle_or_refund()
+that lives in that runner's `finally` never fires for these jobs. The
+call is therefore made explicitly in _run_video_transcribe's own
+`finally` below. Miss it and the 90-minute sweeper still returns the
+credit, so nobody is robbed - they just wait an hour and a half staring
+at a failed job, which is experientially indistinguishable from theft.
+--------------------------------------------------------------------------
 """
 import asyncio
 import os
 import time
-from functools import partial
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
@@ -68,7 +84,6 @@ from utils import (
     _transcription_semaphore,
     _audio_tools_semaphore,
 )
-from rate_limit import check_rate_limit
 from jobs import (
     create_job,
     mark_transcription_complete,
@@ -103,6 +118,14 @@ from speech_to_text import (
     _normalize_mode,
 )
 
+# Credits. settle_or_refund is imported DIRECTLY here, unlike in
+# routes/transcribe.py, because this module runs its own background task
+# - see the module docstring.
+from credits import paywall, metering
+from credits.identity import Identity
+from credits.limits import tiered_rate_limit
+from credits.ledger import settle_or_refund
+
 from ._shared import (
     spawn_background_task,
     _accept_upload,
@@ -115,6 +138,7 @@ router = APIRouter()
 TOOL = "VIDEO_TRANSCRIBE"
 METRIC = "/video-to-text"
 JOB_TYPE = "video_transcribe"
+TOOL_KEY = "transcribe"   # shared credits rule key - see module docstring
 
 # Fallback when the source codec has no stream-copy target. WAV is
 # chosen over a compressed format on purpose: this file is a throwaway
@@ -271,6 +295,30 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
         logger.error(f"[{TOOL}] job={job_id} FAILED (unexpected): {e}", exc_info=True)
 
     finally:
+        # MONEY FIRST, before anything that could itself raise - the same
+        # ordering rule _run_tool_job's finally follows, for the same
+        # reason. A failed paid job must return its credit even if
+        # cleanup or the metrics call then goes wrong.
+        #
+        # This module needs the call EXPLICITLY because it does not use
+        # _run_tool_job; there is no inherited `finally` to ride on.
+        #
+        # It sits in the finally rather than the except-chain so it also
+        # covers the CancelledError path above, which re-raises INTO this
+        # block - a redeploy killing an in-flight paid job returns the
+        # credit in that instant rather than 90 minutes later.
+        settle_or_refund(job_id, succeeded, reason="video_transcribe_failed")
+
+        # Closes the gpu_job_metrics row the route opened. gpu_seconds is
+        # left to transcription.py's GPU path, which is the only place
+        # that sees what RunPod actually reported - a wall-clock number
+        # taken here would also span queue wait and cold start, which are
+        # real latency but not the GPU-seconds figure that belongs in a
+        # cost comparison.
+        metering.record_job_finished(
+            job_id, status="completed" if succeeded else "failed"
+        )
+
         # Only ever one semaphore is held at a time, and `holding` tracks
         # which - releasing blind would over-release whichever phase had
         # already returned its slot, permanently inflating that pool.
@@ -289,10 +337,10 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
 
 @router.post(
     "/video-to-text",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    dependencies=[Depends(tiered_rate_limit(
+        TOOL_KEY,
+        free_max=VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+        free_window=VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
 async def video_to_text_route(
@@ -300,6 +348,7 @@ async def video_to_text_route(
     language: str = Form(None),
     task: str = Form("transcribe"),
     mode: str = Form(None),
+    identity: Identity = paywall.IdentityDep,
 ):
     """Poll GET /video-to-text/status/{job_id}, then
     GET /video-to-text/result/{job_id} once complete.
@@ -352,6 +401,9 @@ async def video_to_text_route(
     # of discovering either after a multi-minute extraction. See the
     # module docstring for why extract_audio()'s own duration cap is not
     # sufficient here.
+    #
+    # It is also what gives the paywall a duration to decide on, which is
+    # why the charge sits below this rather than above it.
     try:
         codec, duration = await run_blocking(probe_audio_stream, video_path)
     except AudioToolError as e:
@@ -370,20 +422,49 @@ async def video_to_text_route(
 
     target_format = _cheapest_target_format(codec)
 
-    spawn_background_task(_run_video_transcribe(
-        job_id, video_path, original_filename, target_format, language, task, mode
-    ))
+    # CHARGE, then enqueue. Same race-handling as routes/transcribe.py -
+    # the affordability pre-check in the dependency has already turned
+    # away anyone who plainly cannot pay, so a 402 here is two tabs
+    # spending the last credit at once.
+    try:
+        async with paywall.guard(
+            identity, job_id=job_id, tool=TOOL_KEY, input_seconds=duration
+        ) as charge:
+            metering.record_job_created(
+                job_id=job_id,
+                tool=TOOL_KEY,
+                subject_id=identity.subject_id,
+                account_id=identity.account_id,
+                ip_hash=identity.ip_hash,
+                input_seconds=duration,
+                input_bytes=size,
+                charge_type=charge.charge_type,
+            )
+
+            spawn_background_task(_run_video_transcribe(
+                job_id, video_path, original_filename, target_format, language, task, mode
+            ))
+    except HTTPException:
+        cleanup_file(video_path)
+        mark_failed(job_id, "Out of credits.")
+        raise
 
     logger.info(
         f"[{TOOL}] job={job_id} queued '{original_filename}' "
         f"{size / (1024 * 1024):.1f}MB ({codec}, {duration:.1f}s -> {target_format}) "
-        f"language={language or 'auto'}, task={task}, mode={mode}"
+        f"language={language or 'auto'}, task={task}, mode={mode} "
+        f"charge={charge.charge_type}"
     )
 
     return JSONResponse({
         "job_id": job_id,
         "status": "processing",
         "options": {"language": language, "task": task, "mode": mode},
+        "billing": {
+            "charged": charge.charge_type,
+            "balance": charge.balance_after,
+            "free_remaining": charge.free_remaining_after,
+        },
     })
 
 

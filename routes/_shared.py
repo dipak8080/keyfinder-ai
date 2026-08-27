@@ -97,6 +97,39 @@ What it still cannot cover, and why the sweeper stays: a task
 garbage-collected mid-run, or the container killed outright. No Python
 executes in either case.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-27: metered_tool= on _run_tool_job, closing the
+gpu_job_metrics row.
+
+Every separation route already opens a metrics row at submit and closes
+it from separation.py, which is where the RunPod-reported gpu_seconds
+actually arrive. /speech-to-text has no equivalent - it goes through
+this shared runner and transcription.py, so nothing here knew when its
+row should be closed.
+
+The row was therefore opened and left at status='created' forever, which
+is worse than not opening it: totals() counts it as a job, so the
+cost-per-job figure would be diluted by rows that never recorded an
+outcome. The number that decides the price would have been wrong in the
+optimistic direction.
+
+DELIBERATELY OPT-IN rather than unconditional, which is the opposite of
+the settle_or_refund() decision directly above it - so the difference is
+worth stating. settle_or_refund() is safe to call blind because it looks
+up a charge row and returns silently when there is none. This one issues
+an UPDATE against gpu_job_metrics for every job, including the eighteen
+ffmpeg tools that will never have a row there. That UPDATE would match
+zero rows and be harmless, but it is a connection open, a transaction
+and a write attempt on the credits DB for every /convert and /trim on
+the site - and credits.db is the file that holds the money, deliberately
+kept away from load (see the three-writers note in credits' PART 7).
+Paying that on the hottest path in the app to save one keyword argument
+on one call site is the wrong trade.
+
+Passed today by routes/transcribe.py only. The other two transcription
+routes have their own runners and call metering directly.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -243,6 +276,7 @@ async def _run_tool_job(
     generic_error: str,
     cleanup_paths: Sequence[str] = (),
     success_detail: Optional[Callable] = None,
+    metered_tool: Optional[str] = None,
     gpu_billed: bool = False,
 ):
     """
@@ -270,6 +304,24 @@ async def _run_tool_job(
                        or lose
       success_detail - optional callable(result) -> str, appended to the
                        COMPLETE log line (e.g. "4 stems", "182.3s total")
+      metered_tool   - route key ("transcribe", ...) when this job has a
+                       gpu_job_metrics row that needs closing. None for
+                       every unmetered tool, which is the default and the
+                       overwhelmingly common case.
+
+                       OPT-IN ON PURPOSE - see the 2026-08-27 note in the
+                       module docstring. Making it unconditional would
+                       put a credits-DB write on the hot path of eighteen
+                       ffmpeg tools that will never have a row to update,
+                       on the one database file deliberately kept away
+                       from load because it holds the money.
+
+                       NOT the same thing as the paywall. A tool can be
+                       metered here (cost recorded) while charging
+                       nobody: that is exactly the state every route ran
+                       in for weeks before PAYWALL_ENABLED was flipped,
+                       and it is how the price was set from real numbers
+                       instead of a guess.
       gpu_billed     - Records this task's own wall-clock time against
                        the GPU spend budget.
 
@@ -304,13 +356,14 @@ async def _run_tool_job(
 
     The `finally` block runs in a fixed order that matters:
       settle_or_refund() FIRST as of 2026-08-25 - see below for why the
-      money moves before anything else. Then fail_if_unfinished(), so a
-      job is guaranteed terminal even if an exception escaped every
-      except clause above (the acquire_slot_or_503-inside-a-background-
-      task case, which no `except AudioToolError` or `except Exception`
-      here would catch if it were raised before the try). Then file
-      cleanup, then memory release, then the metric, then GPU billing -
-      each independent of the others.
+      money moves before anything else. Then the metrics close, then
+      fail_if_unfinished(), so a job is guaranteed terminal even if an
+      exception escaped every except clause above (the
+      acquire_slot_or_503-inside-a-background-task case, which no
+      `except AudioToolError` or `except Exception` here would catch if
+      it were raised before the try). Then file cleanup, then memory
+      release, then the metric, then GPU billing - each independent of
+      the others.
 
       Worth knowing what this does NOT cover: if the task itself is
       garbage-collected mid-run, none of this executes at all, because
@@ -406,6 +459,25 @@ async def _run_tool_job(
             # right.
             settle_or_refund(job_id, succeeded, reason=f"{tool.lower()}_failed")
 
+            # Close the cost row, for the routes that opened one. Second
+            # in the order rather than first: money before measurement,
+            # always - a metering failure must never be able to strand a
+            # refund. metering swallows its own exceptions internally
+            # (see credits/metering.py) so this cannot raise into the
+            # steps below either.
+            #
+            # gpu_seconds is deliberately NOT passed. The honest number
+            # comes from what the worker reports for its own run, which
+            # only the backend module sees; wall clock measured here also
+            # spans queue wait and cold start, and recording that as
+            # GPU-seconds would inflate every cost estimate in a
+            # direction that looks entirely plausible.
+            if metered_tool:
+                from credits import metering
+                metering.record_job_finished(
+                    job_id, status="completed" if succeeded else "failed"
+                )
+
             fail_if_unfinished(job_id, generic_error)
             for path in cleanup_paths:
                 cleanup_file(path)
@@ -473,6 +545,12 @@ async def _validate_duration_or_reject(
       against the upload form - rather than a job that is accepted, then
       fails a second later for a reason the user could have been told
       instantly.
+
+    RETURNS THE DURATION, which matters more since the paywall landed:
+    routes/transcribe.py feeds this value straight into paywall.guard()
+    as input_seconds, so the probe that enforces the cap is also the
+    probe that prices the job. One ffprobe, two decisions - and they can
+    never disagree about how long the file is.
     """
     try:
         if max_seconds is None:
@@ -525,20 +603,27 @@ def _reject_if_separation_queue_full():
 
 def _reject_if_transcription_queue_full():
     """
-    The bounded queue for both transcription routes.
+    The bounded queue for all three transcription routes.
 
-    IMPORTED BY routes/transcribe.py AND routes/youtube_transcribe.py.
-    Same deletion hazard as the separation guard above.
+    IMPORTED BY routes/transcribe.py, routes/youtube_transcribe.py AND
+    routes/video_transcribe.py. Same deletion hazard as the separation
+    guard above.
 
     Same mechanism and same reasoning as
     _reject_if_separation_queue_full() above - see that docstring for the
     full argument. Two things differ and both matter:
 
-    COUNTS BOTH ENDPOINTS TOGETHER. /speech-to-text and
-    /youtube/transcribe share a single semaphore, so counting one in
-    isolation would let the other fill the queue unnoticed. A user
-    uploading a file genuinely is behind everyone who pasted a YouTube
-    link, and the guard has to reflect that.
+    COUNTS ALL THREE ENDPOINTS TOGETHER. /speech-to-text,
+    /youtube/transcribe and /video-to-text share a single semaphore, so
+    counting one in isolation would let the others fill the queue
+    unnoticed. A user uploading a file genuinely is behind everyone who
+    pasted a YouTube link, and the guard has to reflect that.
+
+    It is the same argument that made all three share ONE credits rule
+    key ("transcribe") rather than three: one resource, one bucket. A
+    caller who got three independent budgets for one GPU endpoint would
+    be exactly the drift config.py already complains about in its note
+    on the per-path separation limits.
 
     THE RATE LIMITER DOES NOT ALREADY COVER THIS. That limit is per-IP;
     this is a whole-server capacity bound. Ten visitors each submitting
@@ -588,7 +673,7 @@ def _reject_if_audio_tools_queue_full():
     failure case.
 
     COUNTS ALL EIGHTEEN TOOLS TOGETHER, for the same reason the
-    transcription guard counts both its endpoints: one semaphore, one
+    transcription guard counts all its endpoints: one semaphore, one
     queue. Someone submitting /convert genuinely is behind everyone who
     submitted /join, and a per-tool count would let any one tool fill the
     pool while every individual count looked fine.
@@ -734,7 +819,8 @@ async def _submit_audio_tool(
     ffmpeg/rubberband work costing fractions of a cent, and they are the
     reason people arrive at the site. _run_tool_job's settle_or_refund()
     call is a no-op for every job submitted through here, because no
-    charge row exists. See credits/config.py's DEFAULT_TOOL_RULES for
+    charge row exists, and metered_tool is left at None so no metrics row
+    is touched either. See credits/config.py's DEFAULT_TOOL_RULES for
     what is metered and why.
     """
     set_job_context(tool=tool, tier="standard")

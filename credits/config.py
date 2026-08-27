@@ -79,11 +79,20 @@ def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
 # (or vice versa) is a pricing decision worth being able to make with one env
 # var, not a code change. They all draw from ONE credit balance regardless.
 #
-# free_under_seconds is 0 for all four: unlike transcription, HQ separation is
-# expensive at every length - MAX_SEPARATION_DURATION_SECONDS_HQ already caps
-# input at 6 minutes, so there is no "short enough to be free" band to carve
-# out. Left in the schema because transcription will need it if it's ever
-# metered.
+# TRANSCRIPTION IS THE EXCEPTION, and it is a deliberate one. All three
+# transcription endpoints (/speech-to-text, /youtube/transcribe,
+# /video-to-text) share the single key "transcribe" rather than getting one
+# key each. The separation routes are separate products with separate costs;
+# the transcription routes are three front doors onto ONE RunPod endpoint and
+# ONE MAX_CONCURRENT_TRANSCRIPTIONS pool. Giving them a key each would hand a
+# single caller three independent budgets for one resource - which is exactly
+# the drift the host config.py already complains about in its note on the
+# per-path YouTube limits. One resource, one bucket.
+#
+# free_under_seconds is 0 for all four HQ routes: unlike short transcription,
+# HQ separation is expensive at every length - MAX_SEPARATION_DURATION_SECONDS_HQ
+# already caps input at 6 minutes, so there is no "short enough to be free" band
+# to carve out.
 #
 # ---------------------------------------------------------------------------
 # RATE LIMITS: THREE GUARDS, THREE JOBS. Do not conflate them.
@@ -97,7 +106,8 @@ def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
 #
 #   1. GPU SPEND is guarded by FREE_MONTHLY_OPS (2/user, 4/IP) and by the
 #      credit balance. This is the guard that actually bounds the bill, and
-#      it is exact: 2 free runs x ~$0.018 = ~$0.036 per user per month.
+#      it is exact: 2 free runs x ~$0.018-0.024 = under $0.05 per user per
+#      month, across every metered tool combined.
 #
 #   2. UPLOAD / BANDWIDTH ABUSE cannot be guarded here at all, which is worth
 #      stating plainly because it is easy to assume otherwise. Rate limiting
@@ -107,11 +117,11 @@ def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
 #      notes; that is a WAF rate-limiting rule, not application code.
 #
 #   3. QUEUE FAIRNESS is MAX_CONCURRENT_SEPARATIONS (2, matched to the RunPod
-#      worker count) and MAX_QUEUED_SEPARATIONS (6 in flight before a 503).
-#      Those are global. A per-subject concurrency cap is the precise tool if
-#      one buyer ever starves the queue; an hourly rate limit is the blunt
-#      one, and it hurts the paying customer batching an album far more than
-#      it hurts anyone abusive.
+#      worker count), MAX_QUEUED_SEPARATIONS (6 in flight before a 503), and
+#      their transcription equivalents. Those are global. A per-subject
+#      concurrency cap is the precise tool if one buyer ever starves the
+#      queue; an hourly rate limit is the blunt one, and it hurts the paying
+#      customer batching an album far more than it hurts anyone abusive.
 #
 # What is left for the hourly limit, once those three are placed correctly, is
 # a SAFETY NET - not a primary control. So it should be set for humans.
@@ -152,10 +162,45 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
-    # Not metered at launch. Present so the machinery exists the day it is,
-    # and so /credits/me reports it as free rather than as unknown.
+    # ---- TRANSCRIPTION ----------------------------------------------------
+    # ONE key for three routes - /speech-to-text, /youtube/transcribe and
+    # /video-to-text. See the "TRANSCRIPTION IS THE EXCEPTION" note above.
+    #
+    # PRICED FROM MEASUREMENT, NOT FROM A GUESS. RunPod's own dashboard for
+    # the Whisper endpoint, over a 9-day window: 57 requests, 7,200 GPU
+    # seconds, so ~126 GPU-seconds and ~$0.024 per transcription. That is
+    # MORE per job than an HQ separation (~$0.018), which is what settles two
+    # questions that were otherwise open:
+    #
+    #   1 credit, not 2. $0.024 against $0.20-0.30 of revenue is still a wide
+    #   margin, and pricing this above separation would need a reason a user
+    #   can see - "the transcription costs double" is not one when both take
+    #   about the same wall-clock time from their side. It is also what keeps
+    #   the refund path safe: refund_job() currently hardcodes a -1 free-op
+    #   adjustment while charge_for_job() bumps by credits_needed, so any rule
+    #   with credits > 1 would silently under-refund the free tier on a failed
+    #   job. Fix that before raising this number.
+    #
+    #   free_under_seconds: 0, changed from 600. The original 600 assumed
+    #   transcription was cheap at short lengths and worth carving out a free
+    #   band for. The measurement says the cost is real at ordinary lengths,
+    #   and - more decisively - transcription is not what brings people to the
+    #   site. The eighteen ffmpeg tools and the standard separation routes are
+    #   the draw, and they stay free forever. A free band here would have cost
+    #   money to defend a funnel that runs through different tools entirely.
+    #
+    #   Worth knowing what 0 does NOT mean: it is not "nothing is free".
+    #   FREE_MONTHLY_OPS still applies, so every visitor gets 2 free metered
+    #   runs a month before they ever see a paywall. 0 only removes the
+    #   duration exemption on top of that.
+    #
+    # THE COST NUMBER TO WATCH IS NOT THE ONE ABOVE. 95 cold starts against 57
+    # requests in that same window means workers are dying between jobs and
+    # every spin-up is billed. That is a bigger lever on the bill than any
+    # rule in this file, and no paywall setting touches it - it is the
+    # endpoint's idle timeout.
     "transcribe": {
-        "enabled": False, "free_under_seconds": 600, "credits": 1,
+        "enabled": False, "free_under_seconds": 0, "credits": 1,
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
@@ -445,6 +490,12 @@ def get_settings() -> Settings:
     # Deliberately checked for EVERY rule including disabled ones. A tool
     # that is off today gets enabled by flipping one env var, and that flip
     # should not be the moment a latent contradiction goes live.
+    #
+    # Worth knowing for the transcription rule specifically: the host
+    # config.py sets AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = 2/hour,
+    # which already matches FREE_MONTHLY_OPS. The derived value here is
+    # what the limiter actually enforces on a metered route, so the two
+    # agree without anyone having to keep them in sync by hand.
     for rule in settings.tool_rules.values():
         if rule.free_rate_limit < settings.free_monthly_ops:
             raise RuntimeError(
