@@ -300,6 +300,11 @@ def settle_or_refund(job_id: str, succeeded: bool, reason: str = "job_failed") -
     sweep_stale_holds() stays as the backstop for what no `finally` can
     cover: a task garbage-collected mid-run, or the container killed
     outright.
+
+    NOTE: the two transcription routes with their own background runners
+    (routes/video_transcribe.py, routes/youtube_transcribe.py) call this
+    directly from their own `finally` blocks - they do not go through
+    _run_tool_job, so they inherit nothing from it.
     """
     if succeeded:
         settle_job(job_id)
@@ -326,6 +331,14 @@ def refund_job(job_id: str, reason: str = "job_failed") -> bool:
             grant(conn, owner_type=row["owner_type"], owner_id=row["owner_id"], amount=row["credits"],
                  kind="job_refund", idempotency_key=f"job_refund:{job_id}", job_id=job_id, note=reason)
         elif row["charge_type"] == "free":
+            # KNOWN LIMITATION, safe only while every rule costs 1 credit.
+            # charge_for_job() bumps the free counters by credits_needed,
+            # this returns exactly 1. Add a tool with credits > 1 and a
+            # failed free-tier job permanently eats an op the user never
+            # spent. job_charges.credits is 0 for free charges so it
+            # cannot be read back from there - the fix is a free_ops
+            # column on job_charges, written at charge time. Do that
+            # BEFORE raising any rule above 1.
             _bump_free(conn, row["period"], "owner", f"{row['owner_type']}:{row['owner_id']}", -1)
             _bump_free(conn, row["period"], "ip", row["ip_hash"], -1)
 
@@ -357,13 +370,72 @@ def sweep_stale_holds() -> int:
     return len(stale)
 
 
+# Merge bookkeeping lives in free_usage under its OWN scope rather than a
+# separate table, so this needs no migration: the primary key is already
+# (period, scope, scope_key), and nothing else reads a scope it does not
+# name explicitly. free_remaining() reads only 'owner' and 'ip', so a
+# 'merged' row is inert to every existing query.
+_MERGE_SCOPE = "merged"
+
+
 def merge_free_usage(conn: sqlite3.Connection, subject_id: str, account_id: str) -> None:
     """On sign-in, fold the browser's anonymous free usage into the account
-    so logging in doesn't hand out a second free allowance."""
+    so logging in doesn't hand out a second free allowance.
+
+    THE LOGOUT HOLE THIS FIXES (2026-08-27)
+    ---------------------------------------
+    The original implementation added the subject's usage to the account
+    and then DELETED the subject's free_usage row. That looked like tidy
+    bookkeeping and was a free-credit dispenser:
+
+        spend both free ops anonymously   -> subject:X used=2
+        sign in                           -> account:Y used=2, subject:X DELETED
+        sign out                          -> af_sid is a 2-year cookie, so
+                                             the same subject:X comes back
+                                             with no row at all
+        free_remaining()                  -> 2 again
+
+    Repeatable on demand. The IP counter is never merged and never
+    deleted, so free_monthly_ops_per_ip (4) was the only thing bounding
+    it - which means the advertised "2 free per month" was really "4 per
+    month per IP, for anyone who noticed". Not catastrophic, entirely
+    trivial to discover.
+
+    THE FIX: never delete. The subject row stays exactly as it was, so a
+    signed-out browser is still counted against what it actually spent.
+    Idempotency - the thing the DELETE was really providing - comes from
+    a merge marker recording how much of this subject's usage has
+    already been folded into this account.
+
+    RECONCILES BY DELTA, not by a boolean. The interleaving that makes a
+    simple "already merged?" flag wrong:
+
+        subject:X used=1 -> sign in  -> account +1, marker=1
+        sign out, spend 1 more       -> subject:X used=2
+        sign in again                -> used(2) - marker(1) = 1 -> account +1
+
+    A boolean would skip that second op entirely and hand back a free
+    run. Storing the amount makes repeat sign-ins exact rather than
+    merely safe.
+
+    Called inside the caller's transaction (sign-in), so a failure here
+    rolls back with the rest of it rather than leaving a half-merged
+    counter.
+    """
     period = period_key()
-    used = _free_used(conn, period, "owner", f"subject:{subject_id}")
+    subject_key = f"subject:{subject_id}"
+    used = _free_used(conn, period, "owner", subject_key)
     if used <= 0:
         return
-    _bump_free(conn, period, "owner", f"account:{account_id}", used)
-    conn.execute("DELETE FROM free_usage WHERE period=? AND scope='owner' AND scope_key=?",
-                (period, f"subject:{subject_id}"))
+
+    merge_key = f"{subject_id}>{account_id}"
+    already = _free_used(conn, period, _MERGE_SCOPE, merge_key)
+    delta = used - already
+    if delta <= 0:
+        # Everything this subject spent is already reflected on the
+        # account. Signing in and out repeatedly must not keep adding.
+        return
+
+    _bump_free(conn, period, "owner", f"account:{account_id}", delta)
+    _bump_free(conn, period, _MERGE_SCOPE, merge_key, delta)
+    log.info("merged %d free op(s) from %s into account %s", delta, subject_id, account_id)

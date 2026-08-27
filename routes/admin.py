@@ -82,6 +82,32 @@ frontend should read rather than repeat.
 Both fail closed. A credits-package problem must never break the root
 endpoint, which doubles as the health signal for the whole deploy.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-27): TRANSCRIPTION IS METERED - THREE CONSEQUENCES
+
+All three are the same mistake in different places: a hand-maintained
+list that did not move when a tool did.
+
+1. root() no longer filters "transcribe" out of paywall_tools. That
+   filter was correct while the rule was a placeholder and became a
+   lie the moment PAYWALL_TOOL_TRANSCRIBE_ENABLED went true - the API
+   was charging a credit while telling the frontend it wasn't, which
+   is the one combination guaranteed to produce a 402 the UI never
+   warned about. Every rule is now reported, enabled or not.
+
+2. _iter_tool_routes() gained video_transcribe, youtube_transcribe and
+   tiktok. Those three modules register real product routes and none of
+   them were being walked, so /video-to-text, /youtube/transcribe and
+   /tiktok-to-mp3 never appeared in the dashboard's tool picker and
+   their traffic fell into "Other". Precisely the silent-omission
+   failure that function's own docstring exists to prevent - which is
+   what makes it worth stating rather than quietly fixing.
+
+3. /limits now reports the transcription duration cap and the three
+   transcription rate limits, for the same reason it already reports
+   separation_hq_max_duration_seconds: a cap the user meets by being
+   rejected is a cap the UI should have shown first.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -91,6 +117,7 @@ from config import (
     NOISE_PATH_MARKERS,
     MAX_UPLOAD_BYTES,
     MAX_VIDEO_UPLOAD_BYTES,
+    MAX_VIDEO_TRANSCRIBE_BYTES,
     JOIN_MAX_FILES,
     JOIN_MAX_TOTAL_BYTES,
     ALLOWED_AUDIO_INPUT_FORMATS,
@@ -103,6 +130,10 @@ from config import (
     YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+    AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+    VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+    YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+    MAX_TRANSCRIPTION_DURATION_SECONDS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
@@ -218,10 +249,36 @@ def _iter_tool_routes():
     partners) and would otherwise be invisible to the dashboard's tool
     picker - which is exactly the silent-omission failure this function
     exists to prevent.
+
+    THE SAME OMISSION HAD HAPPENED THREE MORE TIMES, found 2026-08-27:
+    video_transcribe, youtube_transcribe and tiktok were all missing.
+    So /video-to-text, /youtube/transcribe and /tiktok-to-mp3 - three
+    live product routes, two of them now METERED - never reached the
+    dashboard's picker, and every request they served was bucketed into
+    "Other" with no way to filter it back out.
+
+    That this list has now silently gone stale twice is the real finding.
+    The failure is invisible by construction: no error, no empty result,
+    just a slightly shorter dropdown that nobody counts. Anything added
+    under routes/ that registers a product route MUST be added here in
+    the same commit - and if this list goes stale a third time, the fix
+    is to stop maintaining it by hand and enumerate the package with
+    pkgutil instead.
     """
     # Imported here, not at module level - see admin_endpoints()'s
     # docstring for the import-order reasoning.
-    from . import youtube, separation, separation_upgrade, audio_tools, midi, transcribe, media
+    from . import (
+        youtube,
+        separation,
+        separation_upgrade,
+        audio_tools,
+        midi,
+        transcribe,
+        video_transcribe,
+        youtube_transcribe,
+        tiktok,
+        media,
+    )
 
     sub_routers = [
         youtube.router,
@@ -230,6 +287,9 @@ def _iter_tool_routes():
         audio_tools.router,
         midi.router,
         transcribe.router,
+        video_transcribe.router,
+        youtube_transcribe.router,
+        tiktok.router,
         media.router,
         router,  # this module's own
     ]
@@ -684,9 +744,9 @@ async def limits():
     instead of repeating them.
 
     NOTE on rate_limits (2026-08-25): these are the FREE-tier numbers.
-    Callers holding credits get a looser per-account limit on the four
-    metered HQ routes - see credits/limits.py. The applicable limit for
-    a specific visitor comes from GET /credits/me's `rate_limit` block,
+    Callers holding credits get a looser per-account limit on the
+    metered routes - see credits/limits.py. The applicable limit for a
+    specific visitor comes from GET /credits/me's `rate_limit` block,
     which resolves it through the same code the limiter uses. This
     endpoint stays static and cacheable precisely because it does NOT
     know who is asking; a per-visitor number does not belong here.
@@ -696,6 +756,14 @@ async def limits():
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         "max_video_upload_bytes": MAX_VIDEO_UPLOAD_BYTES,
         "max_video_upload_mb": MAX_VIDEO_UPLOAD_BYTES // (1024 * 1024),
+        # /video-to-text has its OWN byte cap, lower than /video-to-audio's
+        # 200MB. config.py's reasoning: a 200MB video is almost certainly
+        # longer than the transcription duration cap, so accepting the
+        # upload only to reject it on duration wastes the entire transfer.
+        # The frontend needs the number that will actually be enforced on
+        # the route being used, not the larger one for a different tool.
+        "max_video_transcribe_bytes": MAX_VIDEO_TRANSCRIBE_BYTES,
+        "max_video_transcribe_mb": MAX_VIDEO_TRANSCRIBE_BYTES // (1024 * 1024),
         "join": {
             "max_files": JOIN_MAX_FILES,
             "max_total_bytes": JOIN_MAX_TOTAL_BYTES,
@@ -718,6 +786,13 @@ async def limits():
             "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
             "youtube_stems": YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
             "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
+            # ADDED 2026-08-27, now that all three transcription routes
+            # are metered. They share one credits rule and one GPU
+            # endpoint but have SEPARATE per-IP rate-limit buckets, since
+            # rate_limit.py keys on (ip, path) - so three keys, not one.
+            "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+            "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
             # LEGACY, kept deliberately. /limits is a public contract the
             # frontend reads, and dropping a key it may still index would
             # turn a backend config change into `undefined` rendered in a
@@ -745,6 +820,17 @@ async def limits():
             # endpoint: the backend knows, so the frontend should read
             # rather than repeat.
             "separation_hq_max_duration_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
+            # ADDED 2026-08-27, same argument one tool over. All three
+            # transcription routes enforce this cap and reject past it
+            # with a 400 - after the upload has already been sent, which
+            # for a 100MB video is a genuinely expensive way to learn a
+            # limit. The frontend can now check duration client-side
+            # (HTMLMediaElement.duration) and say so before the transfer.
+            #
+            # Applies to EVERY caller, free or paid - it is a hard
+            # rejection line, not a tier. The tiering is entirely in the
+            # credits: 2 free ops a month, then 1 credit per job.
+            "transcription_max_duration_seconds": MAX_TRANSCRIPTION_DURATION_SECONDS,
         },
     }
 
@@ -786,9 +872,26 @@ async def root():
 
     Values are EFFECTIVE state - global AND per-tool - so the frontend
     never has to combine two flags and cannot get that combination
-    wrong. transcribe is filtered out: it exists in the rules so the
-    machinery is ready the day it is metered, but it is not a paywall
-    concern the frontend should render anything for today.
+    wrong.
+
+    EVERY RULE IS REPORTED, including disabled ones (changed
+    2026-08-27). A tool that is off reports false rather than being
+    absent, which is more useful to the frontend than having to tell
+    "not metered" apart from "key missing".
+
+    "transcribe" used to be filtered out of this dict on the grounds
+    that it was a placeholder rule nothing should render. That was true
+    until PAYWALL_TOOL_TRANSCRIBE_ENABLED went true, at which point the
+    API was charging a credit for /speech-to-text, /video-to-text and
+    /youtube/transcribe while telling the frontend those tools were
+    free. The user-visible result of that combination is the worst one
+    available: no credit balance shown, no "1 credit" label, both free
+    ops spent invisibly, and then a 402 out of nowhere.
+
+    The filter is DELETED rather than inverted, deliberately. An
+    exclusion list keyed on tool name has to be edited every time a tool
+    changes state, by someone who remembers it exists - and it had
+    already gone stale once by the time anyone looked.
 
     FAILS CLOSED, and that matters more than it looks: this route is also
     the deploy's health signal. A credits-package problem must degrade to
@@ -804,7 +907,6 @@ async def root():
         paywall_tools = {
             key: bool(_c.paywall_enabled and rule.enabled)
             for key, rule in _c.tool_rules.items()
-            if key != "transcribe"
         }
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[CREDITS] Could not read paywall state for / - reporting off: {e}")
