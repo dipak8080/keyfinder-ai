@@ -8,6 +8,66 @@ new subject but the same IP bucket.
 job_charges is the idempotency anchor: exactly one row per job that ever
 reached the paywall, so a retried request or a doubled webhook can never
 double-charge or double-refund.
+
+--------------------------------------------------------------------------
+FREE-TIER ACCOUNTING (rewritten 2026-08-27)
+
+Two holes, same shape, opposite directions. Both let one person take four
+free ops a month instead of two, and both were reachable by clicking
+"sign out".
+
+The mechanism behind both: /auth/logout deletes the SESSION cookie and
+sets subjects.account_id = NULL, but af_sid — the subject cookie — has a
+two-year max age and survives untouched. So signing out swaps
+identity.owner_key from "account:Y" back to "subject:X" while leaving
+the same browser in place. Whether that swap gives free ops back depends
+entirely on what each counter holds at that moment.
+
+HOLE 1 (found in production). merge_free_usage() folded the anonymous
+subject's usage into the account at sign-in and then DELETED the
+subject's row:
+
+    spend both free ops anonymously  -> subject:X used=2
+    sign in                          -> account:Y used=2, subject:X DELETED
+    sign out                         -> subject:X returns with no row
+    free_remaining()                 -> 2 again
+
+HOLE 2 (found while fixing hole 1, and NOT closed by fixing it). Usage
+accrued while signed in only ever touched the account counter, so a
+browser that signed in BEFORE spending anything kept a pristine subject
+counter:
+
+    sign in on a fresh browser       -> subject:X used=0, account:Y used=0
+    spend both free ops              -> account:Y used=2, subject:X STILL 0
+    sign out                         -> subject:X used=0
+    free_remaining()                 -> 2 again
+
+Fixing only hole 1 would have left hole 2 wide open, which is worth
+stating plainly: the first fix was aimed at the symptom that got
+reported, not at the thing causing it.
+
+THE FIX. Stop treating "which counter" as a choice made per request.
+Every free op is charged to BOTH keys — the owner key AND the subject
+key — and free_remaining() reads the MAX of the two. Whichever identity
+the browser is wearing when it next asks, the number it gets already
+includes everything that browser and that account have spent.
+
+merge_free_usage() then becomes a symmetric levelling: raise both keys
+to max(subject_used, account_used). That is idempotent by construction —
+raising to a maximum you already sit at changes nothing — which is what
+removes the need for the merge-marker table an earlier attempt at this
+introduced. It also needs no schema change at all, and that matters: the
+first attempt tried to record merges as a third scope in free_usage,
+which carries CHECK (scope IN ('owner','ip')), so every magic link
+500'd until it was reverted.
+
+WHAT THIS DELIBERATELY DOES NOT DO. It does not try to make the free
+tier unbeatable. A genuinely new browser on a genuinely new IP is a new
+person as far as this code can tell, and treating that as fraud would
+mean punishing shared offices and mobile CGNAT. The IP counter
+(free_monthly_ops_per_ip, 4) is the backstop, and the real ceiling on
+abuse is that a free op costs about two cents.
+--------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -91,10 +151,55 @@ def _free_used(conn: sqlite3.Connection, period: str, scope: str, key: str) -> i
     return int(row["used"]) if row else 0
 
 
+def _free_owner_keys(owner_type: str, owner_id: str, subject_id: str | None) -> list[str]:
+    """Every owner-scope key a single free op must be written to.
+
+    For an ANONYMOUS caller that is one key: subject:X, and owner_key is
+    already exactly that, so the list has one entry.
+
+    For a SIGNED-IN caller it is two: account:Y and subject:X. Writing
+    only the account key is what left hole 2 open - see the module
+    docstring. The subject key is the one that survives sign-out, so it
+    has to carry the same number.
+
+    Deduplicated rather than assumed distinct: identity.owner returns
+    ("subject", subject_id) for anonymous callers, so the two keys are
+    the SAME string then, and bumping twice would silently double-charge
+    every anonymous free op. That is a one-line mistake with a very
+    confusing symptom - 2 free ops that behave like 1 - which is why the
+    dedupe lives here rather than at the three call sites.
+
+    subject_id is Optional because job_charges.subject_id is nullable in
+    principle; a row without one still gets its owner key returned.
+    """
+    keys = [f"{owner_type}:{owner_id}"]
+    if subject_id:
+        subject_key = f"subject:{subject_id}"
+        if subject_key not in keys:
+            keys.append(subject_key)
+    return keys
+
+
 def free_remaining(conn: sqlite3.Connection, identity: Identity, period: str | None = None) -> int:
+    """How many free ops this caller has left this month.
+
+    Takes the MAX across the owner key and the subject key rather than
+    reading whichever one identity happens to be wearing. Those two
+    diverge precisely when someone signs in or out mid-month, and the
+    honest answer is "everything this browser OR this account has
+    spent", not "whichever number happens to be smaller right now".
+
+    Then takes the MIN against the IP allowance, which is a separate
+    guard with a separate purpose: the owner keys bound one identity,
+    the IP key bounds one network. Both apply.
+    """
     s = get_settings()
     period = period or period_key()
-    owner_used = _free_used(conn, period, "owner", identity.owner_key)
+    owner_type, owner_id = identity.owner
+    owner_used = max(
+        _free_used(conn, period, "owner", key)
+        for key in _free_owner_keys(owner_type, owner_id, identity.subject_id)
+    )
     ip_used = _free_used(conn, period, "ip", identity.ip_hash)
     return max(0, min(s.free_monthly_ops - owner_used, s.free_monthly_ops_per_ip - ip_used))
 
@@ -245,7 +350,14 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
             remaining = free_remaining(conn, identity, period)
             if remaining >= credits_needed:
                 charge_type, credits = "free", 0
-                _bump_free(conn, period, "owner", identity.owner_key, credits_needed)
+                # BOTH owner keys, not just the active one. For a
+                # signed-in caller that means account:Y AND subject:X -
+                # the subject key is what survives sign-out, and leaving
+                # it at zero is exactly what hole 2 exploited. For an
+                # anonymous caller the helper returns a single key, so
+                # this stays one write.
+                for key in _free_owner_keys(owner_type, owner_id, identity.subject_id):
+                    _bump_free(conn, period, "owner", key, credits_needed)
                 _bump_free(conn, period, "ip", identity.ip_hash, credits_needed)
             else:
                 balance = get_balance(conn, identity)
@@ -331,15 +443,24 @@ def refund_job(job_id: str, reason: str = "job_failed") -> bool:
             grant(conn, owner_type=row["owner_type"], owner_id=row["owner_id"], amount=row["credits"],
                  kind="job_refund", idempotency_key=f"job_refund:{job_id}", job_id=job_id, note=reason)
         elif row["charge_type"] == "free":
-            # KNOWN LIMITATION, safe only while every rule costs 1 credit.
-            # charge_for_job() bumps the free counters by credits_needed,
-            # this returns exactly 1. Add a tool with credits > 1 and a
+            # Mirrors the charge exactly: every key that was bumped gets
+            # decremented, read back FROM THE ROW rather than from the
+            # current identity. That distinction is load-bearing - a job
+            # can fail long after the person signed out, and refunding
+            # against whoever holds the cookie now would credit the
+            # wrong counter. job_charges stores owner_type, owner_id AND
+            # subject_id at charge time precisely so this can be exact.
+            #
+            # KNOWN LIMITATION, safe only while every rule costs 1
+            # credit. charge_for_job() bumps by credits_needed, this
+            # returns exactly 1. Add a tool with credits > 1 and a
             # failed free-tier job permanently eats an op the user never
             # spent. job_charges.credits is 0 for free charges so it
             # cannot be read back from there - the fix is a free_ops
             # column on job_charges, written at charge time. Do that
             # BEFORE raising any rule above 1.
-            _bump_free(conn, row["period"], "owner", f"{row['owner_type']}:{row['owner_id']}", -1)
+            for key in _free_owner_keys(row["owner_type"], row["owner_id"], row["subject_id"]):
+                _bump_free(conn, row["period"], "owner", key, -1)
             _bump_free(conn, row["period"], "ip", row["ip_hash"], -1)
 
         conn.execute("UPDATE job_charges SET status='refunded', refunded_at=?, refund_reason=? WHERE job_id=?",
@@ -370,72 +491,68 @@ def sweep_stale_holds() -> int:
     return len(stale)
 
 
-# Merge bookkeeping lives in free_usage under its OWN scope rather than a
-# separate table, so this needs no migration: the primary key is already
-# (period, scope, scope_key), and nothing else reads a scope it does not
-# name explicitly. free_remaining() reads only 'owner' and 'ip', so a
-# 'merged' row is inert to every existing query.
-_MERGE_SCOPE = "merged"
-
-
 def merge_free_usage(conn: sqlite3.Connection, subject_id: str, account_id: str) -> None:
-    """On sign-in, fold the browser's anonymous free usage into the account
-    so logging in doesn't hand out a second free allowance.
+    """On sign-in, level this browser and this account to whichever has
+    spent more free ops this month.
 
-    THE LOGOUT HOLE THIS FIXES (2026-08-27)
-    ---------------------------------------
-    The original implementation added the subject's usage to the account
-    and then DELETED the subject's free_usage row. That looked like tidy
-    bookkeeping and was a free-credit dispenser:
+    Called from /auth/verify inside the sign-in transaction, so a failure
+    here rolls back the whole sign-in rather than leaving a half-merged
+    counter. That property is why this function must stay boring: it is
+    on the critical path of every magic link on the site.
 
-        spend both free ops anonymously   -> subject:X used=2
-        sign in                           -> account:Y used=2, subject:X DELETED
-        sign out                          -> af_sid is a 2-year cookie, so
-                                             the same subject:X comes back
-                                             with no row at all
-        free_remaining()                  -> 2 again
+    WHY LEVELLING RATHER THAN ADDING
+    --------------------------------
+    The original implementation ADDED the subject's usage to the
+    account's, then deleted the subject's row to stop a second sign-in
+    adding it twice. That delete was hole 1 (see the module docstring),
+    and removing it alone would have made the addition non-idempotent -
+    sign in, sign out, sign in again, and the account's counter climbs
+    with every round trip even though nothing was spent.
 
-    Repeatable on demand. The IP counter is never merged and never
-    deleted, so free_monthly_ops_per_ip (4) was the only thing bounding
-    it - which means the advertised "2 free per month" was really "4 per
-    month per IP, for anyone who noticed". Not catastrophic, entirely
-    trivial to discover.
+    Raising both keys to their maximum has no such problem: it is
+    idempotent by construction, because raising to a maximum you already
+    sit at is a no-op. Every sign-in can call it, in any order, any
+    number of times.
 
-    THE FIX: never delete. The subject row stays exactly as it was, so a
-    signed-out browser is still counted against what it actually spent.
-    Idempotency - the thing the DELETE was really providing - comes from
-    a merge marker recording how much of this subject's usage has
-    already been folded into this account.
+    An earlier attempt solved the idempotency problem with a
+    merge-marker row instead, written to free_usage under a third scope.
+    That is what took sign-in down in production: free_usage carries
+    CHECK (scope IN ('owner','ip')) and the insert raised inside this
+    very transaction, so every magic link returned 500 until it was
+    reverted. Levelling needs no marker, no new table and no schema
+    change - which is the main reason to prefer it, on a database that
+    holds the money.
 
-    RECONCILES BY DELTA, not by a boolean. The interleaving that makes a
-    simple "already merged?" flag wrong:
+    BOTH DIRECTIONS, deliberately. Raising the ACCOUNT to the subject's
+    level is the obvious half: it stops someone spending their free ops
+    anonymously and then signing in for two more. Raising the SUBJECT to
+    the account's level is the half that is easy to leave out, and it
+    closes the case where a second device signs into an already-exhausted
+    account and then signs out - without it, that browser walks away with
+    a full allowance it did nothing to earn.
 
-        subject:X used=1 -> sign in  -> account +1, marker=1
-        sign out, spend 1 more       -> subject:X used=2
-        sign in again                -> used(2) - marker(1) = 1 -> account +1
-
-    A boolean would skip that second op entirely and hand back a free
-    run. Storing the amount makes repeat sign-ins exact rather than
-    merely safe.
-
-    Called inside the caller's transaction (sign-in), so a failure here
-    rolls back with the rest of it rather than leaving a half-merged
-    counter.
+    The cost of that second half is that a browser which signs into an
+    exhausted account loses its own free allowance for the month. That
+    is the right trade: it is the same person in every normal case, and
+    the alternative is a two-click reset anyone can find.
     """
     period = period_key()
     subject_key = f"subject:{subject_id}"
-    used = _free_used(conn, period, "owner", subject_key)
-    if used <= 0:
+    account_key = f"account:{account_id}"
+
+    subject_used = _free_used(conn, period, "owner", subject_key)
+    account_used = _free_used(conn, period, "owner", account_key)
+    level = max(subject_used, account_used)
+    if level <= 0:
         return
 
-    merge_key = f"{subject_id}>{account_id}"
-    already = _free_used(conn, period, _MERGE_SCOPE, merge_key)
-    delta = used - already
-    if delta <= 0:
-        # Everything this subject spent is already reflected on the
-        # account. Signing in and out repeatedly must not keep adding.
-        return
+    if level > account_used:
+        _bump_free(conn, period, "owner", account_key, level - account_used)
+    if level > subject_used:
+        _bump_free(conn, period, "owner", subject_key, level - subject_used)
 
-    _bump_free(conn, period, "owner", f"account:{account_id}", delta)
-    _bump_free(conn, period, _MERGE_SCOPE, merge_key, delta)
-    log.info("merged %d free op(s) from %s into account %s", delta, subject_id, account_id)
+    if level > min(subject_used, account_used):
+        log.info(
+            "levelled free usage to %d for subject %s / account %s (was %d / %d)",
+            level, subject_id, account_id, subject_used, account_used,
+        )
