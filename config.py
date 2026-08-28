@@ -1384,6 +1384,165 @@ MIDI_INPUT_FORMATS = frozenset(ALLOWED_AUDIO_INPUT_FORMATS) | {"opus", "webm"}
 
 
 
+
+
+
+# ---------- AUDIO TO MIDI, HIGH QUALITY (RunPod GPU worker) ----------
+# A SEPARATE TOOL FROM /audio-to-midi, not a quality flag on it. That
+# distinction is the whole reason this block exists rather than a
+# handful of extra values in the section above, and it is worth being
+# precise about, because "HQ" everywhere else in this app means the same
+# product run harder:
+#
+#   /separate vs /separate-hq   same Demucs, bigger model, same output
+#                               shape, same parameters, same everything
+#                               except SDR and runtime.
+#
+#   /audio-to-midi              basic-pitch. ANY instrument. Six tunable
+#   vs /audio-to-midi-hq        parameters. One MIDI track.
+#                               YourMT3. MULTI-instrument, one track per
+#                               instrument with a General MIDI program
+#                               assigned. ZERO tunable parameters - it is
+#                               a transformer that emits note events and
+#                               there is nothing to turn.
+#
+# There is no honest argument list covering both. onset_threshold and
+# frame_threshold have no counterpart in YourMT3, so a shared route
+# would have to silently ignore three of the free tool's parameters on
+# the HQ path - the kind of thing discovered by a confused user rather
+# than by a test. Separate route, separate rule key, separate semaphore;
+# they share the job system and the credits ledger and nothing else.
+#
+# WHAT SURVIVES OF THE FREE TOOL'S CONTROLS. The worker applies pitch
+# range and minimum note length to the OUTPUT MIDI - see _filter_midi in
+# gpu-worker-mt3/handler.py. That is not an approximation of the free
+# tool's parameters, it is strictly more predictable: "nothing below C2"
+# means exactly that on decided notes, where in basic-pitch it means
+# "bias the detector away from low frequencies". Sensitivity cannot
+# carry over at all, because by the time we have MIDI the detection
+# decision is already made. The frontend must not offer it here.
+#
+# COST. Measured on this VPS's CPU at ~2x realtime; on a RunPod GPU
+# expect roughly 10-20 GPU-seconds for a 4-minute track, about
+# $0.002-0.004 a job. Cheaper than an HQ separation, which is why this
+# is priced at 1 credit and not 2 - see credits/config.py's rule, and
+# the refund_job() limitation noted there that makes any rule above 1
+# credit unsafe until job_charges grows a free_ops column.
+
+# The RunPod Serverless endpoint running gpu-worker-mt3. Empty means the
+# tool reports itself unavailable and every request gets a clean 503,
+# exactly like RUNPOD_WHISPER_ENDPOINT_ID - a missing env var must
+# degrade one endpoint, never crash the app at boot.
+RUNPOD_MT3_ENDPOINT_ID = os.environ.get("RUNPOD_MT3_ENDPOINT_ID", "")
+
+# Both sides of the deadline - see run_worker_job(), which passes this
+# to RunPod as the job's own executionTimeout as well as using it to
+# stop polling. Two independently configured timeouts is exactly how you
+# end up with a job this side has abandoned and RunPod is still billing
+# for.
+#
+# 600s is generous against a measured ~10-20 GPU-seconds of inference:
+# the headroom is for a cold start, which on this image includes loading
+# a transformer checkpoint. It is NOT sized for the inference itself.
+MIDI_HQ_TIMEOUT_SECONDS = int(os.environ.get("MIDI_HQ_TIMEOUT_SECONDS", "600"))  # 10 min
+
+# MUST EQUAL MT3_MAX_SECONDS ON THE WORKER. The worker enforces its own
+# ceiling as a backstop, so if these two drift apart the user waits for
+# a job that was always going to be rejected on the far side - the same
+# trap the Whisper Dockerfile documents at length about baked vs
+# runtime model size.
+#
+# 600 matches both the free /audio-to-midi cap and, since 2026-08-28,
+# MAX_SEPARATION_DURATION_SECONDS_HQ. Deliberately the same number: a
+# paid tool that accepts LESS than the free one is an objection on a
+# pricing page, and there is no cost reason for it here.
+MAX_MIDI_HQ_DURATION_SECONDS = int(os.environ.get("MAX_MIDI_HQ_DURATION_SECONDS", "600"))  # 10 min
+
+# Below this there is not enough signal for any transcription model to
+# find anything, and the result is a guaranteed empty MIDI. Rejecting at
+# submit turns a wasted GPU round trip into an instant, explainable 400.
+# Same value and same reasoning as MIN_MIDI_DURATION_SECONDS.
+MIN_MIDI_HQ_DURATION_SECONDS = float(os.environ.get("MIN_MIDI_HQ_DURATION_SECONDS", "1.0"))
+
+# How many HQ MIDI jobs may be in flight to the GPU worker at once.
+#
+# KEEP THIS IN SYNC WITH THE RUNPOD WORKER COUNT, for the reason spelled
+# out at MAX_CONCURRENT_SEPARATIONS: setting it higher than the number
+# of workers does not add throughput, it just moves the queue from here
+# (where /admin/status can report it) into RunPod's queue, where it is
+# invisible.
+#
+# Its OWN semaphore rather than sharing _midi_semaphore with the free
+# tool. Those two contend for completely different resources - the free
+# one for a CPU sidecar on this box, this one for paid GPU capacity -
+# and sharing would mean a busy midi-worker could block a paid job that
+# has nothing to do with it.
+MAX_CONCURRENT_MIDI_HQ = int(os.environ.get("MAX_CONCURRENT_MIDI_HQ", "2"))
+
+# Bounded queue, mirroring MAX_QUEUED_SEPARATIONS and for the identical
+# reason: the semaphore above is acquired INSIDE the background task, so
+# without this, submissions past the concurrency limit are never
+# refused - they queue in memory with no ceiling, each holding an
+# uploaded file on disk and a job-table row, while the person watching
+# the spinner has no way to know they are tenth in line.
+#
+# The per-IP rate limit does not cover this and never could: it is
+# per-IP, so N different visitors each submitting their allowance still
+# stacks without bound. That is good traffic producing the failure case.
+MAX_QUEUED_MIDI_HQ = int(os.environ.get("MAX_QUEUED_MIDI_HQ", "6"))
+
+# FREE-tier rate limit. Matches the pattern every other metered tool
+# follows: this number is a safety net, not the primary control. What
+# actually bounds GPU spend is FREE_MONTHLY_OPS (2/user, 4/IP) and the
+# credit balance; what bounds queue fairness is the two constants above.
+#
+# credits/limits.py derives the ENFORCED free limit from
+# FREE_MONTHLY_OPS when the rule's free_rate_limit is 0, and boot fails
+# if the two contradict - so this value is the fallback for the
+# unmetered case, not the last word. See credits/config.py's INVARIANT
+# block for why a free hourly limit BELOW the monthly allowance is a
+# broken promise rather than a tight limit.
+MIDI_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_HQ_RATE_LIMIT_MAX_REQUESTS", "2"))
+MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+# Bounds for the two post-processing controls the worker applies to the
+# OUTPUT MIDI. Validated at the route so a bad value costs a 400 rather
+# than a GPU round trip.
+#
+# The pitch bounds are the FULL MIDI range, deliberately wider than the
+# free tool's keyboard picker (21-108, A0 to C8). YourMT3 is
+# multi-instrument and can legitimately emit notes outside a piano's
+# range - bass below A0, percussion mapped high - and clamping to a
+# piano keyboard here would silently discard them. The frontend is free
+# to present a narrower picker; the API should not enforce a piano.
+MIDI_HQ_PITCH_MIN = int(os.environ.get("MIDI_HQ_PITCH_MIN", "0"))
+MIDI_HQ_PITCH_MAX = int(os.environ.get("MIDI_HQ_PITCH_MAX", "127"))
+
+# Same range the free tool's "Shortest note" slider uses, so a preset
+# built for one tool is accepted by the other unchanged.
+MIDI_HQ_MIN_NOTE_MS_MIN = float(os.environ.get("MIDI_HQ_MIN_NOTE_MS_MIN", "10"))
+MIDI_HQ_MIN_NOTE_MS_MAX = float(os.environ.get("MIDI_HQ_MIN_NOTE_MS_MAX", "2000"))
+
+# Same accepted input set as the free tool, including opus/webm - see
+# MIDI_INPUT_FORMATS above for why those two are added there rather than
+# to _SUPPORTED_AUDIO_FORMATS. Aliased rather than redefined so the two
+# MIDI tools can never disagree about what they accept, which would be a
+# genuinely confusing thing for a user to discover by being rejected on
+# one and not the other.
+MIDI_HQ_INPUT_FORMATS = MIDI_INPUT_FORMATS
+
+# Kill switch, mirroring SEPARATION_HQ_ENABLED. Flip to false to stop
+# accepting HQ MIDI jobs without touching the paywall or the free tool -
+# submissions get a clean rejection pointing at /audio-to-midi instead
+# of queueing into a broken worker.
+#
+# Env-driven, so changing it needs a container recreate (--env-file is
+# read once at docker run). The public root response exposes it so the
+# frontend can hide the HQ option rather than letting users submit into
+# a guaranteed error.
+MIDI_HQ_ENABLED = os.environ.get("MIDI_HQ_ENABLED", "true").lower() == "true"
+
+
 # ---------- TIKTOK (/tiktok-to-mp3) ----------
 # Its OWN duration cap, not MAX_VIDEO_DURATION_SECONDS. TikTok's own
 # ceiling is 10 min, so this rejects nothing TikTok allows - and

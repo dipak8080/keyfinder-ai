@@ -26,11 +26,15 @@ Target structure:
       youtube.py           # /download, /youtube/analyze|separate|stems (+hq)
       tiktok.py             # /tiktok-to-mp3
       separation.py          # /separate, /stems (+hq)
-      audio_tools.py          # the 13 ffmpeg/rubberband tools + fade/channels/resample/ringtone
-      midi.py                  # /audio-to-midi
-      transcribe.py             # /speech-to-text
-      media.py                   # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
-      admin.py                    # /admin/*, /limits, /health, /
+      separation_upgrade.py   # /separate/upgrade, /stems/upgrade (+ upgrade-info)
+      audio_tools.py           # the 13 ffmpeg/rubberband tools + fade/channels/resample/ringtone
+      midi.py                   # /audio-to-midi
+      midi_hq.py                 # /audio-to-midi-hq
+      transcribe.py               # /speech-to-text
+      video_transcribe.py          # /video-to-text
+      youtube_transcribe.py         # /youtube/transcribe
+      media.py                       # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
+      admin.py                        # /admin/*, /limits, /health, /
 
 The six concurrency semaphores that used to be module-level globals in
 routes.py now live in utils.py, alongside the two that were already
@@ -76,14 +80,72 @@ bot-check, and its one IP-shaped error was proven not to be fixed by a
 different exit IP. See tiktok/core.py's module docstring for the
 evidence behind each of those omissions.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+FIXED 2026-08-28: separation_upgrade.py WAS NEVER MOUNTED
+
+routes/separation_upgrade.py has registered four real routes since
+2026-08-25 - POST /separate/upgrade, POST /stems/upgrade, and their two
+upgrade-info partners - and none of them were reachable. The module was
+never imported here and never included, so every one of them returned
+404 in production for three days.
+
+What made it survive that long is the specific shape of the failure.
+admin.py's _iter_tool_routes() DOES walk separation_upgrade (it was
+added there in the same commit that created the module), so
+/admin/endpoints listed the tool, the dashboard picker showed it, and
+everything about the feature looked wired up from the operator side.
+The only place it was missing is the one place that decides whether a
+request reaches a handler.
+
+Two lessons worth writing down rather than just fixing:
+
+  1. A route module is not live because it exists, and not because
+     something else can see it. It is live because THIS file includes
+     it. Any new routes/*.py needs a line in the import block AND a
+     line in the include block below - both, in the same commit.
+
+  2. _iter_tool_routes() and this file are two hand-maintained lists of
+     the same thing, and they have now drifted in BOTH directions:
+     admin.py's list went stale by omission three times (video_transcribe,
+     youtube_transcribe, tiktok - fixed 2026-08-27), and this one went
+     stale by omission once, in a way admin.py's completeness actively
+     disguised. If either drifts again, the fix is to stop maintaining
+     them by hand and enumerate the package with pkgutil.
+--------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-28: midi_hq.py
+
+/audio-to-midi-hq is a standalone route rather than a `quality` field on
+/audio-to-midi, for the rate-limit reason this file already gives twice
+above - and for a second one specific to MIDI: the two tools do not
+share an argument list and could not.
+
+basic-pitch takes onset_threshold, frame_threshold and
+minimum_note_length; YourMT3 takes nothing at all, because it is a
+transformer that emits note events rather than a detector with
+thresholds. A shared route would have to silently ignore three
+parameters on the HQ path, and "silently" is the problem - there is no
+sensible error for "this parameter is meaningless at this quality" that
+does not read as a bug.
+
+It has its OWN semaphore (_midi_hq_semaphore, bounded by the RunPod MT3
+worker count) rather than sharing _midi_semaphore with the free tool.
+Those two bound different resources - a CPU sidecar on this box versus
+paid GPU capacity - and sharing would let a busy midi-worker block a
+paid job that never touches it. See utils.py's semaphore block.
+--------------------------------------------------------------------------
 """
 from fastapi import APIRouter
 
 from .youtube import router as _youtube_router
 from .tiktok import router as _tiktok_router
 from .separation import router as _separation_router
+from .separation_upgrade import router as _separation_upgrade_router
 from .audio_tools import router as _audio_tools_router
 from .midi import router as _midi_router
+from .midi_hq import router as _midi_hq_router
 from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
@@ -99,8 +161,10 @@ router = APIRouter()
 router.include_router(_youtube_router)
 router.include_router(_tiktok_router)
 router.include_router(_separation_router)
+router.include_router(_separation_upgrade_router)
 router.include_router(_audio_tools_router)
 router.include_router(_midi_router)
+router.include_router(_midi_hq_router)
 router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)

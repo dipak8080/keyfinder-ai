@@ -4,7 +4,7 @@ utils.py - Shared low-level helpers used across the app:
 - memory cleanup / temp file cleanup
 - thread pool + run_blocking() for offloading blocking calls
 - safe upload path construction (byte-bounded, no user-controlled bytes)
-- concurrency semaphores (all six, app-wide) + acquire_slot_or_503()
+- concurrency semaphores (all seven, app-wide) + acquire_slot_or_503()
 - Camelot wheel / key math
 - killable subprocess for YouTube downloads
 
@@ -47,6 +47,7 @@ from config import (
     MAX_CONCURRENT_AUDIO_TOOLS,
     MAX_CONCURRENT_TRANSCRIPTIONS,
     MAX_CONCURRENT_MIDI,
+    MAX_CONCURRENT_MIDI_HQ,
     QUEUE_WAIT_TIMEOUT_SECONDS,
     YT_COOKIES_PATH_DEFAULT,
     UPLOAD_DIR,
@@ -240,7 +241,7 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 # above (that's about not freezing the event loop; this is about not
 # loading many audio files into RAM simultaneously).
 #
-# All six of the app's concurrency pools are declared here, together:
+# All seven of the app's concurrency pools are declared here, together:
 #   _analysis_semaphore       - /analyze, and the analyze half of
 #                                /youtube/analyze
 #   _download_semaphore       - /download, and the download half of every
@@ -264,12 +265,31 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 #                                midi-worker sidecar, on its own pool for
 #                                the same reason as transcription (moved
 #                                here, same as above)
+#   _midi_hq_semaphore        - /audio-to-midi-hq's call to the RunPod
+#                                MT3 worker (added 2026-08-28)
+#
+# THE LAST TWO ARE DELIBERATELY SEPARATE POOLS, and it is worth saying
+# why, because "both are MIDI" makes sharing look obvious.
+#
+# They do not contend for the same resource. _midi_semaphore bounds
+# concurrent HTTP calls into a CPU sidecar running on THIS box, where the
+# limit exists to stop basic-pitch starving the ffmpeg tools of cores.
+# _midi_hq_semaphore bounds concurrent jobs in flight to PAID GPU
+# capacity, where the limit exists to match the RunPod worker count so a
+# second worker is not left idle by construction (the same reasoning
+# MAX_CONCURRENT_SEPARATIONS documents at length after that exact bug).
+#
+# Sharing one semaphore would mean a busy midi-worker could block a paid
+# HQ job that never touches it, and vice versa - one free user's
+# transcription delaying someone who paid, for no resource reason at
+# all. Two pools, two constants, two numbers that move independently.
 _analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _separation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEPARATIONS)
 _audio_tools_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO_TOOLS)
 _transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
 _midi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI)
+_midi_hq_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI_HQ)
 
 
 async def acquire_slot_or_503(semaphore: asyncio.Semaphore, what: str):

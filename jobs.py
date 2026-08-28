@@ -177,6 +177,21 @@ SEPARATION_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stem
 # isolation would let the other two fill the queue invisibly.
 TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe", "video_transcribe")
 
+# /audio-to-midi-hq only. Its own tuple rather than an entry in
+# AUDIO_TOOL_JOB_TYPES, because it does not share the audio-tools
+# semaphore - it has _midi_hq_semaphore, bounded by the RunPod MT3
+# worker count, and counting it against the ffmpeg pool would reject a
+# /convert because somebody else was transcribing MIDI on a GPU.
+#
+# A one-element tuple looks like overkill next to the two above, and it
+# is deliberate: count_processing() takes a collection, the guard reads
+# a name rather than a literal, and the day a second GPU-MIDI route
+# exists it goes here rather than being discovered as a missing string
+# in a queue check that silently stopped counting half its pool. The
+# free /audio-to-midi is NOT here - different semaphore, different
+# worker, different queue.
+MIDI_HQ_JOB_TYPES = ("audio_to_midi_hq",)
+
 
 def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) -> str:
     """

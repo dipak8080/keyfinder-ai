@@ -1,0 +1,33 @@
+# gpu-worker-mt3/requirements.txt
+#
+# transformers is pinned HARD and must not be bumped without testing.
+# YourMT3's decoder calls into transformers' T5 internals directly, and
+# two separate breakages were hit getting this to run at all:
+#
+#   >= 4.50   ImportError: No module named
+#             'transformers.utils.model_parallel_utils'
+#   ~ 4.4x    TypeError: 'NoneType' object is not subscriptable, from
+#             T5Attention.forward expecting a cache_position tensor that
+#             YourMT3's generate loop never passes
+#
+# 4.38.2 predates both. Neither failure names YourMT3 anywhere in the
+# stack trace - they surface as errors deep inside transformers - so a
+# casual bump costs an afternoon to diagnose.
+transformers==4.38.2
+
+# The inference wrapper (MIT). Pulls YourMT3's model code, which is
+# GPL-3.0 - see the licence note at the top of the Dockerfile for why
+# that governs where this image may be pushed.
+mt3-infer
+
+# Explicit rather than inherited from mt3-infer's dependency tree.
+# librosa does the 16kHz resample in handler.py and pretty_midi does the
+# post-filtering and the summary; both are load-bearing here, so they
+# are named rather than left to arrive as somebody else's transitive
+# dependency that a future release could drop.
+librosa
+pretty_midi
+numpy
+
+requests
+runpod

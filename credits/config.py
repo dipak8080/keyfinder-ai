@@ -89,10 +89,19 @@ def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
 # the drift the host config.py already complains about in its note on the
 # per-path YouTube limits. One resource, one bucket.
 #
-# free_under_seconds is 0 for all four HQ routes: unlike short transcription,
-# HQ separation is expensive at every length - MAX_SEPARATION_DURATION_SECONDS_HQ
-# already caps input at 6 minutes, so there is no "short enough to be free" band
-# to carve out.
+# AUDIO-TO-MIDI-HQ is the second one-key-per-product entry, added
+# 2026-08-28, and it is the opposite shape to transcription: one route, one
+# key, but a genuinely different PRODUCT from the free /audio-to-midi rather
+# than the same product run harder. See its own note below - the short
+# version is that basic-pitch and YourMT3 do not share an argument list, so
+# they could not have shared a route even if the pricing suited it.
+#
+# free_under_seconds is 0 on every rule in this dict. For HQ separation the
+# reason is that it is expensive at every length - MAX_SEPARATION_DURATION_SECONDS_HQ
+# already caps input, so there is no "short enough to be free" band to carve
+# out. For transcription and HQ MIDI the reason is different and simpler: the
+# free allowance IS the free tier, and a duration exemption stacked on top of
+# it is one more rule a user has to hold in their head for no gain.
 #
 # ---------------------------------------------------------------------------
 # RATE LIMITS: THREE GUARDS, THREE JOBS. Do not conflate them.
@@ -200,6 +209,65 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     # rule in this file, and no paywall setting touches it - it is the
     # endpoint's idle timeout.
     "transcribe": {
+        "enabled": False, "free_under_seconds": 0, "credits": 1,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
+    },
+    # ---- AUDIO TO MIDI, HIGH QUALITY -------------------------------------
+    # A SEPARATE PRODUCT from /audio-to-midi, not a quality flag on it -
+    # which is why it gets its own key rather than a "quality" field on a
+    # shared one. The distinction matters more here than anywhere else in
+    # this dict, because everywhere else "-hq" means the same product run
+    # harder:
+    #
+    #   /separate vs /separate-hq   same Demucs, bigger model, identical
+    #                               parameters and output shape.
+    #
+    #   /audio-to-midi              basic-pitch. ANY instrument. Six
+    #   vs /audio-to-midi-hq        tunable parameters. One MIDI track.
+    #                               YourMT3. MULTI-instrument, one track
+    #                               per instrument with a General MIDI
+    #                               program assigned. ZERO tunable
+    #                               parameters.
+    #
+    # The free tool stays free forever. This is an upgrade path, not a
+    # paywall dropped in front of something people already use - the same
+    # arrangement standard vs HQ separation has, and the reason /audio-to-
+    # midi's traffic is safe to keep unmetered.
+    #
+    # PRICED FROM MEASUREMENT. Measured on this VPS's CPU at ~2x realtime
+    # (13.7s of audio in 25s, a 4.5-minute track in ~9 minutes); on a
+    # RunPod GPU that lands around 10-20 GPU-seconds for a 4-minute track,
+    # roughly $0.002-0.004 a job. CHEAPER than an HQ separation (~$0.018)
+    # and far cheaper than a transcription per minute of audio.
+    #
+    #   1 credit, and the margin is not the reason. At ~$0.003 against
+    #   $0.20-0.30 of revenue this could carry 2 credits comfortably on
+    #   cost alone. It does not, because refund_job() still hardcodes a -1
+    #   free-op adjustment while charge_for_job() bumps by credits_needed:
+    #   any rule with credits > 1 silently under-refunds the free tier on
+    #   a failed job, permanently eating an op the user never spent.
+    #
+    #   That fix is a free_ops column on job_charges, written at charge
+    #   time. Until it lands, 1 is not a pricing decision - it is the only
+    #   safe value, for this rule and every other one in this dict.
+    #
+    #   free_under_seconds: 0, matching every other rule here. There is no
+    #   "short enough to be free" band worth carving out when the whole
+    #   job costs a third of a cent; the free allowance is the free tier,
+    #   and a duration exemption on top would only complicate what a user
+    #   has to understand.
+    #
+    # SHARES THE FREE ALLOWANCE with every other metered tool -
+    # free_usage has no tool in its key, so FREE_MONTHLY_OPS is a pool of
+    # 2 across all of them, not 2 each. Worth watching once this ships:
+    # /audio-to-midi is a high-traffic entry point, so someone arriving
+    # for MIDI and trying the HQ tier twice has no free HQ separations
+    # left that month - on a tool they never touched. If that shows up in
+    # support, FREE_MONTHLY_OPS=3 costs about 1.5 cents per user per month
+    # and is one env var, where per-tool allowances would mean reopening
+    # ledger.py.
+    "audio-to-midi-hq": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,

@@ -99,6 +99,22 @@ executes in either case.
 --------------------------------------------------------------------------
 
 --------------------------------------------------------------------------
+ADDED 2026-08-28: _reject_if_midi_hq_queue_full() - the FOURTH bounded
+queue guard, for /audio-to-midi-hq.
+
+First one written BEFORE the bug rather than after it. The other three
+each followed a production incident; this one exists because the
+mechanism is now well enough understood to see it coming. Same shape as
+its siblings, counting MIDI_HQ_JOB_TYPES against MAX_QUEUED_MIDI_HQ.
+
+Deliberately does NOT count the free /audio-to-midi. Those two tools
+share a name and nothing else: one is a CPU sidecar on this box bounded
+by MAX_CONCURRENT_MIDI, the other is paid GPU capacity bounded by the
+RunPod worker count. See utils.py's semaphore block for the full
+argument against merging them.
+--------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
 ADDED 2026-08-27: metered_tool= on _run_tool_job, closing the
 gpu_job_metrics row.
 
@@ -145,6 +161,7 @@ from config import (
     MAX_QUEUED_SEPARATIONS,
     MAX_QUEUED_TRANSCRIPTIONS,
     MAX_QUEUED_AUDIO_TOOLS,
+    MAX_QUEUED_MIDI_HQ,
     AUDIO_TOOL_JOB_TYPES,
 )
 from upload import save_upload
@@ -163,6 +180,7 @@ from jobs import (
     count_processing,
     SEPARATION_JOB_TYPES,
     TRANSCRIPTION_JOB_TYPES,
+    MIDI_HQ_JOB_TYPES,
 )
 from separation import SeparationError
 from audio_common import (
@@ -698,6 +716,55 @@ def _reject_if_audio_tools_queue_full():
             503,
             "The server is busy processing other files right now. These jobs "
             "are usually quick - please try again in a moment.",
+        )
+
+
+def _reject_if_midi_hq_queue_full():
+    """
+    The bounded queue for /audio-to-midi-hq.
+
+    The FOURTH guard in this file, and the first one added for a tool
+    that did not exist yet - the previous three were all written after
+    the bug they prevent had already happened in production. Worth
+    saying, because the reasoning is identical and the cost of adding it
+    up front is one function:
+
+    MAX_CONCURRENT_MIDI_HQ caps how many jobs RUN at once, but the
+    semaphore enforcing it is acquired INSIDE the background task (see
+    _run_tool_job's `async with semaphore`). Without this check,
+    submissions past that limit are never refused - they queue in memory
+    with no ceiling, each holding an uploaded file on disk and a
+    job-table row, while the person watching the spinner has no way to
+    know they are tenth in line.
+
+    COUNTS ONLY audio_to_midi_hq. Deliberately NOT the free
+    /audio-to-midi: that runs on _midi_semaphore against a CPU sidecar
+    on this box, this runs on _midi_hq_semaphore against paid GPU
+    capacity. They are different pools with different limits, and
+    counting them together would let a busy midi-worker reject a paid
+    job that never touches it.
+
+    THE RATE LIMITER DOES NOT COVER THIS. It is per-IP; this is a
+    whole-server capacity bound. Ten visitors each submitting their
+    permitted allowance is ten queued jobs and zero rate-limit
+    violations - good traffic producing the failure case, which is
+    exactly the shape that made this guard necessary for the other three
+    pools.
+
+    503, not 429: the server is at capacity, the caller did nothing
+    wrong, and a client deciding whether to retry needs to tell those
+    apart.
+    """
+    depth = count_processing(MIDI_HQ_JOB_TYPES)
+    if depth >= MAX_QUEUED_MIDI_HQ:
+        logger.warning(
+            f"[MIDI_HQ] Rejected submission - queue full "
+            f"({depth}/{MAX_QUEUED_MIDI_HQ} jobs in flight)"
+        )
+        raise HTTPException(
+            503,
+            "The high-quality MIDI queue is full right now. These jobs take "
+            "under a minute each - please try again shortly.",
         )
 
 

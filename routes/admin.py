@@ -108,6 +108,21 @@ list that did not move when a tool did.
    separation_hq_max_duration_seconds: a cap the user meets by being
    rejected is a cap the UI should have shown first.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-28): /audio-to-midi-hq
+
+midi_hq added to _iter_tool_routes(), and /limits gained
+midi_hq_enabled plus both MIDI duration caps and both MIDI rate limits.
+
+Note the list in _iter_tool_routes() has now been corrected twice in two
+days, and routes/__init__.py was found to have drifted in the opposite
+direction over the same period - separation_upgrade registered four
+routes that were never mounted, while this file's list happily reported
+them to the dashboard. Two hand-maintained lists of the same thing,
+failing in opposite directions and each disguising the other. If either
+drifts a third time, replace both with pkgutil enumeration rather than
+another fix.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -134,6 +149,11 @@ from config import (
     VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
     MAX_TRANSCRIPTION_DURATION_SECONDS,
+    MIDI_RATE_LIMIT_MAX_REQUESTS,
+    MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
+    MIDI_HQ_ENABLED,
+    MAX_MIDI_DURATION_SECONDS,
+    MAX_MIDI_HQ_DURATION_SECONDS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
@@ -273,6 +293,7 @@ def _iter_tool_routes():
         separation_upgrade,
         audio_tools,
         midi,
+        midi_hq,
         transcribe,
         video_transcribe,
         youtube_transcribe,
@@ -286,6 +307,7 @@ def _iter_tool_routes():
         separation_upgrade.router,
         audio_tools.router,
         midi.router,
+        midi_hq.router,
         transcribe.router,
         video_transcribe.router,
         youtube_transcribe.router,
@@ -793,6 +815,12 @@ async def limits():
             "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
             "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
             "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+            # ADDED 2026-08-28. Both MIDI tools, because they are two
+            # products rather than two qualities of one - see
+            # credits/config.py's rule note. The frontend needs both
+            # numbers on one page if it ever offers the upgrade inline.
+            "audio_to_midi": MIDI_RATE_LIMIT_MAX_REQUESTS,
+            "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
             # LEGACY, kept deliberately. /limits is a public contract the
             # frontend reads, and dropping a key it may still index would
             # turn a backend config change into `undefined` rendered in a
@@ -831,6 +859,20 @@ async def limits():
             # rejection line, not a tier. The tiering is entirely in the
             # credits: 2 free ops a month, then 1 credit per job.
             "transcription_max_duration_seconds": MAX_TRANSCRIPTION_DURATION_SECONDS,
+            # ADDED 2026-08-28. midi_hq_enabled mirrors
+            # separation_hq_enabled exactly: a kill switch the frontend
+            # reads so it can hide the HQ option rather than letting
+            # someone submit into a guaranteed 503.
+            #
+            # Both duration caps are exposed because the two MIDI tools
+            # accept the same length TODAY (600s each) and there is no
+            # guarantee they always will - a frontend that reads one and
+            # assumes the other would break silently the first time they
+            # diverge, which is exactly the drift this endpoint exists to
+            # prevent.
+            "midi_hq_enabled": MIDI_HQ_ENABLED,
+            "midi_max_duration_seconds": MAX_MIDI_DURATION_SECONDS,
+            "midi_hq_max_duration_seconds": MAX_MIDI_HQ_DURATION_SECONDS,
         },
     }
 
