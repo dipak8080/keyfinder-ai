@@ -110,7 +110,7 @@ from config import (
     AUDIO_TOOL_JOB_TTL_SECONDS,
 )
 from utils import _midi_hq_semaphore, cleanup_file
-from jobs import create_job, mark_tool_complete, mark_failed, get_job
+from jobs import create_job, mark_tool_complete, mark_data_complete, mark_failed, get_job
 from audio_common import get_audio_mime_type, build_output_path
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
@@ -375,8 +375,28 @@ async def audio_to_midi_hq_route(
                     max_pitch=max_pitch,
                     min_note_ms=min_note_ms,
                 ),
-                on_success=lambda _: mark_tool_complete(
-                    job_id, original_filename, output_path, "mid"
+                # BOTH marks, deliberately. mark_tool_complete stores the
+                # file (output_path/output_format) so preview and download
+                # work; mark_data_complete stores the worker's stats in
+                # result_data so GET .../result can serve them.
+                #
+                # They write to different fields on the same job dict and
+                # set status/title identically, so calling both is safe
+                # and order does not matter.
+                #
+                # WHY THE STATS NEED SERVING AT ALL. Every other job tool
+                # returns audio a user can hear, so "did it work?" answers
+                # itself. MIDI cannot be previewed as audio in a browser,
+                # so without this the entire result of a PAID job is a
+                # download link and nothing else - no way to tell a
+                # 2,000-note multi-track transcription from an empty file
+                # until it is open in a DAW. The track and note counts are
+                # the only verifiable evidence the paid tier did anything,
+                # which makes them part of the product rather than
+                # diagnostics.
+                on_success=lambda result: (
+                    mark_tool_complete(job_id, original_filename, output_path, "mid"),
+                    mark_data_complete(job_id, original_filename, result),
                 ),
                 generic_error="High-quality MIDI transcription failed unexpectedly.",
                 cleanup_paths=[input_path],
@@ -428,6 +448,63 @@ async def audio_to_midi_hq_route(
 @router.get("/audio-to-midi-hq/status/{job_id}")
 async def audio_to_midi_hq_status(job_id: str):
     return _tool_status(job_id, JOB_TYPE)
+
+
+@router.get("/audio-to-midi-hq/result/{job_id}")
+async def audio_to_midi_hq_result(job_id: str):
+    """What the transcription produced, as JSON. The MIDI itself is at
+    /download.
+
+    Mirrors /speech-to-text/result's contract exactly - same status
+    codes, same 404-on-expired - so a frontend that already polls one
+    can reuse the same handling.
+
+    Returns the worker's own summary:
+
+        {
+          "duration_seconds": 271.4,
+          "track_count": 3,
+          "note_count": 1842,
+          "input_seconds": 270.9,
+          "notes_dropped_by_filter": 37,
+          "tracks": [
+            {"program": 0, "is_drum": false, "name": "Acoustic Grand Piano",
+             "notes": 1204, "low": 28, "high": 96},
+            ...
+          ],
+          "_gpu": {"fetch_seconds": 1.2, "infer_seconds": 14.8, "rtf": 18.3}
+        }
+
+    THIS IS THE ONLY PROOF THE TOOL WORKED. Every other job tool returns
+    audio, so a user can just listen. MIDI cannot be previewed as audio
+    in a browser, so a paid job whose entire visible output is a download
+    link gives someone no way to distinguish a good transcription from an
+    empty file without opening a DAW. "1,842 notes across 3 tracks" is
+    the difference.
+
+    `notes_dropped_by_filter` is worth showing when non-zero: it is the
+    honest answer to "why does this look sparse?" and points at the
+    user's own pitch-range or minimum-note settings rather than leaving
+    them to blame the model.
+
+    "_gpu" is operator diagnostics and is NOT part of the contract - the
+    frontend should ignore it. It is left in rather than stripped because
+    this route is admin-adjacent in practice (it is what you read when
+    someone reports a bad result), and removing it would mean a second
+    lookup to answer "how long did the GPU actually take".
+    """
+    tag_from_job(job_id)
+    job = get_job(job_id)
+    if job is None or job["job_type"] != JOB_TYPE:
+        raise HTTPException(404, "Job not found (it may have expired).")
+    if job["status"] == "failed":
+        raise HTTPException(409, job.get("error") or "This job failed.")
+    if job["status"] != "complete":
+        raise HTTPException(409, f"Job is not complete yet (status: {job['status']}).")
+    result = job.get("result_data")
+    if not result:
+        raise HTTPException(404, "Result not found (it may have expired).")
+    return JSONResponse(result)
 
 
 @router.get("/audio-to-midi-hq/preview/{job_id}")
