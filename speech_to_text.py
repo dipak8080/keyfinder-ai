@@ -38,6 +38,7 @@ from faster_whisper import WhisperModel
 from config import (
     logger,
     TRANSCRIPTION_BACKEND,
+    TRANSCRIPTION_MODEL_NAME,
     WHISPER_MODEL_SIZE,
     WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
@@ -425,6 +426,28 @@ def get_language_options() -> dict:
         "tasks": list(ALLOWED_TRANSCRIPTION_TASKS),
         "modes": list(TRANSCRIPTION_MODE_BEAM_SIZES.keys()),
         "default_mode": DEFAULT_TRANSCRIPTION_MODE,
+        # ADDED 2026-08-29. The model name was a TypeScript constant
+        # rendered on six separate surfaces - six places to be
+        # confidently wrong the day the model changes, which is exactly
+        # the drift this endpoint's own docstring exists to prevent for
+        # the language list.
+        #
+        # NOT DETECTED, and the distinction is worth stating rather than
+        # letting a reader assume it. The language list above genuinely
+        # is read from the installed faster_whisper package, so it
+        # cannot drift. This one cannot be: with TRANSCRIPTION_BACKEND
+        # set to "gpu", the model actually running is whatever
+        # WHISPER_MODEL_SIZE is set to ON THE RUNPOD ENDPOINT - an
+        # environment this process never reads - and the VPS's own
+        # WHISPER_MODEL_SIZE is deliberately left unset so no multi-GB
+        # model gets baked into an image for a fallback that never runs.
+        #
+        # So this is an operator-maintained label in ONE place rather
+        # than seven. Changing the model means editing the RunPod
+        # endpoint's env AND config.TRANSCRIPTION_MODEL_NAME - two edits
+        # in the same mental step, instead of six scattered across a
+        # frontend nobody remembers to grep.
+        "model_name": TRANSCRIPTION_MODEL_NAME,
     }
 
 

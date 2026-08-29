@@ -1055,6 +1055,41 @@ if TRANSCRIPTION_BACKEND not in ("local", "gpu"):
 
 RUNPOD_WHISPER_ENDPOINT_ID = os.environ.get("RUNPOD_WHISPER_ENDPOINT_ID", "")
 
+# ---------- THE MODEL NAME THE SITE ADVERTISES ----------
+# Served in GET /speech-to-text/languages so the frontend stops
+# hardcoding it. It was previously a TypeScript constant rendered on six
+# separate surfaces, which is six places to be confidently wrong the day
+# the model changes.
+#
+# WHY THIS IS A HAND-MAINTAINED STRING AND NOT DETECTED. It would be
+# better if it were detected, and it cannot be:
+#
+#   TRANSCRIPTION_BACKEND=local  the resident faster-whisper model is
+#                                WHISPER_MODEL_SIZE, right here, knowable.
+#   TRANSCRIPTION_BACKEND=gpu    the model is whatever WHISPER_MODEL_SIZE
+#                                is set to ON THE RUNPOD ENDPOINT - a
+#                                different environment this process never
+#                                reads.
+#
+# We run on "gpu". And this VPS's .env DELIBERATELY does not set
+# WHISPER_MODEL_SIZE (see the comment there: setting it would bake a
+# multi-GB model into the VPS image for a local fallback that never
+# runs). So speech_to_text_gpu.get_backend_info() already reports
+# model_size="small" - the default - regardless of what the GPU is
+# actually running. Feeding that to the frontend would replace six
+# hardcoded strings with one confidently wrong one, which is worse:
+# wrong in one place looks authoritative.
+#
+# So this is honest about what it is: an operator-maintained label, in
+# ONE place, next to the endpoint id it has to agree with. Changing the
+# model means changing the RunPod endpoint's env AND this line. Two
+# edits instead of seven, and they sit in the same mental step.
+#
+# If it is ever worth automating, the right shape is the worker
+# reporting its own model in the "_gpu" block it already returns, cached
+# on this side - the same pattern that made gpu_seconds trustworthy.
+TRANSCRIPTION_MODEL_NAME = os.environ.get("TRANSCRIPTION_MODEL_NAME", "Whisper large-v3")
+
 # Both sides of the deadline - see run_worker_job(). Generous enough for
 # a cold start (15-30s) plus a large file transfer plus inference on a
 # 20-minute file, and no more: an over-long timeout is billed GPU time

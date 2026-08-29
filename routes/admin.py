@@ -964,6 +964,23 @@ async def root():
         ),
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
+            # ADDED 2026-08-29. It was in /limits and NOT here, and the
+            # difference matters because getFeatureFlags() reads THIS
+            # route, not /limits.
+            #
+            # The consequence was specific and bad: with no availability
+            # flag to read, the frontend tied the Multi-track engine
+            # picker to paywall_tools["audio-to-midi-hq"] instead. Those
+            # are different questions. Turning OFF charging - the exact
+            # state the integration spec tells you to test in - made the
+            # tool vanish rather than become free, so the free-flow test
+            # could not be run at all.
+            #
+            # Sits beside separation_hq_enabled because it is the same
+            # kind of flag: "can this tool run", independent of "does it
+            # cost anything". Both belong here; neither belongs in
+            # paywall_tools.
+            "midi_hq_enabled": MIDI_HQ_ENABLED,
             "paywall_enabled": paywall_enabled,
             "paywall_tools": paywall_tools,
         },
