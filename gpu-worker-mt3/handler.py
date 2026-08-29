@@ -85,7 +85,6 @@ instrument" for a solo guitar upload.
 """
 
 import base64
-import io
 import os
 import tempfile
 import time
@@ -370,10 +369,47 @@ def handler(job):
 
         # ---------- inference ----------
         infer_started = time.monotonic()
-        midi = mt3_transcribe(audio, sr=sr, model=MODEL)
+        midi_raw = mt3_transcribe(audio, sr=sr, model=MODEL)
         infer_seconds = time.monotonic() - infer_started
 
-        if midi is None or not getattr(midi, "instruments", None):
+        if midi_raw is None:
+            return {"error": "NO_NOTES_DETECTED"}
+
+        # ---------- mido -> pretty_midi ----------
+        # mt3_infer.transcribe() returns a mido.MidiFile, NOT a
+        # pretty_midi.PrettyMIDI. Those two have completely different
+        # APIs: mido exposes .tracks holding raw MIDI messages, while
+        # everything below this line - _filter_midi, _summarise, the
+        # note counts, the per-instrument programs - is written against
+        # pretty_midi's .instruments / .notes / .get_end_time().
+        #
+        # THIS COST A DAY. The first version of this handler checked
+        # `getattr(midi, "instruments", None)` and returned
+        # NO_NOTES_DETECTED when it was falsy. mido.MidiFile has no
+        # .instruments attribute at all, so that check was ALWAYS false -
+        # every job reported "no notes" no matter how good the
+        # transcription was, and the model's actual output was discarded
+        # unread. The worker log said "Inference result type: <class
+        # 'tuple'>" and then failed, which reads like a model problem and
+        # is not one.
+        #
+        # Converting through a file rather than in memory is deliberate:
+        # pretty_midi has no constructor that takes a mido object, and
+        # round-tripping through the on-disk format is exactly what the
+        # mt3-infer CLI does. It is also what guarantees the bytes the
+        # user downloads are the bytes that were parsed for the stats -
+        # a separate serialisation path could report counts that do not
+        # match the file.
+        raw_path = os.path.join(tmp_dir, "raw.mid")
+        try:
+            midi_raw.save(raw_path)
+            midi = pretty_midi.PrettyMIDI(raw_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"[MT3_GPU] could not convert model output to MIDI: {e}", flush=True)
+            traceback.print_exc()
+            return {"error": "TRANSCRIPTION_FAILED"}
+
+        if not midi.instruments or not any(i.notes for i in midi.instruments):
             return {"error": "NO_NOTES_DETECTED"}
 
         # ---------- post-process ----------
@@ -392,9 +428,15 @@ def handler(job):
             return {"error": "NO_NOTES_AFTER_FILTER" if dropped else "NO_NOTES_DETECTED"}
 
         # ---------- serialise ----------
-        buf = io.BytesIO()
-        midi.write(buf)
-        midi_bytes = buf.getvalue()
+        # Written to a path and read back, rather than PrettyMIDI.write()
+        # into a BytesIO. Its file-object support has varied across
+        # versions, and a silently truncated write here would produce a
+        # .mid that opens as an empty project in a DAW - a much worse
+        # failure than an error, because it looks like the tool worked.
+        out_path = os.path.join(tmp_dir, "out.mid")
+        midi.write(out_path)
+        with open(out_path, "rb") as f:
+            midi_bytes = f.read()
 
         stats = _summarise(midi)
         total = time.monotonic() - started
@@ -431,10 +473,13 @@ def handler(job):
     finally:
         # The worker's disk persists across jobs on a warm container, so
         # a leaked temp file is a leak for the life of the worker.
+        # shutil.rmtree, not os.remove + rmdir: the directory now holds
+        # the input, the raw model output and the filtered output, and an
+        # rmdir on a non-empty directory fails silently under the except
+        # below - leaking all three for the life of a warm worker.
         try:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-            os.rmdir(tmp_dir)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:  # noqa: BLE001
             pass
 
