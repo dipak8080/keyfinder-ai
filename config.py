@@ -1001,11 +1001,41 @@ WHISPER_VAD_FILTER = os.environ.get("WHISPER_VAD_FILTER", "false").lower() == "t
 # just needs its own TTL, same reasoning as AUDIO_TOOL_JOB_TTL_SECONDS.
 TRANSCRIPTION_JOB_TTL_SECONDS = int(os.environ.get("TRANSCRIPTION_JOB_TTL_SECONDS", str(60 * 60)))  # 1 hour
 
-# Transcription time scales with audio length and, even with int8 on
-# CPU, can be slow for long files - cap input duration more
-# conservatively than the other audio tools (20 min) to keep worst-case
-# wait times bounded. Raise only after confirming your VPS's actual
-# throughput.
+# CORRECTED 2026-08-29. This comment was stale in two ways at once and
+# both were misleading in the same direction - they made the cap sound
+# looser and the cost sound lower than either is.
+#
+# It said "(20 min)". The value is 600 seconds, which is 10. The number
+# was lowered from 1200 on 2026-08-27 and the prose was not, so anyone
+# reading this file - or writing frontend copy from it - would have
+# advertised a limit twice the real one. That is the same class of bug
+# as the four /limits drifts the frontend found: a hand-maintained
+# second statement of a number that already exists in code.
+#
+# It also reasoned from "even with int8 on CPU". Transcription has not
+# run on this VPS since the GPU migration - see TRANSCRIPTION_BACKEND
+# below and transcription.py's dispatch. The local faster-whisper model
+# is not even loaded when the backend is "gpu".
+#
+# THE REAL REASON FOR 600, which is worth stating because it is not
+# about wait time at all any more:
+#
+# Transcription is the most expensive tool on the site per minute of
+# audio - $0.0050/min measured, against $0.0029 for HQ stem splitting
+# and $0.0007 for HQ MIDI. It is also, as of today, the only metered
+# tool whose PAYWALL IS OFF, because the frontend cannot yet render a
+# 402. That combination makes it 76% of a $2.10 monthly GPU bill while
+# charging nobody.
+#
+# So this cap is currently the ONLY thing bounding that spend. 600
+# halves the worst case per job from $0.050 to $0.025. Average input is
+# around 8 minutes, so 600 already bites real users - going lower would
+# start rejecting ordinary work, which is the wrong trade for a few
+# cents.
+#
+# RAISE THIS ONCE THE PAYWALL IS ON, not before. With credits charged,
+# the cost is covered by the person choosing to spend one, and the cap
+# goes back to being about wait time - where 1200 was defensible.
 MAX_TRANSCRIPTION_DURATION_SECONDS = int(os.environ.get("MAX_TRANSCRIPTION_DURATION_SECONDS", "600"))  # 10 min
 
 AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS", "2"))
