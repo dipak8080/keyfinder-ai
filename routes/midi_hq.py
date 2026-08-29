@@ -252,6 +252,46 @@ def _validated_filters(
     )
 
 
+def _record_gpu_cost(job_id: str, result: dict) -> None:
+    """Write the worker's reported timing against this job's metrics row.
+
+    WHY THIS IS NOT IN _run_tool_job. That runner's metered_tool= hook
+    records only the terminal STATUS, deliberately: the honest
+    gpu_seconds figure comes from what the worker measured for its own
+    run, and the runner has no access to it - `result` is opaque to it
+    by design, since eighteen other tools share the same function.
+    Wall clock measured there would also span RunPod queue wait and cold
+    start, and recording that as GPU-seconds would inflate every cost
+    estimate in a direction that looks entirely plausible.
+
+    So the number is recorded HERE, at the one call site that sees both
+    the job id and the worker's payload. transcription.py does the same
+    thing one layer down for the same reason.
+
+    ORDER IS SAFE EITHER WAY. This runs from on_success; _run_tool_job's
+    `finally` then writes the status. record_job_finished COALESCEs every
+    optional column, so whichever lands second cannot blank what the
+    first recorded.
+
+    Swallows everything, like every function in credits/metering.py: a
+    metering failure must never turn a working transcription into a
+    failed one. A missing row costs one data point; an exception here
+    would cost the user their MIDI after the GPU time was already paid
+    for.
+    """
+    try:
+        gpu = (result or {}).get("_gpu") or {}
+        gpu_seconds = float(gpu.get("fetch_seconds") or 0) + float(gpu.get("infer_seconds") or 0)
+        if gpu_seconds <= 0:
+            # Older worker image, or a malformed payload. Recording zero
+            # would be worse than recording nothing: it drags the average
+            # cost-per-job down with a job that certainly cost something.
+            return
+        metering.record_job_finished(job_id, status="completed", gpu_seconds=gpu_seconds)
+    except Exception:  # noqa: BLE001
+        logger.exception("[%s] could not record GPU cost for job %s", TOOL, job_id)
+
+
 @router.post(
     "/audio-to-midi-hq",
     dependencies=[Depends(tiered_rate_limit(
@@ -397,6 +437,7 @@ async def audio_to_midi_hq_route(
                 on_success=lambda result: (
                     mark_tool_complete(job_id, original_filename, output_path, "mid"),
                     mark_data_complete(job_id, original_filename, result),
+                    _record_gpu_cost(job_id, result),
                 ),
                 generic_error="High-quality MIDI transcription failed unexpectedly.",
                 cleanup_paths=[input_path],
