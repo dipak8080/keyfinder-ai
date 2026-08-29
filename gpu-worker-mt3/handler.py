@@ -174,7 +174,22 @@ def _fetch_input(vps_base_url: str, token: str, secret: str, dest_path: str) -> 
     large file away from an OOM that looks like a model failure.
     """
     url = f"{vps_base_url.rstrip('/')}/internal/gpu/input/{token}"
-    headers = {"x-internal-secret": secret}
+
+    # Authorization: Bearer, NOT a custom x-internal-secret header.
+    #
+    # gpu_internal_routes._check_secret() on the VPS reads
+    # request.headers["authorization"], requires the "Bearer " prefix,
+    # and compares the remainder in constant time. Anything else is a
+    # 401 raised BEFORE the route body runs - which surfaces here as
+    # INPUT_FETCH_FAILED and, on the VPS, as nothing at all in the
+    # application log, because the dependency rejected the request
+    # before any handler could log it.
+    #
+    # That combination is why this was worth getting wrong once: the
+    # worker reports a generic fetch failure, the VPS reports silence,
+    # and the only place the truth exists is a header name neither side
+    # prints.
+    headers = {"Authorization": f"Bearer {secret}"}
 
     written = 0
     with requests.get(url, headers=headers, stream=True, timeout=_HTTP_TIMEOUT) as r:
