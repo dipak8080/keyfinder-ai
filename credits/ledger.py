@@ -7,7 +7,10 @@ new subject but the same IP bucket.
 
 job_charges is the idempotency anchor: exactly one row per job that ever
 reached the paywall, so a retried request or a doubled webhook can never
-double-charge or double-refund.
+double-charge or double-refund. It also records free_ops - how much
+ALLOWANCE a job consumed, as distinct from how many credits - because
+those two are different numbers and only one of them was being stored.
+See charge_for_job() and migration 003.
 
 --------------------------------------------------------------------------
 FREE-TIER ACCOUNTING (rewritten 2026-08-27)
@@ -219,6 +222,10 @@ def _free_route_limits() -> dict:
             YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
             YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
             YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+            AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
+            AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+            MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
+            MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
         )
     except ImportError:
         return {}
@@ -227,6 +234,30 @@ def _free_route_limits() -> dict:
         "stems-hq": (STEMS_HQ_RATE_LIMIT_MAX_REQUESTS, STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS),
         "youtube/separate-hq": (YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS, YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS),
         "youtube/stems-hq": (YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS, YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS),
+        # ADDED 2026-08-29. Both were metered without being added here,
+        # so GET /credits/me reported a rate_limit block covering four of
+        # the six metered tools and silently omitting two.
+        #
+        # WHY THAT MATTERED MORE THAN IT LOOKS. The frontend's fallback
+        # for a missing key is /limits, which serves the FREE numbers and
+        # nothing else - it is static and cacheable precisely because it
+        # does not know who is asking. So a credit holder on
+        # /audio-to-midi-hq was shown "2 per hour" while the limiter was
+        # actually enforcing 30. A UI that lies pessimistically is still
+        # a UI that lies, and this one lied specifically to the people
+        # who had paid.
+        #
+        # "transcribe" is ONE key for three routes - /speech-to-text,
+        # /youtube/transcribe and /video-to-text - because they share one
+        # credits rule, one RunPod endpoint and one semaphore. But
+        # rate_limit.py keys its window on (ip, path), so those three
+        # have SEPARATE per-IP buckets at the same number. The value
+        # below is /speech-to-text's; all three are 2/hour today, and if
+        # they ever diverge this line reports whichever one it names
+        # rather than being wrong about all of them. The per-route
+        # numbers stay available in /limits.
+        "transcribe": (AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS, AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS),
+        "audio-to-midi-hq": (MIDI_HQ_RATE_LIMIT_MAX_REQUESTS, MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS),
     }
 
 
@@ -344,12 +375,21 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
 
         owner_type, owner_id = identity.owner
 
+        # How many free monthly ops this job consumes. Zero for 'credit'
+        # and 'none' charges, which spend no allowance at all - only the
+        # 'free' branch below sets it. Stored on the charge row so
+        # refund_job() can return exactly what was taken instead of
+        # assuming 1, which is what it did until 2026-08-29 and which was
+        # correct only by coincidence of every rule costing 1 credit.
+        free_ops = 0
+
         if not billable:
             charge_type, credits = "none", 0
         else:
             remaining = free_remaining(conn, identity, period)
             if remaining >= credits_needed:
                 charge_type, credits = "free", 0
+                free_ops = credits_needed
                 # BOTH owner keys, not just the active one. For a
                 # signed-in caller that means account:Y AND subject:X -
                 # the subject key is what survives sign-out, and leaving
@@ -370,9 +410,10 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
 
         conn.execute(
             """INSERT INTO job_charges (job_id, tool, charge_type, owner_type, owner_id, subject_id,
-               ip_hash, period, credits, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,'held',?)""",
+               ip_hash, period, credits, free_ops, status, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,'held',?)""",
             (job_id, tool, charge_type, owner_type, owner_id, identity.subject_id,
-             identity.ip_hash, period, credits, now_iso()),
+             identity.ip_hash, period, credits, free_ops, now_iso()),
         )
         return Charge(job_id=job_id, tool=tool, charge_type=charge_type, credits=credits,
                      balance_after=get_balance(conn, identity),
@@ -451,17 +492,25 @@ def refund_job(job_id: str, reason: str = "job_failed") -> bool:
             # wrong counter. job_charges stores owner_type, owner_id AND
             # subject_id at charge time precisely so this can be exact.
             #
-            # KNOWN LIMITATION, safe only while every rule costs 1
-            # credit. charge_for_job() bumps by credits_needed, this
-            # returns exactly 1. Add a tool with credits > 1 and a
-            # failed free-tier job permanently eats an op the user never
-            # spent. job_charges.credits is 0 for free charges so it
-            # cannot be read back from there - the fix is a free_ops
-            # column on job_charges, written at charge time. Do that
-            # BEFORE raising any rule above 1.
+            # free_ops is read the same way, and for the same reason
+            # (fixed 2026-08-29). This used to be a hardcoded -1 while
+            # charge_for_job() bumped by credits_needed - correct only
+            # because every rule costs 1 credit, and silently wrong the
+            # moment one did not. The amount could not be derived: for a
+            # free charge job_charges.credits is 0 by design, because no
+            # credits moved. So the allowance spent is now recorded
+            # explicitly at charge time.
+            #
+            # The `or 1` fallback covers rows written before migration
+            # 003. It matches that migration's DEFAULT 1, and 1 is the
+            # correct historical value for all of them rather than a
+            # placeholder - every existing charge was made under a
+            # 1-credit rule.
+            ops = row["free_ops"] if "free_ops" in row.keys() else None
+            ops = int(ops) if ops is not None else 1
             for key in _free_owner_keys(row["owner_type"], row["owner_id"], row["subject_id"]):
-                _bump_free(conn, row["period"], "owner", key, -1)
-            _bump_free(conn, row["period"], "ip", row["ip_hash"], -1)
+                _bump_free(conn, row["period"], "owner", key, -ops)
+            _bump_free(conn, row["period"], "ip", row["ip_hash"], -ops)
 
         conn.execute("UPDATE job_charges SET status='refunded', refunded_at=?, refund_reason=? WHERE job_id=?",
                     (now_iso(), reason, job_id))

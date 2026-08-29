@@ -1,0 +1,53 @@
+-- 003 — free_ops on job_charges.
+--
+-- WHAT WAS WRONG
+-- charge_for_job() bumps the free-tier counters by credits_needed:
+--
+--     _bump_free(conn, period, "owner", key, credits_needed)
+--     _bump_free(conn, period, "ip",    key, credits_needed)
+--
+-- refund_job() gave back exactly 1:
+--
+--     _bump_free(conn, row["period"], "owner", key, -1)
+--
+-- On every rule shipped so far those two agree, because every rule
+-- costs 1 credit. The moment any rule is set to 2, a FAILED free-tier
+-- job returns one op and keeps the other — permanently, silently, with
+-- no error anywhere. The user is left short an op they never spent, and
+-- the only trace is a free_usage row that is one higher than it should
+-- be.
+--
+-- WHY THE NUMBER COULD NOT SIMPLY BE READ BACK
+-- job_charges.credits is 0 for a free charge, by design: no credits
+-- changed hands, and the ledger has no row. So the charge record knew
+-- how much money moved (none) and not how much ALLOWANCE moved, which
+-- is the thing a refund has to return. The information was never
+-- stored, so refund_job() guessed — and the guess was right only by
+-- coincidence of the current pricing.
+--
+-- WHAT THIS COLUMN IS
+-- How many free monthly ops this job consumed, written at charge time,
+-- read at refund time. Zero for 'credit' and 'none' charges, which
+-- consume no allowance at all.
+--
+-- DEFAULT 1 IS DELIBERATE AND MAKES BACKFILL UNNECESSARY.
+-- Every existing row was charged under a 1-credit rule, so 1 is not a
+-- placeholder — it is the correct historical value for all of them. A
+-- refund of an old job after this migration returns exactly what it
+-- would have returned before, which is what makes this safe to apply to
+-- a live database holding real balances.
+--
+-- The alternative — NULL default plus a COALESCE at every read — would
+-- have been strictly worse: it makes "we don't know" and "it was 1"
+-- indistinguishable forever, on a table where the two have different
+-- meanings the day a rule changes.
+--
+-- SQLite ALTER TABLE ADD COLUMN is safe here: it rewrites no rows, holds
+-- no long lock, and cannot fail partway on an existing table. That is
+-- specifically why this is a column and not the table rebuild that
+-- changing a CHECK constraint would have required — see the reverted
+-- attempt to add a 'merged' scope to free_usage, which took sign-in
+-- down in production because free_usage carries
+-- CHECK (scope IN ('owner','ip')) and SQLite cannot ALTER a CHECK.
+
+ALTER TABLE job_charges ADD COLUMN free_ops INTEGER NOT NULL DEFAULT 1;
