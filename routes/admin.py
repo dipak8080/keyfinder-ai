@@ -220,6 +220,18 @@ from config import (
     SEPARATION_JOB_TTL_SECONDS,
     AUDIO_TOOL_JOB_TTL_SECONDS,
     TRANSCRIPTION_JOB_TTL_SECONDS,
+    # Durations and the two format sets the audio list does not cover
+    # (added 2026-08-30). See the `durations` block in limits() for why
+    # ~18 pages stating no length limit at all was the more urgent half
+    # of this.
+    MAX_AUDIO_TOOL_DURATION_SECONDS,
+    AUDIO_TOOL_MAX_DURATION_SECONDS,
+    VIDEO_EXTRACT_MAX_DURATION_SECONDS,
+    JOIN_MAX_TOTAL_DURATION_SECONDS,
+    MIN_MIDI_DURATION_SECONDS,
+    MIN_MIDI_HQ_DURATION_SECONDS,
+    ALLOWED_VIDEO_INPUT_FORMATS,
+    MIDI_INPUT_FORMATS,
     MIDI_WORKER_URL,
 )
 from utils import run_blocking
@@ -861,6 +873,82 @@ async def limits():
             "max_per_file_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         },
         "allowed_audio_formats": sorted(ALLOWED_AUDIO_INPUT_FORMATS),
+        # The two sets the audio list does NOT cover (added 2026-08-30).
+        # Both were already enforced and neither was published, so a page
+        # wanting either had to hand-write it - which is precisely how
+        # /stems came to omit AIFF while the tool accepted it.
+        #
+        # Video is deliberately its own set rather than folded into the
+        # audio one: /video-to-audio and /video-to-text accept these, no
+        # other endpoint should, and no endpoint anywhere outputs one.
+        # Merging them would make every audio tool advertise mp4.
+        "allowed_video_formats": sorted(ALLOWED_VIDEO_INPUT_FORMATS),
+        # /audio-to-midi and /audio-to-midi-hq accept the audio set PLUS
+        # opus and webm - basic-pitch decodes via librosa, which falls
+        # back to ffmpeg for containers soundfile cannot read. Published
+        # as its own complete list rather than as "audio plus two" so the
+        # frontend renders it directly instead of reconstructing it.
+        "allowed_midi_input_formats": sorted(MIDI_INPUT_FORMATS),
+        # ---------- DURATION CAPS (added 2026-08-30) ----------
+        # /limits published four duration caps - midi, midi_hq,
+        # separation_hq, transcription - and nothing for the ~18 ordinary
+        # job tools, which left every one of those pages silent about a
+        # limit that will reject an upload. Silence is better than a
+        # wrong number and worse than the right one.
+        #
+        # A FALLBACK PLUS OVERRIDES, not a flat per-tool map, because
+        # that is the actual shape in config.py: _validate_duration_or_reject
+        # looks the tool up in AUDIO_TOOL_MAX_DURATION_SECONDS and falls
+        # through to MAX_AUDIO_TOOL_DURATION_SECONDS when it is absent.
+        # Publishing a flattened map would mean re-listing every tool
+        # here - a sixth hand-maintained enumeration, and three of the
+        # existing five have already drifted. Read
+        # per_tool_seconds[tool] ?? default_seconds; a tool missing from
+        # the map is not an omission, it is the fallback.
+        #
+        # WORTH KNOWING WHY THE OVERRIDES SUDDENLY MATTER: that map sat
+        # in config.py for weeks with ZERO readers - a grep for its name
+        # across the container returned two hits, both inside config.py
+        # itself. Every tool silently took the 3600 fallback, so pitch
+        # and tempo's 900s entries were decoration. Wired up 2026-08-30,
+        # which means those two tools dropped from 1 hour to 15 minutes
+        # in a single deploy. Any page still advertising an hour for
+        # pitch or tempo has been wrong since that deploy - which is the
+        # strongest argument available for reading this block rather
+        # than typing the numbers.
+        "durations": {
+            "audio_tools_default_seconds": MAX_AUDIO_TOOL_DURATION_SECONDS,
+            "audio_tools_per_tool_seconds": dict(AUDIO_TOOL_MAX_DURATION_SECONDS),
+            # Keyed by the same job_type string create_job() uses, which
+            # is what _validate_duration_or_reject looks up - so the keys
+            # here are the enforced keys, not a parallel naming scheme.
+            #
+            # /convert is the ONE tool with no duration cap at all, and
+            # it is absent from both values above rather than carrying a
+            # large number - so it needs its own key or the frontend
+            # would apply the 3600 fallback to it and reject uploads the
+            # server would have accepted.
+            #
+            # VERIFIED AT THE ROUTE, not inferred from config.py's
+            # comment: convert_audio_route is the only caller anywhere
+            # passing check_duration=False. Worth stating how it was
+            # checked, because the per-tool map immediately above spent
+            # weeks being described accurately by a comment and read by
+            # nothing - a config comment is evidence of intent, not of
+            # behaviour.
+            "exempt_tools": ["convert"],
+            "video_extract_max_seconds": VIDEO_EXTRACT_MAX_DURATION_SECONDS,
+            # A TOTAL across every file in one /join request, not per
+            # file - ten four-minute tracks is a forty-minute re-encode
+            # however modest each one looks alone.
+            "join_max_total_seconds": JOIN_MAX_TOTAL_DURATION_SECONDS,
+            # LOWER bounds, the only two on the site. Below these there
+            # is not enough signal for the model to find anything and the
+            # result is a guaranteed empty MIDI, so submitting is
+            # rejected rather than spending a worker round trip on it.
+            "midi_min_seconds": MIN_MIDI_DURATION_SECONDS,
+            "midi_hq_min_seconds": MIN_MIDI_HQ_DURATION_SECONDS,
+        },
         # ---------- RETENTION (added 2026-08-30) ----------
         # Published because these are PRIVACY CLAIMS now, not internal
         # details. /vocal-remover's FAQ said uploads are "deleted once
