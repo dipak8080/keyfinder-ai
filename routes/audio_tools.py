@@ -49,6 +49,38 @@ their third attempt mid-decision. See the note on
 AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS in config.py. No code change here -
 the constants are read from config as before.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-30): THE PER-TOOL DURATION CAP IS NOW LIVE
+
+AUDIO_TOOL_MAX_DURATION_SECONDS in config.py (pitch/tempo = 900s) had
+never been imported by anything. A grep across every .py file in the
+container found it in exactly two places, both inside config.py itself:
+its own definition and a comment pointing at it. Every tool in this file
+was therefore validated against validate_duration()'s signature default,
+MAX_AUDIO_TOOL_DURATION_SECONDS (3600).
+
+The fix is entirely in _shared.py - _validate_duration_or_reject() takes
+a job_type now and resolves the map when the caller passed no explicit
+cap. The fourteen tools that go through _submit_audio_tool() inherit it
+with no change here at all, because that helper already knows its own
+job_type and forwards it.
+
+THE ONE LINE IN THIS FILE is /trim's direct call, which now passes
+job_type="trim". trim has no entry in the map, so its behaviour is
+identical today - it still gets the 3600s fallback. It is passed anyway
+because /trim is the single route here with a custom submit path, which
+makes it the one most likely to be forgotten the day someone decides
+trim needs its own cap. Every other route in this file gets that for
+free; this keeps /trim from being the exception that quietly cannot be
+tuned.
+
+FRONTEND IMPACT: /pitch and /tempo genuinely accept 15 minutes now, not
+an hour. The pitch and tempo pages advertised 1 hour, which was correct
+against the old behaviour and is wrong against this one - the copy
+changes in the same release. See the module docstring in _shared.py for
+the full writeup.
+--------------------------------------------------------------------------
 """
 import os
 import asyncio
@@ -254,7 +286,16 @@ async def trim_audio_route(
     # use the shared helper's fire-and-forget check: the cap has to be
     # enforced AND the value is passed to trim_audio() itself, and
     # end_seconds has to be range-checked against it.
-    duration = await _validate_duration_or_reject(job_id, input_path)
+    #
+    # job_type="trim" added 2026-08-30, when AUDIO_TOOL_MAX_DURATION_SECONDS
+    # was finally wired into _validate_duration_or_reject(). trim has no
+    # entry in that map, so this changes nothing today - it still gets
+    # MAX_AUDIO_TOOL_DURATION_SECONDS. It is passed because every other
+    # route in this file gets its per-tool cap for free via
+    # _submit_audio_tool, and /trim is the one custom submit path here:
+    # without this argument it would be the single route that silently
+    # ignores the map the day someone adds a "trim" entry to it.
+    duration = await _validate_duration_or_reject(job_id, input_path, job_type="trim")
 
     if end_seconds > duration:
         # Small overshoot: the caller measured the same file a different

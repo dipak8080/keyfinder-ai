@@ -146,6 +146,44 @@ on one call site is the wrong trade.
 Passed today by routes/transcribe.py only. The other two transcription
 routes have their own runners and call metering directly.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-08-30: job_type= on _validate_duration_or_reject(), which is
+what finally makes AUDIO_TOOL_MAX_DURATION_SECONDS do anything at all.
+
+That map has sat in config.py since the per-tool timeouts landed,
+carrying a docstring that describes precisely the bug it prevents - and
+nothing ever imported it. A `grep -rn` for its name across every .py
+file in the container returned exactly two hits, both inside config.py
+itself: the definition, and a comment pointing at the definition. Zero
+readers.
+
+So every audio tool took the `max_seconds is None` branch and got
+validate_duration()'s own default, which is
+MAX_AUDIO_TOOL_DURATION_SECONDS (3600). pitch and tempo's 900s entries
+were decoration.
+
+Which means the failure the map was written to stop was live the entire
+time, exactly as its config comment predicted: a 50-minute file passes
+the 1-hour check, is accepted, takes one of only four slots in
+MAX_CONCURRENT_AUDIO_TOOLS, and rubberband grinds until pitch's 600s
+entry in AUDIO_TOOL_TIMEOUT_SECONDS kills it. The user waits the full
+ten minutes to be told it failed, and a quarter of the shared pool is
+unavailable for all of it.
+
+WHY THIS KEPT HAPPENING is worth naming, because it is the same shape as
+two other bugs this file and config.py already document: the
+SILENCE_MIN_DURATION_SECONDS env lookup that read a name nothing ever
+set, and the /limits values the frontend had drifted from. A constant
+that exists and is never read fails identically to an env var that never
+matches - silently, and always in the looser-than-documented direction.
+Neither raises. Neither logs. The only symptom is that a limit you
+believe you have is not there.
+
+The frontend was advertising 1 hour on the pitch and tempo pages, which
+was CORRECT against the running code and becomes wrong the moment this
+deploys. Those two pages drop to 15 minutes in the same release.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -163,6 +201,12 @@ from config import (
     MAX_QUEUED_AUDIO_TOOLS,
     MAX_QUEUED_MIDI_HQ,
     AUDIO_TOOL_JOB_TYPES,
+    # The per-tool duration caps. MAX_AUDIO_TOOL_DURATION_SECONDS is
+    # deliberately NOT imported alongside it: validate_duration()'s
+    # signature default already IS that constant, so a tool with no entry
+    # in this map falls through to it without the number being restated
+    # here. One fallback, one place.
+    AUDIO_TOOL_MAX_DURATION_SECONDS,
 )
 from upload import save_upload
 from utils import (
@@ -545,6 +589,7 @@ async def _validate_duration_or_reject(
     job_id: str,
     input_path: str,
     max_seconds: Optional[int] = None,
+    job_type: Optional[str] = None,
 ) -> float:
     """
     Runs the ffprobe duration check and turns a failure into a synchronous
@@ -569,7 +614,43 @@ async def _validate_duration_or_reject(
     as input_seconds, so the probe that enforces the cap is also the
     probe that prices the job. One ffprobe, two decisions - and they can
     never disagree about how long the file is.
+
+    ------------------------------------------------------------------
+    job_type (ADDED 2026-08-30) - the per-tool cap, finally connected.
+
+    See the module docstring for how long AUDIO_TOOL_MAX_DURATION_SECONDS
+    sat in config.py with zero readers. Short version: pitch and tempo's
+    900s entries did nothing, every tool got the 3600s fallback, and a
+    50-minute file was accepted into a slot it could never finish in.
+
+    PRECEDENCE, highest first:
+      1. an explicit max_seconds from the caller. routes/transcribe.py
+         and routes/midi.py pass their own caps and must keep winning -
+         transcribe's value also feeds paywall.guard(), so overriding it
+         here would change what a job costs.
+      2. this tool's entry in AUDIO_TOOL_MAX_DURATION_SECONDS, keyed by
+         the same job_type string passed to create_job().
+      3. validate_duration()'s own signature default, which IS
+         MAX_AUDIO_TOOL_DURATION_SECONDS.
+
+    .get() with NO default is the point: a tool absent from the map
+    leaves max_seconds None and falls through to (3) untouched. Writing
+    `.get(job_type, MAX_AUDIO_TOOL_DURATION_SECONDS)` instead would put a
+    second copy of the fallback here, and two statements of one number is
+    how the /limits drift started.
+
+    OPTIONAL, not required, and that is deliberate rather than lazy. The
+    three transcription routes and both MIDI routes call this with an
+    explicit max_seconds and no job_type; making job_type mandatory would
+    force five call sites to pass a value that (1) above then discards.
     """
+    # Resolve the per-tool cap only when the caller didn't name one. The
+    # `max_seconds is None` guard is what preserves rule (1) above - a
+    # route that brought its own number is never second-guessed by the
+    # map.
+    if max_seconds is None and job_type is not None:
+        max_seconds = AUDIO_TOOL_MAX_DURATION_SECONDS.get(job_type)
+
     try:
         if max_seconds is None:
             return await run_blocking(validate_duration, input_path)
@@ -958,7 +1039,15 @@ async def _submit_audio_tool(
         raise HTTPException(500, str(e))
 
     if check_duration:
-        duration = await _validate_duration_or_reject(job_id, input_path, max_duration_seconds)
+        # job_type is forwarded so the per-tool cap in
+        # AUDIO_TOOL_MAX_DURATION_SECONDS applies - pitch and tempo are
+        # 900s, everything else falls through to
+        # MAX_AUDIO_TOOL_DURATION_SECONDS. max_duration_seconds still
+        # wins when a caller passes one; see the precedence list in
+        # _validate_duration_or_reject's docstring.
+        duration = await _validate_duration_or_reject(
+            job_id, input_path, max_duration_seconds, job_type=job_type
+        )
 
         # Lower bound, opt-in per tool. Below ~1s there isn't enough
         # signal for MIDI transcription to find anything - this turns a
