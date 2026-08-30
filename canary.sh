@@ -10,11 +10,21 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # WHY IT REALLY DOWNLOADS: on 2026-08-18 --skip-download reported every
 # client healthy while real downloads 403'd on the media fetch. A canary
 # that doesn't pull bytes lies.
+#
+# WHY FAILURES ARE LOGGED TO DISK (added 2026-08-30): on 2026-08-29 this
+# fired ALL-clients-FAILED three separate times (12:45, 16:15, 23:15 UTC)
+# and every window self-recovered within one or two cron cycles. There was
+# NOTHING to diagnose from afterwards: `docker exec` output never enters
+# the container's own log stream, and this script sent it to /dev/null, so
+# three real outage alerts produced zero evidence. The failing client's
+# last 30 lines now land in data/canary_failures.log - the bind mount, so
+# it outlives the container the same way cookies and cache do.
 set -uo pipefail
 
 VIDEO="https://www.youtube.com/shorts/EzbugeXQMeY"
 CLIENTS=(tv_simply web_embedded android_vr)
 STATE="/home/deploy/app/data/canary_state.json"
+FAILLOG="/home/deploy/app/data/canary_failures.log"
 POT="/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
 HOOK=$(grep -m1 '^ALERT_WEBHOOK_URL=' /home/deploy/app/.env | cut -d= -f2-)
 
@@ -37,13 +47,28 @@ for c in "${CLIENTS[@]}"; do
       -f bestaudio/best -o "/tmp/canary_$c.%(ext)s" --no-progress \
       --extractor-args "youtube:player_client=$c" \
       --extractor-args "youtubepot-bgutilscript:script_path=$POT" \
-      "$VIDEO" >/dev/null 2>&1; then
+      "$VIDEO" >"/tmp/canary_out_$c.txt" 2>&1; then
     passed="$passed $c"; results="${results}${c}=OK "
   else
     failed="$failed $c"; results="${results}${c}=FAIL "
+    # Written on EVERY failed client, not only on alert-worthy state
+    # changes. A client that fails on two consecutive runs produces one
+    # alert and two log entries - and the second entry is what tells you
+    # whether it is the same error twice or a different one.
+    {
+      date -u +"%Y-%m-%dT%H:%M:%SZ [$c] ---------------------------"
+      tail -30 "/tmp/canary_out_$c.txt" 2>/dev/null || echo "(no output captured)"
+    } >> "$FAILLOG" 2>/dev/null
   fi
   docker exec audioforges-api rm -f "/tmp/canary_$c.webm" "/tmp/canary_$c.m4a" 2>/dev/null
+  rm -f "/tmp/canary_out_$c.txt" 2>/dev/null
 done
+
+# Keep the failure log bounded. Unbounded it would grow forever on a bad
+# night and nothing else prunes it.
+if [ -f "$FAILLOG" ] && [ "$(wc -l < "$FAILLOG" 2>/dev/null || echo 0)" -gt 2000 ]; then
+  tail -1000 "$FAILLOG" > "$FAILLOG.tmp" && mv "$FAILLOG.tmp" "$FAILLOG"
+fi
 
 current=$(echo "$results" | tr -d ' ')
 previous=$(cat "$STATE" 2>/dev/null || echo "")
@@ -54,9 +79,9 @@ echo "$current" > "$STATE"
 [ "$current" = "$previous" ] && exit 0
 
 if [ -n "$failed" ] && [ -z "$passed" ]; then
-  msg="[CANARY] ALL extraction clients FAILED ($results) - downloads are down. Check yt-dlp/YouTube changes, and confirm the container is running."
+  msg="[CANARY] ALL extraction clients FAILED ($results) - downloads are down. Check yt-dlp/YouTube changes, and confirm the container is running. Error output: tail -60 $FAILLOG"
 elif [ -n "$failed" ]; then
-  msg="[CANARY] Client change:$results Working:${passed}. Promote a working client to rung 0 of CLIENT_LADDER_NO_COOKIES in youtube.py."
+  msg="[CANARY] Client change:$results Working:${passed}. Promote a working client to rung 0 of CLIENT_LADDER_NO_COOKIES in youtube.py. Error output: tail -60 $FAILLOG"
 else
   msg="[CANARY] Recovered - all clients healthy again ($results)."
 fi

@@ -413,13 +413,20 @@ PERMANENT_ERROR_MARKERS = (
     "unable to download webpage",
 )
 
-# Errors that indicate the PROXY itself is out of credit/quota, as opposed
-# to a normal connection hiccup. Provider wording varies a lot, so this
-# list is intentionally broad - false positives just mean the circuit
-# breaker trips a bit eagerly (cheap: falls back to direct-only for a
-# while), which is far better than false negatives (silently retrying a
-# dead proxy on every single request).
-PROXY_QUOTA_ERROR_MARKERS = (
+# Errors meaning the PROXY is unusable for this request. SPLIT INTO TWO
+# CAUSES 2026-08-30, because the recovery differs and the old single list
+# told you the wrong one.
+#
+# CONFIRMED IN PRODUCTION 2026-08-29 22:08 UTC: DataImpulse's gateway went
+# down and returned "Tunnel connection failed: 502 NO_HOST_CONNECTION".
+# That matched this list, so the breaker correctly tripped - and then sent
+# a CRITICAL alert reading "proxy looks out of credit/quota... Top up the
+# proxy provider balance." Nothing was out of credit. The balance was
+# fine, the provider recovered on its own, and the alert sent an hour of
+# incident debugging at a billing problem that did not exist. The breaker
+# was right; the message was a lie. Both causes still trip the same
+# breaker with the same cooldown - only the wording differs now.
+PROXY_BILLING_ERROR_MARKERS = (
     "insufficient balance",
     "insufficient funds",
     "insufficient credit",
@@ -429,19 +436,30 @@ PROXY_QUOTA_ERROR_MARKERS = (
     "payment required",
     "account suspended",
     "proxy authentication failed",  # several providers reuse this for "balance = 0", not just bad creds
-    "407",  # HTTP 407 Proxy Authentication Required - overloaded by some providers for "no balance"
-    # Connection-level failures, not billing - a proxy provider outage
-    # (their gateway can't reach the destination at all) looks
-    # different from a quota error but is exactly as unrecoverable
-    # within the current request. Without these, an outage like this
-    # never trips the breaker, so every subsequent request keeps
-    # paying the ~30s proxy-retry cost until the outage ends on its
-    # own - broad-matching here is the same "false positive is cheap,
-    # false negative is expensive" reasoning as the rest of this list.
+    # Was a bare "407" until 2026-08-30 - see the removal note below for
+    # why bare status numbers cannot be matched against yt-dlp error text.
+    "http error 407",
+    "proxy authentication required",
+)
+
+# The provider's gateway is reachable but cannot reach the destination, or
+# is down outright. Exactly as unrecoverable within the current request as
+# a billing error, so it trips the same breaker - but it resolves on its
+# own, so the alert must not send you to a billing page at 3am.
+#
+# BARE "502" AND "407" WERE REMOVED 2026-08-30. Every marker here is
+# matched against the FULL yt-dlp error string, which on a media-phase
+# failure embeds the entire signed googlevideo URL - and that URL carries
+# a clen= byte count. A perfectly ordinary "clen=3502438" contains "502",
+# which would trip the quota breaker, disable the proxy for 30 minutes,
+# and page about billing, on an error that had nothing to do with the
+# proxy at all. The specific phrases below already catch every real case;
+# the bare numbers only ever added false positives.
+PROXY_OUTAGE_ERROR_MARKERS = (
     "no_host_connection",
     "tunnel connection failed",
     "unable to connect to proxy",
-    "502",
+    "502 bad gateway",
 )
 
 # Errors meaning THIS SERVER has no working route to the destination -
@@ -1015,9 +1033,27 @@ def is_permanent_error(error_text: str) -> bool:
     return any(marker in normalized for marker in PERMANENT_ERROR_MARKERS)
 
 
-def is_proxy_quota_error(error_text: str) -> bool:
+def is_proxy_billing_error(error_text: str) -> bool:
+    """The provider says this account cannot pay for the request."""
     normalized = _normalize_error_text(error_text)
-    return any(marker in normalized for marker in PROXY_QUOTA_ERROR_MARKERS)
+    return any(marker in normalized for marker in PROXY_BILLING_ERROR_MARKERS)
+
+
+def is_proxy_outage_error(error_text: str) -> bool:
+    """The provider's own infrastructure is failing. Not a billing problem
+    and not fixable by topping up - it clears when they fix it."""
+    normalized = _normalize_error_text(error_text)
+    return any(marker in normalized for marker in PROXY_OUTAGE_ERROR_MARKERS)
+
+
+def is_proxy_quota_error(error_text: str) -> bool:
+    """
+    Either cause trips the same breaker with the same cooldown. Kept under
+    the original name so any caller outside this module keeps working
+    unchanged - only the ALERT WORDING depends on which one it was, and
+    that is decided at the call site in _try_proxy.
+    """
+    return is_proxy_billing_error(error_text) or is_proxy_outage_error(error_text)
 
 
 # Errors meaning the TLS handshake to the proxy (or through it to the
@@ -1055,18 +1091,44 @@ def proxy_available() -> bool:
         return time.time() >= _proxy_disabled_until
 
 
-def _trip_proxy_circuit_breaker():
-    _record_event("proxy_quota")
+def _trip_proxy_circuit_breaker(cause: str = "billing"):
+    """
+    `cause` is "billing" or "outage" and changes ONLY the alert text -
+    same breaker, same cooldown, same fallback either way. It exists
+    because the two need opposite responses from a human at 3am: one
+    means go top up an account, the other means wait and verify. See
+    PROXY_OUTAGE_ERROR_MARKERS for the 2026-08-29 incident where the
+    single combined message sent the debugging in the wrong direction.
+
+    Defaults to "billing" so the cross-process replay path in
+    apply_events() cannot crash on an event recorded before this
+    parameter existed.
+    """
+    _record_event("proxy_quota", cause=cause)
     global _proxy_disabled_until
     with _proxy_lock:
         _proxy_disabled_until = time.time() + PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS
     cooldown_min = PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60
-    message = (
-        f"[PROXY] Circuit breaker TRIPPED - proxy looks out of credit/quota. "
-        f"Disabling proxy for {cooldown_min} min; falling back to direct "
-        f"(no-proxy, cookies-only) requests in the meantime. Top up the "
-        f"proxy provider balance to restore full bot-check resilience."
-    )
+    if cause == "outage":
+        message = (
+            f"[PROXY] Circuit breaker TRIPPED - the proxy provider's gateway is "
+            f"refusing connections. This is an OUTAGE ON THEIR SIDE, not a "
+            f"billing problem - do NOT top up. Disabling proxy for "
+            f"{cooldown_min} min; falling back to direct (no-proxy, "
+            f"cookies-only) requests, which WILL bot-check from this VPS IP, "
+            f"so expect 503s on /download until it clears. Verify with: "
+            f"curl -x '$YT_PROXY_URL' -m 20 https://www.youtube.com/ - a 200 "
+            f"means it recovered, and POST /admin/reset-proxy restores it "
+            f"immediately instead of waiting out the cooldown."
+        )
+    else:
+        message = (
+            f"[PROXY] Circuit breaker TRIPPED - the provider returned a "
+            f"BILLING/quota error. Disabling proxy for {cooldown_min} min; "
+            f"falling back to direct (no-proxy, cookies-only) requests in the "
+            f"meantime. Top up the proxy provider balance, then POST "
+            f"/admin/reset-proxy to restore full bot-check resilience."
+        )
     logger.critical(message)
     # Fired immediately - don't wait for monitoring.record_result()'s
     # failure-threshold/cooldown logic. This is a single distinct event
@@ -2297,8 +2359,15 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 record_account_result(proxy_account, False, "proxy", proxy_error_text)
                 record_path_attempt("proxy", False)
 
-                if is_proxy_quota_error(proxy_error_text):
-                    _trip_proxy_circuit_breaker()
+                # Both causes trip the same breaker with the same
+                # cooldown - only the alert wording differs. Billing is
+                # checked first because a provider that is BOTH out of
+                # credit and refusing connections is, in practice, out of
+                # credit: topping up is the action that fixes it.
+                if is_proxy_billing_error(proxy_error_text):
+                    _trip_proxy_circuit_breaker("billing")
+                elif is_proxy_outage_error(proxy_error_text):
+                    _trip_proxy_circuit_breaker("outage")
                 elif is_bot_check_error(proxy_error_text):
                     record_proxy_botcheck()
                     logger.warning(
@@ -2508,8 +2577,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     if not proxy_available():
         logger.warning(
             "[PROXY] Direct attempt(s) failed, but proxy circuit breaker is "
-            "currently OPEN (likely out of credit) - failing as-is instead of "
-            "retrying a proxy known to be down."
+            "currently OPEN (out of credit, or the provider's gateway is "
+            "down) - failing as-is instead of retrying a proxy known to be "
+            "unusable. See the [PROXY] Circuit breaker TRIPPED alert for "
+            "which of the two it was."
         )
         raise last_error
 
@@ -2617,7 +2688,11 @@ def apply_events(events: list):
             elif kind == "proxy_botcheck":
                 record_proxy_botcheck()
             elif kind == "proxy_quota":
-                _trip_proxy_circuit_breaker()
+                # `cause` rides across the process boundary so the parent
+                # sends the same message the worker would have. Defaulted
+                # so an event recorded by an older worker build (before
+                # the 2026-08-30 split) still replays cleanly.
+                _trip_proxy_circuit_breaker(ev.get("cause", "billing"))
             elif kind == "cookie_dead" and ev.get("path"):
                 _disable_cookie_account(ev["path"])
             elif kind == "account_result":
