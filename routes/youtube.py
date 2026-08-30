@@ -932,7 +932,35 @@ async def download_audio_file(
         # distinguish "your link outlived the entry" from "LRU eviction
         # reclaimed the space", and the fix is identical either way -
         # POST /download again.
-        logger.info(f"[DOWNLOAD] File no longer cached: {video_id}.{fmt}")
+        #
+        # THIS BRANCH IS EXACTLY THE EVICTION RACE, and nothing else.
+        # Reaching it means the token verified, which means it has not
+        # expired, which means the entry existed when the link was signed
+        # and is gone now. So it is worth a WARNING with a greppable tag
+        # rather than an INFO that blends into normal traffic - it is the
+        # one new failure mode url mode introduced, and the frontend's
+        # retry for it is silent by design, so this line is the only
+        # place either side can learn that it fired.
+        #
+        # age_seconds is how long the link survived before the file went
+        # away. A few seconds means genuine cache pressure; near the full
+        # TTL means the user simply sat on the page - different problems,
+        # and the number is free to compute from the token we already
+        # verified.
+        age_seconds = None
+        try:
+            expires_at = int(token.split(".", 1)[0])
+            age_seconds = int(DOWNLOAD_URL_TTL_SECONDS - (expires_at - time.time()))
+        except (ValueError, IndexError):
+            pass
+        logger.warning(
+            f"[DOWNLOAD] EVICTION-404: {video_id}.{fmt} was evicted from the cache "
+            f"between signing and fetch"
+            + (f" ({age_seconds}s after the link was issued)" if age_seconds is not None else "")
+            + ". The client should re-POST /download once and use the fresh link. "
+            "If this recurs, the cache is too small for current traffic - raise "
+            "the cap via POST /admin/cache/limit."
+        )
         raise HTTPException(
             404,
             "This file is no longer available. Please request the download again."

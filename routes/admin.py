@@ -123,6 +123,42 @@ failing in opposite directions and each disguising the other. If either
 drifts a third time, replace both with pkgutil enumeration rather than
 another fix.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-30): PER-TOOL RATE-LIMIT WINDOWS IN /limits
+
+/limits published fifteen per-tool MAXIMA under a single, flat
+`window_seconds` - SEPARATION's 3600 - on the unstated assumption that
+every tool shares one window.
+
+Fourteen of them do. /audio-to-midi does not:
+MIDI_RATE_LIMIT_WINDOW_SECONDS is 300, so its real allowance is 5 per
+FIVE MINUTES while this endpoint advertised 5 per hour. Twelvefold
+looser than what rate_limit.py actually enforces, and the only symptom
+for a user is a 429 the UI said could not happen yet.
+
+This is the same failure the endpoint exists to prevent, one layer down.
+/limits was built because ~20 page files, the client-side validator and
+config.py each restated the same numbers and drifted. Then /limits
+restated one itself - a window, hardcoded from the wrong constant, in
+the file whose whole job is to stop that.
+
+THE FIX IS ADDITIVE. A `windows` map is added alongside the existing
+`window_seconds`, which stays exactly as it was. Same reasoning as the
+youtube_chain keys retained above: /limits is a public contract the
+frontend reads, and a key it may still index must not vanish because the
+backend tidied up. `window_seconds` remains correct for every key except
+audio_to_midi, and can be removed once nothing reads it - the same
+condition already written against the legacy chain keys.
+
+WHAT THIS DOES NOT FIX, and should not: /limits still carries one
+hand-listed entry per route. That is the fifth such list in this
+codebase, after routes/__init__.py, _iter_tool_routes(), the Cloudflare
+WAF allowlist and the frontend's rate-limits.ts - and three of those
+have already drifted. This change makes the existing list correct; it
+does not make it self-maintaining. If it goes stale, the answer is the
+one already written into _iter_tool_routes(): stop maintaining it by
+hand.
+--------------------------------------------------------------------------
 """
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -155,6 +191,24 @@ from config import (
     MAX_MIDI_DURATION_SECONDS,
     MAX_MIDI_HQ_DURATION_SECONDS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+    # The other thirteen windows (added 2026-08-30). Imported so the
+    # `windows` map below reads each tool's OWN constant rather than
+    # assuming they all match SEPARATION's - which is exactly the
+    # assumption that made /audio-to-midi's published limit wrong by
+    # a factor of twelve.
+    SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    STEMS_RATE_LIMIT_WINDOW_SECONDS,
+    STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+    AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+    MIDI_RATE_LIMIT_WINDOW_SECONDS,
+    MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     MAX_QUEUED_SEPARATIONS,
@@ -772,6 +826,11 @@ async def limits():
     which resolves it through the same code the limiter uses. This
     endpoint stays static and cacheable precisely because it does NOT
     know who is asking; a per-visitor number does not belong here.
+
+    WINDOWS (2026-08-30): every max above now has a matching entry in
+    `windows`, because they are NOT all the same. See the module
+    docstring for the /audio-to-midi case that made this necessary - a
+    limit published as twelve times looser than the one enforced.
     """
     return {
         "max_upload_bytes": MAX_UPLOAD_BYTES,
@@ -819,6 +878,12 @@ async def limits():
             # products rather than two qualities of one - see
             # credits/config.py's rule note. The frontend needs both
             # numbers on one page if it ever offers the upgrade inline.
+            #
+            # audio_to_midi's WINDOW is 300s, not 3600 - the only tool in
+            # this block that differs. Until 2026-08-30 that fact had
+            # nowhere to live in this response, so this number was read
+            # as hourly and advertised twelvefold too loose. See
+            # `windows` below.
             "audio_to_midi": MIDI_RATE_LIMIT_MAX_REQUESTS,
             "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
             # LEGACY, kept deliberately. /limits is a public contract the
@@ -832,6 +897,50 @@ async def limits():
             # the per-tool keys above and nothing else reads these.
             "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
             "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
+            # PER-TOOL WINDOWS (added 2026-08-30). Every key above has an
+            # entry here, read from that tool's OWN window constant.
+            #
+            # Fourteen of the fifteen are 3600, which is exactly why the
+            # single flat window_seconds below survived this long without
+            # anyone noticing: it was right almost everywhere.
+            # /audio-to-midi is 300, so its published allowance was 5 per
+            # hour against 5 per five minutes actually enforced - and the
+            # only way a user learns that is a 429 the UI promised could
+            # not happen.
+            #
+            # This is the same drift /limits was built to end, one layer
+            # down: the endpoint that stops the frontend restating
+            # config.py's numbers had restated one of them itself, from
+            # the wrong constant.
+            #
+            # ADDITIVE. window_seconds below is untouched, for the same
+            # reason the youtube_chain keys above are untouched - a
+            # public contract does not lose a key because the backend
+            # tidied up. New consumers read windows[tool]; the flat value
+            # can be dropped once nothing reads it, which is the same
+            # condition already written against those legacy keys.
+            "windows": {
+                "separate": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+                "separate_hq": SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "stems": STEMS_RATE_LIMIT_WINDOW_SECONDS,
+                "stems_hq": STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_analyze": YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_separate": YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_stems": YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+                "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
+                "audio_to_midi": MIDI_RATE_LIMIT_WINDOW_SECONDS,
+                "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
+            },
+            # LEGACY as of 2026-08-30, same status as the two chain keys
+            # above: correct for every tool except audio_to_midi, kept
+            # because the frontend may still index it. Read `windows`
+            # instead.
             "window_seconds": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
         },
         "features": {
