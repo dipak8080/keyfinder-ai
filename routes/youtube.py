@@ -201,11 +201,56 @@ change where things can go wrong:
    everywhere" because it was handled in the one place most code goes
    through.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-30): /download CAN RETURN A URL INSTEAD OF BASE64
+
+/download returned the entire audio file as a base64 string inside the
+JSON body. That shape predates the job system - it is not a decision
+anyone made about large files, it is simply older than the routes that
+do this properly - and at MAX_VIDEO_DURATION_SECONDS it does not work on
+either end:
+
+  BROWSER: a ~420 MB WAV becomes ~560 MB of base64 that the frontend
+  holds as a string and then converts to a Blob. That is an OOM crash on
+  most phones - and /youtube-to-wav, the highest-traffic page on the
+  site (~10K/month), defaults to WAV, so the worst case sits on the
+  busiest route.
+
+  SERVER: the same request allocates ~420 MB reading the file, ~560 MB
+  encoding it, and ~560 MB again when JSONResponse serializes the body -
+  roughly 1.5 GB resident for ONE request, on a VPS with NO SWAP, behind
+  a semaphore that allows concurrent downloads. The cache-HIT path did
+  exactly the same thing. Two overlapping long WAVs is an OOM kill with
+  nothing to absorb it.
+
+The fix is the shape the job-based tools already use: return a URL and
+let the browser stream it to disk. `response=url` on the POST returns
+{"title", "format", "url", "expires_at"}, and the new
+GET /download/file/{video_id}.{fmt} serves the bytes via FileResponse -
+which streams in chunks and supports Range requests, so a dropped mobile
+connection resumes instead of restarting a 400 MB transfer.
+
+DEFAULT IS STILL "base64", DELIBERATELY. This route serves ~10K requests
+a month; flipping its response shape in the same deploy that introduces
+the new path would mean any mistake takes the busiest page down with no
+way to tell which of the two changes caused it. The frontend opts in
+when it is ready, and the base64 branch gets deleted in a later, boring
+deploy.
+
+WHY THE URL IS SIGNED: /download/file/{video_id}.{fmt} with no token
+would be trivially enumerable - every cached track on the box fetchable
+by anyone who can guess a YouTube ID, bypassing the rate limiter, with
+bandwidth being the actual bill. An HMAC over (video_id, format, expiry)
+closes that while staying stateless: no tokens table, no cleanup job,
+and links that expire on their own.
+--------------------------------------------------------------------------
 """
 import os
 import time
 import uuid
+import hmac
 import base64
+import hashlib
 import asyncio
 from typing import Optional
 from functools import partial
@@ -273,7 +318,7 @@ from youtube import (
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
-from cache import get_cached_audio, put_cached_audio
+from cache import get_cached_audio, put_cached_audio, get_cached_path, put_cached_file
 from monitoring import record_result
 from download_progress import make_progress_hook
 from jobs import (
@@ -308,6 +353,98 @@ router = APIRouter()
 
 
 # ============================================================
+# SIGNED DOWNLOAD URLS (added 2026-08-30)
+#
+# See this module's docstring for why /download can now hand back a URL
+# instead of a base64 body, and why that URL has to be signed.
+#
+# Stateless on purpose. A tokens table would need a schema migration, a
+# write on every download, and a sweeper to delete expired rows - three
+# new things that can break, replacing an HMAC that cannot get out of
+# sync with itself. The expiry travels inside the token and is covered
+# by the signature, so a forged expiry fails verification.
+# ============================================================
+DOWNLOAD_URL_TTL_SECONDS = int(os.environ.get("DOWNLOAD_URL_TTL_SECONDS", "3600"))
+
+# SET DOWNLOAD_URL_SECRET IN .env. The ADMIN_KEY fallback exists so this
+# works on first deploy without a config change, but it couples two
+# unrelated things: rotating the admin key would silently invalidate
+# every outstanding download link. The uuid4 fallback below that is
+# process-local, so links simply stop working after a restart - annoying,
+# never insecure, which is the right direction for a missing secret.
+_DOWNLOAD_URL_SECRET = (
+    os.environ.get("DOWNLOAD_URL_SECRET")
+    or os.environ.get("ADMIN_KEY")
+    or uuid.uuid4().hex
+).encode()
+
+if not os.environ.get("DOWNLOAD_URL_SECRET"):
+    logger.warning(
+        "[DOWNLOAD] DOWNLOAD_URL_SECRET is not set - falling back to ADMIN_KEY "
+        "(or a per-process random value if that is unset too). Set it in .env so "
+        "signed download links survive an admin-key rotation and a container restart."
+    )
+
+_MEDIA_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav"}
+
+
+def _sign_download_token(video_id: str, fmt: str, expires_at: int) -> str:
+    """Token format is '<expires_at>.<signature>' - the expiry is
+    readable so verification can reject a stale token without any lookup,
+    and signed so it cannot be edited to extend itself."""
+    payload = f"{video_id}:{fmt}:{expires_at}"
+    sig = hmac.new(_DOWNLOAD_URL_SECRET, payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{expires_at}.{sig}"
+
+
+def _verify_download_token(video_id: str, fmt: str, token: str) -> bool:
+    try:
+        expires_str, _ = token.split(".", 1)
+        expires_at = int(expires_str)
+    except (ValueError, AttributeError):
+        return False
+
+    if time.time() > expires_at:
+        return False
+
+    # compare_digest, NOT ==. A plain string comparison short-circuits on
+    # the first differing byte, and that timing difference is enough to
+    # recover a valid signature one byte at a time given enough requests.
+    return hmac.compare_digest(token, _sign_download_token(video_id, fmt, expires_at))
+
+
+def _safe_filename(title: str, fmt: str) -> str:
+    """Content-Disposition filename built from a YouTube title.
+
+    Strips path separators and the Windows-reserved set, drops
+    non-printables, and caps the length - a title is attacker-influenced
+    text (anyone can name a video anything) heading into a response
+    header. Starlette handles RFC 5987 encoding of whatever survives, so
+    this only has to remove what should never be in a filename at all.
+    """
+    cleaned = "".join(
+        c for c in (title or "audio")
+        if c.isprintable() and c not in '/\\:*?"<>|'
+    )
+    cleaned = cleaned.strip()[:120] or "audio"
+    return f"{cleaned}.{fmt}"
+
+
+def _url_payload(video_id: str, fmt: str, title: Optional[str]) -> dict:
+    """The `response=url` body. expires_at is returned so the frontend
+    can decide whether to reuse a link or ask for a fresh one, rather
+    than discovering expiry as a 403 partway through a download."""
+    expires_at = int(time.time()) + DOWNLOAD_URL_TTL_SECONDS
+    token = _sign_download_token(video_id, fmt, expires_at)
+    return {
+        "title": title or "Unknown",
+        "format": fmt,
+        "url": f"/download/file/{video_id}.{fmt}?token={token}",
+        "expires_at": expires_at,
+    }
+
+
+# ============================================================
 # /download - YouTube URL to MP3/WAV (synchronous, cached)
 #
 # The only tool that takes no upload, which is why it was the ONLY tool
@@ -323,7 +460,29 @@ router = APIRouter()
         window_seconds=DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS,
     ))],
 )
-async def download_audio(url: str = Form(...), format: str = Form("mp3")):
+async def download_audio(
+    url: str = Form(...),
+    format: str = Form("mp3"),
+    response: str = Form("base64"),
+):
+    """
+    `response` selects the body shape:
+
+      "base64" (default) - {"title", "audio", "format"}, the original
+          shape. Every existing client keeps working untouched.
+
+      "url" - {"title", "format", "url", "expires_at"}. The bytes are
+          fetched separately from GET /download/file/{video_id}.{fmt},
+          which streams them. Use this for anything that might be large;
+          see the 2026-08-30 note in this module's docstring for the
+          memory numbers that make it necessary on WAV.
+
+    URL mode needs a video_id - it is both the cache key and the resource
+    identifier. Every URL that passes is_valid_youtube_url() yields one,
+    so in practice this only fails if a YouTube URL shape changes under
+    us, and it degrades to base64 rather than erroring: a working large
+    response beats a clean failure.
+    """
     # Synchronous tool, no job - tagged anyway so its row in request_logs
     # reports "DOWNLOAD" the same consistent way every other tool's rows
     # do, instead of being the one row type where "which tool" has to be
@@ -333,6 +492,9 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     if format not in ["mp3", "wav"]:
         raise HTTPException(400, "Format must be 'mp3' or 'wav'")
 
+    if response not in ("base64", "url"):
+        raise HTTPException(400, "response must be 'base64' or 'url'")
+
     if not is_valid_youtube_url(url):
         logger.warning(f"[DOWNLOAD] Rejected - not a recognizable YouTube URL: {url}")
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
@@ -340,21 +502,41 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
     started = time.monotonic()
     video_id = extract_video_id(url)
 
-    if video_id:
-        try:
-            cached_audio, cached_title = await run_blocking(get_cached_audio, video_id, format)
-        except Exception as cache_err:
-            logger.warning(f"[CACHE] Lookup failed (non-fatal, downloading fresh): {cache_err}")
-            cached_audio, cached_title = None, None
+    want_url = response == "url" and bool(video_id)
+    if response == "url" and not video_id:
+        logger.warning(
+            f"[DOWNLOAD] response=url requested but no video_id could be extracted "
+            f"from {url} - falling back to base64."
+        )
 
-        if cached_audio:
-            cached_b64 = base64.b64encode(cached_audio).decode('utf-8')
-            logger.info(
-                f"[CACHE] HIT '{cached_title}' ({format}) {_mb(len(cached_audio))} "
-                f"in {time.monotonic() - started:.2f}s"
-            )
-            record_result("/download", True)
-            return JSONResponse({"title": cached_title or "Unknown", "audio": cached_b64, "format": format})
+    if video_id:
+        if want_url:
+            # Path-based lookup: no bytes read, nothing to encode. This is
+            # the single biggest win in the change - a cache HIT on a
+            # 420 MB WAV used to allocate ~1.5 GB just to answer.
+            cached_path, cached_title = await run_blocking(get_cached_path, video_id, format)
+            if cached_path:
+                logger.info(
+                    f"[CACHE] HIT '{cached_title}' ({format}) url-mode "
+                    f"in {time.monotonic() - started:.2f}s"
+                )
+                record_result("/download", True)
+                return JSONResponse(_url_payload(video_id, format, cached_title))
+        else:
+            try:
+                cached_audio, cached_title = await run_blocking(get_cached_audio, video_id, format)
+            except Exception as cache_err:
+                logger.warning(f"[CACHE] Lookup failed (non-fatal, downloading fresh): {cache_err}")
+                cached_audio, cached_title = None, None
+
+            if cached_audio:
+                cached_b64 = base64.b64encode(cached_audio).decode('utf-8')
+                logger.info(
+                    f"[CACHE] HIT '{cached_title}' ({format}) {_mb(len(cached_audio))} "
+                    f"in {time.monotonic() - started:.2f}s"
+                )
+                record_result("/download", True)
+                return JSONResponse({"title": cached_title or "Unknown", "audio": cached_b64, "format": format})
 
     temp_id = str(uuid.uuid4())
     temp_path = os.path.join(UPLOAD_DIR, f"{temp_id}.%(ext)s")
@@ -433,6 +615,12 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
 
     audio_data = None
     succeeded = False
+    # put_cached_file() MOVES the download into the cache, so on that path
+    # there is nothing left at output_file for the `finally` to clean up.
+    # Tracking the path in its own variable and clearing it after a
+    # successful move keeps cleanup correct without depending on how
+    # cleanup_file() happens to handle a path that no longer exists.
+    pending_cleanup = output_file
     try:
         result = await run_in_killable_subprocess(
             serializable_ydl_opts, url, proxy_url,
@@ -583,6 +771,39 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             logger.error(f"[DOWNLOAD] Expected output missing after download: {output_file}")
             raise HTTPException(500, "Failed: audio file was not produced by the downloader")
 
+        if want_url:
+            # Move (not copy) into the cache: the downloaded file BECOMES
+            # the cache entry, which is also what the new GET route
+            # serves. Nothing is read into memory anywhere on this path.
+            raw_size = os.path.getsize(output_file)
+            cached_path = await run_blocking(put_cached_file, video_id, format, output_file, title)
+
+            if not cached_path:
+                # put_cached_file never raises, so None means the move
+                # failed - and after a failed cross-filesystem move the
+                # source may or may not still exist. Serving a URL would
+                # 404 and falling back to base64 would need a file we can
+                # no longer trust, so fail cleanly and let the user retry
+                # (that retry is a fresh download, not this half-state).
+                logger.error(
+                    f"[DOWNLOAD] Could not move '{title}' ({format}) into the cache - "
+                    f"cannot serve a URL for it."
+                )
+                raise HTTPException(
+                    500,
+                    "Something went wrong while preparing this download. Please try again."
+                )
+
+            # The move consumed output_file; nothing left to clean up.
+            pending_cleanup = None
+
+            logger.info(
+                f"[DOWNLOAD] COMPLETE '{title}' ({format}) {_mb(raw_size)} url-mode "
+                f"in {time.monotonic() - started:.1f}s"
+            )
+            succeeded = True
+            return JSONResponse(_url_payload(video_id, format, title))
+
         audio_bytes = await run_blocking(_read_file_bytes, output_file)
         audio_data = base64.b64encode(audio_bytes).decode('utf-8')
 
@@ -612,12 +833,67 @@ async def download_audio(url: str = Form(...), format: str = Form("mp3")):
             "Something went wrong while downloading this video. Please try again."
         )
     finally:
-        cleanup_file(output_file)
+        if pending_cleanup:
+            cleanup_file(pending_cleanup)
         if audio_data is not None:
             del audio_data
         release_memory_to_os()
         _download_semaphore.release()
         record_result("/download", succeeded)
+
+
+@router.get("/download/file/{video_id}.{fmt}")
+async def download_audio_file(video_id: str, fmt: str, token: str = Query(...)):
+    """
+    Streams a cached download straight to the browser.
+
+    FileResponse streams the file in chunks and handles Range requests
+    natively, so the server never holds it in memory and a dropped mobile
+    connection resumes instead of restarting a 400 MB transfer. That is
+    the entire point of this route - see the 2026-08-30 note in this
+    module's docstring.
+
+    NOT rate-limited by check_rate_limit. The POST that produced the
+    token already passed the limiter, and a resumed Range request would
+    otherwise count as a second call and could 429 a download that is
+    already half finished. The signature and the TTL are what bound abuse
+    here.
+    """
+    if fmt not in ("mp3", "wav"):
+        raise HTTPException(400, "Format must be 'mp3' or 'wav'")
+
+    if not _verify_download_token(video_id, fmt, token):
+        # Deliberately identical wording for a bad signature and an
+        # expired one, and deliberately checked BEFORE the cache lookup:
+        # a different response for "valid token, no such entry" would
+        # turn this route into an oracle for which videos are cached,
+        # which is exactly the enumeration the signature exists to stop.
+        logger.warning(
+            f"[DOWNLOAD] Rejected file request with an invalid/expired token: {video_id}.{fmt}"
+        )
+        raise HTTPException(
+            403,
+            "This download link is invalid or has expired. Please request the file again."
+        )
+
+    path, title = await run_blocking(get_cached_path, video_id, fmt)
+    if not path:
+        # 404 rather than 410: from the client's side there is nothing to
+        # distinguish "your link outlived the entry" from "LRU eviction
+        # reclaimed the space", and the fix is identical either way -
+        # POST /download again.
+        logger.info(f"[DOWNLOAD] File no longer cached: {video_id}.{fmt}")
+        raise HTTPException(
+            404,
+            "This file is no longer available. Please request the download again."
+        )
+
+    logger.info(f"[DOWNLOAD] Serving '{title}' ({fmt}) from cache: {video_id}")
+    return FileResponse(
+        path,
+        media_type=_MEDIA_TYPES[fmt],
+        filename=_safe_filename(title, fmt),
+    )
 
 
 def _read_file_bytes(path: str) -> bytes:
@@ -626,7 +902,10 @@ def _read_file_bytes(path: str) -> bytes:
     Reading a finished download can mean pulling tens of megabytes off
     disk; doing that inline in the async handler blocks every other
     connection for its duration, which on a single worker is the whole
-    server."""
+    server.
+
+    Only the legacy base64 path uses this now - url mode never reads the
+    file at all."""
     with open(path, "rb") as f:
         return f.read()
 

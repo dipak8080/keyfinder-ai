@@ -16,6 +16,12 @@ replaces:
   check), PLUS a new total-size cap with LRU eviction, since local disk
   is finite in a way R2 effectively wasn't.
 
+BYTES-FREE TWINS (added 2026-08-30): get_cached_path() and
+put_cached_file() do the same two jobs without ever holding the audio in
+memory - see each function's docstring for why /download needed them.
+The bytes-based pair is unchanged and still used by youtube_chain.py,
+which genuinely needs the contents.
+
 Storage: actual audio bytes as plain files under CACHE_DIR. A small
 SQLite table (same pattern already used for logs.db elsewhere in this
 project) tracks metadata (video_id, format, title, size, timestamps) -
@@ -134,6 +140,11 @@ def get_cached_audio(video_id: str, fmt: str) -> Tuple[Optional[bytes], Optional
     entry are all treated identically as "not cached", so the caller
     always has a clean, simple fallback path (just proceed with a
     normal download) - same guarantee the R2 version made.
+
+    Reads the WHOLE file into memory. Callers that only need to serve
+    the file to a browser should use get_cached_path() below instead -
+    on a 40-minute WAV this allocates ~420 MB that a streaming response
+    never has to touch.
     """
     if not video_id:
         return None, None
@@ -185,6 +196,78 @@ def get_cached_audio(video_id: str, fmt: str) -> Tuple[Optional[bytes], Optional
         return None, None
 
 
+def get_cached_path(video_id: str, fmt: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Path-returning twin of get_cached_audio(). Identical freshness,
+    missing-file and LRU-touch semantics - it simply does not read the
+    file into memory.
+
+    WHY THIS EXISTS (2026-08-30): /download used get_cached_audio() and
+    then base64-encoded the result into a JSON body. At
+    MAX_VIDEO_DURATION_SECONDS a WAV is ~420 MB, so a single request
+    allocated ~420 MB of bytes, ~560 MB of base64 string, and another
+    ~560 MB again when JSONResponse serialized it - roughly 1.5 GB
+    resident, on a VPS with NO SWAP, behind a semaphore that permits
+    concurrent downloads. Two overlapping requests on a long WAV is an
+    OOM, and there is no swap to absorb it. Handing the caller a path
+    instead lets FileResponse stream the file in chunks and hold
+    essentially nothing.
+
+    Same NEVER-raises guarantee as get_cached_audio(): every failure mode
+    returns (None, None) so the caller falls through to a real download.
+
+    NOTE: the returned path is only guaranteed to exist at the moment it
+    is returned. LRU eviction can remove the file between this call and
+    the caller opening it - the window is tiny, and the caller's own
+    404 covers it, which is the same outcome the user gets from an
+    entry that had already been evicted.
+    """
+    if not video_id:
+        return None, None
+
+    try:
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT file_path, title, created_at FROM cache_entries WHERE video_id = ? AND format = ?",
+                (video_id, fmt),
+            ).fetchone()
+
+            if row is None:
+                logger.info(f"[CACHE] MISS: {video_id}_{fmt}")
+                return None, None
+
+            age_seconds = time.time() - row["created_at"]
+            if age_seconds > CACHE_MAX_AGE_SECONDS:
+                logger.info(f"[CACHE] MISS (stale, {int(age_seconds)}s old): {video_id}_{fmt}")
+                _delete_entry(conn, video_id, fmt, row["file_path"])
+                return None, None
+
+            file_path = row["file_path"]
+            if not os.path.exists(file_path):
+                logger.warning(
+                    f"[CACHE] Metadata found for {video_id}_{fmt} but file missing on disk, treating as a miss"
+                )
+                conn.execute("DELETE FROM cache_entries WHERE video_id = ? AND format = ?", (video_id, fmt))
+                conn.commit()
+                return None, None
+
+            conn.execute(
+                "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
+                (time.time(), video_id, fmt),
+            )
+            conn.commit()
+
+            title = row["title"] or "Unknown"
+            logger.info(
+                f"[CACHE] HIT (path): {video_id}_{fmt} (age {int(age_seconds)}s, title='{title}')"
+            )
+            return file_path, title
+
+    except Exception as e:
+        logger.warning(f"[CACHE] Unexpected read error for {video_id}_{fmt} (non-fatal): {e}")
+        return None, None
+
+
 def put_cached_audio(video_id: str, fmt: str, data: bytes, title: str):
     """
     Saves a successfully downloaded file (+ its title) for future
@@ -192,6 +275,10 @@ def put_cached_audio(video_id: str, fmt: str, data: bytes, title: str):
     a caching write failure must not fail the download that already
     succeeded and is about to be returned to the user. Triggers
     size-cap eviction afterward if needed.
+
+    Requires the caller to already hold the whole file in memory. When
+    the caller has a PATH rather than bytes, use put_cached_file() below
+    - it avoids the allocation entirely.
     """
     if not video_id or not data:
         return
@@ -219,6 +306,75 @@ def put_cached_audio(video_id: str, fmt: str, data: bytes, title: str):
 
     except Exception as e:
         logger.warning(f"[CACHE] Failed to save {video_id}_{fmt} (non-fatal, download still succeeded): {e}")
+
+
+def put_cached_file(video_id: str, fmt: str, src_path: str, title: str) -> Optional[str]:
+    """
+    Bytes-free twin of put_cached_audio(): takes a PATH to an
+    already-downloaded file and moves it into the cache, rather than
+    taking its contents as a bytes object.
+
+    put_cached_audio() requires the caller to have read the whole file
+    into memory first, which is precisely the allocation /download is
+    trying to stop making (see get_cached_path above for the numbers).
+
+    shutil.move() is a rename when source and destination are on the
+    same filesystem and a chunked copy-then-delete when they are not -
+    on this VPS /app/data is a bind mount and UPLOAD_DIR may not be, so
+    the copy path is the likely one. Either way it never holds more than
+    a small buffer, unlike the read-then-write pair it replaces.
+
+    RETURNS THE CACHE PATH ON SUCCESS, None on any failure - and the
+    caller must treat None as "the source file may or may not still be
+    where I left it". shutil.move is not atomic across filesystems: a
+    failure partway through can leave the source intact, the destination
+    partial, or both. The cache row is only written after the move
+    returns, so a partial destination is never registered as a cache
+    entry; it is orphaned bytes that the next successful save for the
+    same (video_id, fmt) overwrites.
+
+    NEVER raises, same as put_cached_audio - a caching failure must not
+    fail a download that already succeeded.
+    """
+    if not video_id or not src_path:
+        return None
+
+    if not os.path.exists(src_path):
+        logger.warning(f"[CACHE] Cannot save {video_id}_{fmt}: source file is missing at {src_path}")
+        return None
+
+    dest_path = _cache_file_path(video_id, fmt)
+    try:
+        # Read the size BEFORE the move - afterwards the source is gone
+        # and stat'ing the destination would be a second syscall for a
+        # number we already had.
+        size_bytes = os.path.getsize(src_path)
+
+        shutil.move(src_path, dest_path)
+
+        now = time.time()
+        with _get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cache_entries
+                    (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (video_id, fmt, title or "Unknown", dest_path, size_bytes, now, now),
+            )
+            conn.commit()
+
+        logger.info(f"[CACHE] SAVED (moved): {video_id}_{fmt} ({size_bytes} bytes, title='{title}')")
+
+        _evict_if_over_limit()
+        return dest_path
+
+    except Exception as e:
+        logger.warning(
+            f"[CACHE] Failed to save {video_id}_{fmt} from {src_path} "
+            f"(non-fatal, download still succeeded): {e}"
+        )
+        return None
 
 
 def _delete_entry(conn, video_id: str, fmt: str, file_path: str):
