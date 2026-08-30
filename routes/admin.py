@@ -213,6 +213,13 @@ from config import (
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     MAX_QUEUED_SEPARATIONS,
     MAX_CONCURRENT_SEPARATIONS,
+    # Retention (added 2026-08-30). These became user-facing privacy
+    # claims the moment /vocal-remover's FAQ started stating them, so
+    # they are published rather than retyped - see the `retention` block
+    # in limits() for the wrong-claim incident that prompted it.
+    SEPARATION_JOB_TTL_SECONDS,
+    AUDIO_TOOL_JOB_TTL_SECONDS,
+    TRANSCRIPTION_JOB_TTL_SECONDS,
     MIDI_WORKER_URL,
 )
 from utils import run_blocking
@@ -854,6 +861,72 @@ async def limits():
             "max_per_file_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         },
         "allowed_audio_formats": sorted(ALLOWED_AUDIO_INPUT_FORMATS),
+        # ---------- RETENTION (added 2026-08-30) ----------
+        # Published because these are PRIVACY CLAIMS now, not internal
+        # details. /vocal-remover's FAQ said uploads are "deleted once
+        # processing finishes" - true for every other tool on the site
+        # and false for that one, because separation deliberately retains
+        # the source for the Studio Quality upgrade path. A user read a
+        # sentence about their own file that was not true of their own
+        # file.
+        #
+        # The fix is not a corrected sentence, it is removing the
+        # opportunity to type one: ~20 pages state a retention number,
+        # and any number typed on a page is a number that can drift from
+        # the code. Same argument as every other value in this endpoint.
+        #
+        # THREE SHAPES, not one pair of numbers, because the tools
+        # genuinely differ and flattening them is how the wrong claim
+        # happened in the first place:
+        #
+        #   separation    input AND output both live to the job TTL. The
+        #                 input is retained ON PURPOSE (routes/separation.py
+        #                 calls set_job_input() and passes an empty
+        #                 cleanup_paths) so /separate/upgrade can re-run a
+        #                 finished standard job at HQ without a second
+        #                 upload. The only tool family where the upload
+        #                 outlives the job.
+        #
+        #   audio_tools   input deleted the moment the job ends - win,
+        #                 lose, or killed by a redeploy - via
+        #                 _run_tool_job's `finally`. Only the OUTPUT
+        #                 waits for the TTL. Verified across all 18: the
+        #                 14 sharing _submit_audio_tool and the 4 with
+        #                 their own submit paths (/trim, /join,
+        #                 /video-to-audio, /silence-split), every one of
+        #                 which passes its input to cleanup_paths.
+        #
+        #   transcription input deleted at job end like the audio tools,
+        #                 but the OUTPUT is inline text in the job record
+        #                 rather than a file - so nothing sits on disk
+        #                 after processing at all. Worth its own shape
+        #                 because "your file is available for an hour" is
+        #                 the wrong sentence for a transcript.
+        #
+        # input_seconds is null where the input does not survive the job,
+        # rather than 0 - null reads as "not applicable", 0 invites
+        # "deleted after zero seconds", and the frontend should render a
+        # different sentence, not the same one with a different number.
+        "retention": {
+            "separation": {
+                "input_deleted_when": "ttl",
+                "input_seconds": SEPARATION_JOB_TTL_SECONDS,
+                "output_seconds": SEPARATION_JOB_TTL_SECONDS,
+                "output_kind": "files",
+            },
+            "audio_tools": {
+                "input_deleted_when": "job_end",
+                "input_seconds": None,
+                "output_seconds": AUDIO_TOOL_JOB_TTL_SECONDS,
+                "output_kind": "file",
+            },
+            "transcription": {
+                "input_deleted_when": "job_end",
+                "input_seconds": None,
+                "output_seconds": TRANSCRIPTION_JOB_TTL_SECONDS,
+                "output_kind": "text",
+            },
+        },
         "rate_limits": {
             "separate": SEPARATION_RATE_LIMIT_MAX_REQUESTS,
             "separate_hq": SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
