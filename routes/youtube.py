@@ -243,6 +243,22 @@ by anyone who can guess a YouTube ID, bypassing the rate limiter, with
 bandwidth being the actual bill. An HMAC over (video_id, format, expiry)
 closes that while staying stateless: no tokens table, no cleanup job,
 and links that expire on their own.
+
+TWO FOLLOW-UPS, same day, both raised by the frontend during migration:
+
+  size_bytes IS NOW IN THE PAYLOAD. url mode never touches the bytes, so
+  the result card lost the file size it used to derive from the base64
+  string's length. The server already has the number; sending it saves a
+  HEAD request made purely to print a figure.
+
+  THE FILE ROUTE TAKES ?disposition=inline. FileResponse(filename=...)
+  sets Content-Disposition: attachment, which is REQUIRED for the
+  download button - <a download> is ignored cross-origin, and
+  api.audioforges.com is cross-origin from the site, so the header is
+  the only thing that makes a click save rather than navigate. But that
+  same header stops the preview player from streaming the file, and a
+  working download button would never have revealed it. attachment stays
+  the default; inline is opt-in per request.
 --------------------------------------------------------------------------
 """
 import os
@@ -430,18 +446,35 @@ def _safe_filename(title: str, fmt: str) -> str:
     return f"{cleaned}.{fmt}"
 
 
-def _url_payload(video_id: str, fmt: str, title: Optional[str]) -> dict:
+def _url_payload(
+    video_id: str,
+    fmt: str,
+    title: Optional[str],
+    size_bytes: Optional[int] = None,
+) -> dict:
     """The `response=url` body. expires_at is returned so the frontend
     can decide whether to reuse a link or ask for a fresh one, rather
-    than discovering expiry as a 403 partway through a download."""
+    than discovering expiry as a 403 partway through a download.
+
+    size_bytes added 2026-08-30. url mode never touches the bytes, so the
+    frontend lost the file size it used to derive from the base64 length,
+    and its result card lost the number. The server already knows it -
+    either from the file it just wrote or from a stat on the cache entry -
+    so sending it saves the client a HEAD request purely to print a
+    figure. Omitted rather than sent as null when it genuinely could not
+    be read, so `"size_bytes" in payload` is a meaningful check.
+    """
     expires_at = int(time.time()) + DOWNLOAD_URL_TTL_SECONDS
     token = _sign_download_token(video_id, fmt, expires_at)
-    return {
+    payload = {
         "title": title or "Unknown",
         "format": fmt,
         "url": f"/download/file/{video_id}.{fmt}?token={token}",
         "expires_at": expires_at,
     }
+    if size_bytes is not None:
+        payload["size_bytes"] = size_bytes
+    return payload
 
 
 # ============================================================
@@ -516,12 +549,20 @@ async def download_audio(
             # 420 MB WAV used to allocate ~1.5 GB just to answer.
             cached_path, cached_title = await run_blocking(get_cached_path, video_id, format)
             if cached_path:
+                try:
+                    cached_size = os.path.getsize(cached_path)
+                except OSError:
+                    # Evicted between the lookup and this stat. The link
+                    # is still worth returning - the GET does its own
+                    # lookup and will 404 honestly if it is really gone -
+                    # so don't fail a request over a display number.
+                    cached_size = None
                 logger.info(
                     f"[CACHE] HIT '{cached_title}' ({format}) url-mode "
                     f"in {time.monotonic() - started:.2f}s"
                 )
                 record_result("/download", True)
-                return JSONResponse(_url_payload(video_id, format, cached_title))
+                return JSONResponse(_url_payload(video_id, format, cached_title, cached_size))
         else:
             try:
                 cached_audio, cached_title = await run_blocking(get_cached_audio, video_id, format)
@@ -802,7 +843,8 @@ async def download_audio(
                 f"in {time.monotonic() - started:.1f}s"
             )
             succeeded = True
-            return JSONResponse(_url_payload(video_id, format, title))
+            # raw_size was read off the file above, before the move.
+            return JSONResponse(_url_payload(video_id, format, title, raw_size))
 
         audio_bytes = await run_blocking(_read_file_bytes, output_file)
         audio_data = base64.b64encode(audio_bytes).decode('utf-8')
@@ -843,7 +885,12 @@ async def download_audio(
 
 
 @router.get("/download/file/{video_id}.{fmt}")
-async def download_audio_file(video_id: str, fmt: str, token: str = Query(...)):
+async def download_audio_file(
+    video_id: str,
+    fmt: str,
+    token: str = Query(...),
+    disposition: str = Query("attachment"),
+):
     """
     Streams a cached download straight to the browser.
 
@@ -861,6 +908,9 @@ async def download_audio_file(video_id: str, fmt: str, token: str = Query(...)):
     """
     if fmt not in ("mp3", "wav"):
         raise HTTPException(400, "Format must be 'mp3' or 'wav'")
+
+    if disposition not in ("attachment", "inline"):
+        raise HTTPException(400, "disposition must be 'attachment' or 'inline'")
 
     if not _verify_download_token(video_id, fmt, token):
         # Deliberately identical wording for a bad signature and an
@@ -888,11 +938,25 @@ async def download_audio_file(video_id: str, fmt: str, token: str = Query(...)):
             "This file is no longer available. Please request the download again."
         )
 
-    logger.info(f"[DOWNLOAD] Serving '{title}' ({fmt}) from cache: {video_id}")
+    logger.info(
+        f"[DOWNLOAD] Serving '{title}' ({fmt}) from cache: {video_id} ({disposition})"
+    )
     return FileResponse(
         path,
         media_type=_MEDIA_TYPES[fmt],
         filename=_safe_filename(title, fmt),
+        # ATTACHMENT IS THE DEFAULT AND HAS TO BE. <a download> is IGNORED
+        # on cross-origin URLs, and api.audioforges.com is cross-origin
+        # from the site - so this header is the only thing that makes a
+        # click save the file rather than navigate to it. Dropping it
+        # would break every download button.
+        #
+        # inline is opt-in for the preview player, which wants the same
+        # bytes from the same route without triggering a save. Left OUT
+        # of the signed payload deliberately: it changes presentation,
+        # not access, so a user flipping it gains nothing they did not
+        # already have with a valid token.
+        content_disposition_type=disposition,
     )
 
 
