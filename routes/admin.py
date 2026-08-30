@@ -232,6 +232,14 @@ from config import (
     MIN_MIDI_HQ_DURATION_SECONDS,
     ALLOWED_VIDEO_INPUT_FORMATS,
     MIDI_INPUT_FORMATS,
+    # The download cache's own max age, and the one duration cap /limits
+    # did not publish (added 2026-08-30). MAX_VIDEO_DURATION_SECONDS
+    # governs the YouTube DOWNLOADER, not transcription - it had been
+    # living in the frontend's TRANSCRIPTION_LIMITS, which is the wrong
+    # home for it and exactly the kind of misfiling that survives because
+    # the number happens to be right.
+    CACHE_MAX_AGE_SECONDS,
+    MAX_VIDEO_DURATION_SECONDS,
     MIDI_WORKER_URL,
 )
 from utils import run_blocking
@@ -938,6 +946,15 @@ async def limits():
             # behaviour.
             "exempt_tools": ["convert"],
             "video_extract_max_seconds": VIDEO_EXTRACT_MAX_DURATION_SECONDS,
+            # The YouTube DOWNLOADER's cap - /download and every
+            # /youtube/* chained tool reject past it. Published here
+            # 2026-08-30; it was the last duration figure any page stated
+            # from a hand-maintained constant, and it had been living in
+            # the frontend's TRANSCRIPTION_LIMITS, which governs a
+            # different subsystem entirely. Deliberately NOT named
+            # anything with "transcribe" in it, so it cannot drift back
+            # into that file.
+            "youtube_download_max_seconds": MAX_VIDEO_DURATION_SECONDS,
             # A TOTAL across every file in one /join request, not per
             # file - ten four-minute tracks is a forty-minute re-encode
             # however modest each one looks alone.
@@ -1013,6 +1030,32 @@ async def limits():
                 "input_seconds": None,
                 "output_seconds": TRANSCRIPTION_JOB_TTL_SECONDS,
                 "output_kind": "text",
+            },
+            # FOURTH SHAPE (added 2026-08-30), and the one that does not
+            # fit the input/output pair above - deliberately given its
+            # own fields rather than forced into that mould.
+            #
+            # Nothing is UPLOADED to /download: the user pastes a URL.
+            # What is stored is the CONVERTED AUDIO, and the key is
+            # (video_id, format) - the SQLite primary key and the
+            # filename both, with no visitor identity anywhere in it. So
+            # one person's conversion genuinely serves the next person's
+            # request for the same URL and format. That is worth stating
+            # plainly on the page, and it is a very different sentence
+            # from "your file is cached".
+            #
+            # max_age_seconds IS A CEILING, NOT A PROMISE, which is why
+            # `guaranteed` is here and false. The cache is LRU-evicted
+            # against a size cap (see cache.py's _evict_if_over_limit),
+            # so a rarely-requested entry can disappear long before 30
+            # days. Copy should say "up to 30 days", never "for 30 days".
+            "download_cache": {
+                "scope": "per_video",
+                "keyed_on": ["video_id", "format"],
+                "max_age_seconds": CACHE_MAX_AGE_SECONDS,
+                "eviction": "lru",
+                "guaranteed": False,
+                "stores": "converted_audio",
             },
         },
         "rate_limits": {

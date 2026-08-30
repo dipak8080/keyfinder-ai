@@ -44,10 +44,39 @@ USAGE:
 save_upload() either returns the byte count written, or raises an
 HTTPException and leaves NO partial file behind. Callers do not need
 their own try/except around it for cleanup purposes.
+
+--------------------------------------------------------------------------
+WHAT CHANGED (2026-08-30): save_uploads() ENFORCES A PER-FILE CAP TOO
+
+It enforced only the batch total. /limits has been publishing
+`join.max_per_file_mb` alongside `join.max_total_mb` for as long as that
+block has existed, with a comment saying the per-file limit "is NOT
+implied by the total, and the frontend enforces it separately" - and
+that was the whole of it. The frontend enforced it; nothing here did. A
+single 85MB file inside a batch under the total was accepted by the
+server despite /limits stating it could not be.
+
+That is the exact inverse of the bug found the same day on the OTHER
+side of this code: JOIN_MAX_TOTAL_BYTES was 150MB while Cloudflare's
+free plan caps request bodies at 100MB, so a batch between those two
+numbers was advertised as fine and could never reach the origin at all.
+One published limit was unenforceable, the other was unenforced. Both
+came from a number being stated in one place and checked in another.
+
+The total is still the primary bound and its docstring reasoning below
+is unchanged - ten 45MB files must not land 450MB on disk regardless of
+how modest each looks. The per-file cap is additive, and its value is in
+the ERROR, not the rejection: without it, one oversized file in an
+otherwise fine batch produces "Combined file size too large", which
+names no file and leaves the user guessing which one to drop.
+
+OPTIONAL, defaulting to None, so nothing outside /join changes. A caller
+that passes no per-file cap gets exactly today's behaviour.
+--------------------------------------------------------------------------
 """
 import os
 import asyncio
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException, UploadFile
 
@@ -147,6 +176,7 @@ async def save_uploads(
     dest_paths: Sequence[str],
     max_total_bytes: int,
     label: str = "upload",
+    max_per_file_bytes: Optional[int] = None,
 ) -> Tuple[List[str], int]:
     """
     Multi-file variant for /join. The cap is enforced across the WHOLE
@@ -155,6 +185,26 @@ async def save_uploads(
 
     On any failure EVERY already-written file in the batch is removed,
     not just the one that failed. Returns (written_paths, total_bytes).
+
+    max_per_file_bytes (added 2026-08-30) is an ADDITIONAL, optional
+    bound applied to each file individually. The batch total above
+    remains the primary protection and the reasoning for it is unchanged;
+    this exists because /limits publishes `join.max_per_file_mb` and
+    nothing here was checking it - a published limit with no enforcement
+    behind it.
+
+    Its real value is the ERROR, not the rejection. Without it, one
+    oversized file in an otherwise reasonable batch trips the TOTAL and
+    reports "Combined file size too large", which names no file and
+    leaves the user to guess which of ten to remove. With it, the message
+    names the file.
+
+    Both checks run inside the chunk loop, so an oversized file is
+    rejected mid-stream rather than after the whole body has landed -
+    same no-swap reasoning as save_upload() above.
+
+    None (the default) preserves today's behaviour exactly, so callers
+    other than /join are unaffected.
     """
     if len(files) != len(dest_paths):
         raise HTTPException(500, "Internal error: upload path count mismatch.")
@@ -177,6 +227,25 @@ async def save_uploads(
 
                     total += len(chunk)
                     per_file += len(chunk)
+
+                    # PER-FILE FIRST, deliberately. When one oversized
+                    # file is what pushed the batch over, both conditions
+                    # can be true on the same chunk - and the per-file
+                    # message is the more useful of the two, because it
+                    # names the file. Checking the total first would
+                    # report a combined-size failure for a problem the
+                    # user can only fix by identifying one specific file.
+                    if max_per_file_bytes is not None and per_file > max_per_file_bytes:
+                        logger.warning(
+                            f"[UPLOAD] Rejected batch ({label}): '{file.filename}' "
+                            f"exceeded the {max_per_file_bytes // (1024 * 1024)} MB "
+                            f"per-file limit mid-stream"
+                        )
+                        raise HTTPException(
+                            413,
+                            f"'{file.filename}' is too large. Each file must be under "
+                            f"{max_per_file_bytes // (1024 * 1024)} MB.",
+                        )
 
                     if total > max_total_bytes:
                         logger.warning(

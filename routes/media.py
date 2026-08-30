@@ -36,6 +36,37 @@ point - a limit nobody can find is a limit nobody maintains.
 
 Nothing else in this file changed.
 --------------------------------------------------------------------------
+
+WHAT CHANGED (2026-08-30): /join NOW ENFORCES ITS PER-FILE CAP
+
+One argument, and it closes a limit that was published but not checked.
+
+/limits has reported `join.max_per_file_mb` for as long as that block
+has existed, with a comment stating the per-file limit "is NOT implied
+by the total, and the frontend enforces it separately". That was the
+whole of it: the frontend enforced it, and nothing on this side did.
+save_uploads() took only a batch total, so a single 85MB file inside a
+batch under the total was accepted by the server despite /limits saying
+it could not be.
+
+The batch total remains the primary bound and its reasoning is
+unchanged - ten 45MB files must not land 450MB on disk however modest
+each one looks alone. The per-file cap is additive, and its value is
+mostly in the ERROR rather than the rejection: without it, one oversized
+file trips the TOTAL and reports "Combined file size too large", which
+names no file and leaves someone with a ten-file batch guessing which
+one to drop.
+
+CONTEXT WORTH KEEPING, because the pair is instructive. The same day
+this was found, JOIN_MAX_TOTAL_BYTES was discovered to be 150MB while
+Cloudflare's free plan caps request bodies at 100MB - so a batch between
+those two numbers was advertised as fine and could never reach this
+process at all (confirmed: a 110MB POST returns Cloudflare's own 413,
+and nothing appears in the container log). One published limit was
+UNENFORCEABLE, this one was UNENFORCED, and both came from a number
+being stated in one place and checked in another. The total is now
+capped below Cloudflare's ceiling via .env; this line is the other half.
+--------------------------------------------------------------------------
 """
 import os
 import time
@@ -198,6 +229,12 @@ async def analyze_audio(file: UploadFile = File(...)):
         logger.error(f"[ANALYZE] FAILED '{file.filename}' (unexpected): {e}", exc_info=True)
         raise HTTPException(500, "Could not analyze this file. It may be corrupt or in an unsupported format.")
     finally:
+        # Unconditional, and both files. The upload goes on success, on a
+        # 400 for a corrupt file, and on an unexpected 500 alike; the
+        # trimmed ANALYSIS_MAX_SECONDS excerpt goes with it when one was
+        # made. /analyze produces no output file and no job row at all -
+        # the key and BPM are returned inline - so once this block runs
+        # there is nothing left of the request anywhere on disk.
         cleanup_file(file_path)
         if analysis_path != file_path:
             cleanup_file(analysis_path)
@@ -244,10 +281,9 @@ async def video_to_audio_route(file: UploadFile = File(...), target_format: str 
     # the same. Placed after the caller's own input has been validated
     # and before create_job, matching the shared helper exactly.
     #
-    # It matters more here than on most routes: this endpoint accepts up
-    # to MAX_VIDEO_UPLOAD_BYTES (200MB), so a submission refused at this
-    # line saves an upload an order of magnitude larger than any other
-    # tool's.
+    # It matters more here than on most routes: this endpoint accepts the
+    # largest uploads on the site, so a submission refused at this line
+    # saves an upload an order of magnitude larger than any other tool's.
     _reject_if_audio_tools_queue_full()
 
     job_id = create_job(job_type="video_to_audio")
@@ -334,7 +370,7 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
         raise HTTPException(400, f"You can join up to {JOIN_MAX_FILES} files at a time.")
 
     # Every filename is checked before ANY byte is transferred - one bad
-    # extension in a ten-file batch should not cost the user a 150MB
+    # extension in a ten-file batch should not cost the user the whole
     # upload first.
     for f in files:
         _validated_input_format(f.filename)
@@ -346,9 +382,9 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
     # doesn't inherit _submit_audio_tool's.
     #
     # The most valuable placement of the four: refusing here saves a
-    # JOIN_MAX_TOTAL_BYTES batch (150MB across up to ten files) that
-    # would otherwise all land on disk before anything noticed the pool
-    # was full.
+    # whole JOIN_MAX_TOTAL_BYTES batch across up to ten files that would
+    # otherwise all land on disk before anything noticed the pool was
+    # full.
     _reject_if_audio_tools_queue_full()
 
     job_id = create_job(job_type="join")
@@ -361,8 +397,19 @@ async def join_route(files: List[UploadFile] = File(...), target_format: str = F
     ]
 
     try:
+        # max_per_file_bytes added 2026-08-30. /limits has published
+        # join.max_per_file_mb since that block existed while nothing
+        # here checked it - see this module's WHAT CHANGED note. The
+        # batch total is still the primary bound; this makes the
+        # published per-file number true, and makes the error name the
+        # offending file instead of blaming the combined size.
+        #
+        # MAX_UPLOAD_BYTES deliberately, not a literal: it is the same
+        # constant /limits derives join.max_per_file_mb from, so the two
+        # cannot drift apart.
         input_paths, total = await save_uploads(
-            files, dest_paths, JOIN_MAX_TOTAL_BYTES, label="join"
+            files, dest_paths, JOIN_MAX_TOTAL_BYTES, label="join",
+            max_per_file_bytes=MAX_UPLOAD_BYTES,
         )
     except HTTPException as e:
         mark_failed(job_id, e.detail if isinstance(e.detail, str) else "Upload rejected.")
