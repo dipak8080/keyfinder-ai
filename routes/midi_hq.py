@@ -114,7 +114,7 @@ from jobs import create_job, mark_tool_complete, mark_data_complete, mark_failed
 from audio_common import get_audio_mime_type, build_output_path
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
-from midi_hq_gpu import transcribe_to_midi, is_available as midi_hq_available
+from midi_hq_gpu import transcribe_to_midi, is_available as midi_hq_available, INSTRUMENTS
 
 from credits import paywall, metering
 from credits.identity import Identity
@@ -305,6 +305,8 @@ async def audio_to_midi_hq_route(
     min_pitch: int = Form(None),
     max_pitch: int = Form(None),
     min_note_ms: float = Form(None),
+    instrument: str = Form("auto"),
+    isolate: bool = Form(False),
     identity: Identity = paywall.IdentityDep,
 ):
     """Multi-instrument transcription on the GPU. 1 credit.
@@ -316,6 +318,10 @@ async def audio_to_midi_hq_route(
         min_pitch    MIDI note number, inclusive. Notes below are dropped.
         max_pitch    MIDI note number, inclusive. Notes above are dropped.
         min_note_ms  Notes shorter than this are dropped, in milliseconds.
+        instrument   auto | piano | mix | guitar. Picks the engine - see
+                     midi_hq_gpu.py. Default auto = YourMT3.
+        isolate      guitar only. Run htdemucs_6s first and transcribe
+                     the guitar stem. Use for guitar inside a full mix.
 
     NOT accepted, and deliberately: onset_threshold, frame_threshold.
     Those control basic-pitch's DETECTION and have no counterpart in this
@@ -334,6 +340,12 @@ async def audio_to_midi_hq_route(
     _require_available()
 
     min_pitch, max_pitch, min_note_ms = _validated_filters(min_pitch, max_pitch, min_note_ms)
+
+    instrument = (instrument or "auto").lower()
+    if instrument not in INSTRUMENTS:
+        raise HTTPException(400, f"instrument must be one of: {', '.join(INSTRUMENTS)}.")
+    if isolate and instrument != "guitar":
+        raise HTTPException(400, "isolate is only supported with instrument=guitar.")
 
     _validated_input_format(file.filename)
     original_filename = file.filename
@@ -414,6 +426,9 @@ async def audio_to_midi_hq_route(
                     min_pitch=min_pitch,
                     max_pitch=max_pitch,
                     min_note_ms=min_note_ms,
+                    instrument=instrument,
+                    isolate=isolate,
+                    job_id=job_id,
                 ),
                 # BOTH marks, deliberately. mark_tool_complete stores the
                 # file (output_path/output_format) so preview and download
@@ -464,7 +479,8 @@ async def audio_to_midi_hq_route(
         TOOL, job_id, original_filename, size,
         f"{duration:.1f}s pitch={min_pitch if min_pitch is not None else '-'}.."
         f"{max_pitch if max_pitch is not None else '-'} "
-        f"min_note={min_note_ms or '-'}ms charge={charge.charge_type}",
+        f"min_note={min_note_ms or '-'}ms instrument={instrument} "
+        f"isolate={isolate} charge={charge.charge_type}",
     )
 
     # The `billing` block means the frontend never needs a follow-up
@@ -477,6 +493,8 @@ async def audio_to_midi_hq_route(
             "min_pitch": min_pitch,
             "max_pitch": max_pitch,
             "min_note_ms": min_note_ms,
+            "instrument": instrument,
+            "isolate": isolate,
         },
         "billing": {
             "charged": charge.charge_type,

@@ -85,7 +85,10 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
+import json
+
 from basic_pitch.inference import predict, Model
+from basic_pitch.note_creation import note_events_to_midi
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -125,6 +128,42 @@ SUBSTANTIAL_MIN_NOTES = int(os.environ.get("MIDI_SUBSTANTIAL_MIN_NOTES", "5"))
 # genuine notes beat a later, noisier tier that found more total notes
 # but wasn't itself substantial.
 MODERATE_FLOOR_NOTES = int(os.environ.get("MIDI_MODERATE_FLOOR_NOTES", "3"))
+
+# --------------------------------------------------------------------------
+# GUITAR MODE (instrument=guitar)
+#
+# Same model, guitar-specific defaults, plus cleanup on the decided notes
+# before the MIDI is built. Ghost notes on guitar are overwhelmingly
+# harmonics of a real note (+12 / +19 / +24 semitones, same attack,
+# quieter) and doubled onsets on the same pitch. Both are removed here.
+# Polyphony is capped at the string count. Defaults tuned for riffs:
+# 16ths at 140 BPM are ~107ms, so the 127ms default min length was
+# eating real notes.
+# --------------------------------------------------------------------------
+GUITAR_PRESET = {
+    "onset_threshold": float(os.environ.get("GUITAR_ONSET", "0.45")),
+    "frame_threshold": float(os.environ.get("GUITAR_FRAME", "0.25")),
+    "minimum_note_length": float(os.environ.get("GUITAR_MIN_NOTE_MS", "50")),
+    "minimum_frequency": float(os.environ.get("GUITAR_MIN_HZ", "70")),      # drop-D safe
+    "maximum_frequency": float(os.environ.get("GUITAR_MAX_HZ", "1400")),    # 24th fret high E
+}
+GUITAR_MAX_POLYPHONY = int(os.environ.get("GUITAR_MAX_POLYPHONY", "6"))
+GUITAR_ONSET_TOLERANCE_S = float(os.environ.get("GUITAR_ONSET_TOL_MS", "35")) / 1000.0
+# ghost = same attack as a note 12/19/24 below, quieter than ratio x its amplitude, and not outliving it
+GUITAR_HARMONIC_RATIOS = {
+    12: float(os.environ.get("GUITAR_RATIO_OCTAVE", "0.5")),
+    19: float(os.environ.get("GUITAR_RATIO_12TH", "0.6")),
+    24: float(os.environ.get("GUITAR_RATIO_15TH", "0.6")),
+}
+GUITAR_PROGRAM = int(os.environ.get("GUITAR_PROGRAM", "27"))  # GM 27 = Electric Guitar (clean)
+
+DEFAULT_PRESET = {
+    "onset_threshold": 0.5,
+    "frame_threshold": 0.3,
+    "minimum_note_length": 127.70,
+    "minimum_frequency": None,
+    "maximum_frequency": None,
+}
 
 app = FastAPI()
 
@@ -226,6 +265,89 @@ def _select_best(results: List[_TierResult]) -> Optional[_TierResult]:
     return None
 
 
+def _dedupe_onsets(notes: list) -> Tuple[list, int]:
+    notes = sorted(notes, key=lambda n: (n[2], n[0]))
+    kept, dropped = [], 0
+    for n in notes:
+        if kept and kept[-1][2] == n[2] and (n[0] - kept[-1][0]) <= GUITAR_ONSET_TOLERANCE_S:
+            prev = kept[-1]
+            if (n[1] - n[0]) > (prev[1] - prev[0]) or n[3] > prev[3]:
+                kept[-1] = (prev[0], max(prev[1], n[1]), n[2], max(prev[3], n[3]), n[4])
+            dropped += 1
+            continue
+        kept.append(n)
+    return kept, dropped
+
+
+def _prune_harmonics(notes: list) -> Tuple[list, int]:
+    by_pitch = {}
+    for n in notes:
+        by_pitch.setdefault(n[2], []).append(n)
+    kept, dropped = [], 0
+    for n in notes:
+        ghost = False
+        for interval, ratio in GUITAR_HARMONIC_RATIOS.items():
+            for low in by_pitch.get(n[2] - interval, ()):
+                if (abs(low[0] - n[0]) <= GUITAR_ONSET_TOLERANCE_S
+                        and n[3] < ratio * low[3]
+                        and n[1] <= low[1] + 0.1):
+                    ghost = True
+                    break
+            if ghost:
+                break
+        if ghost:
+            dropped += 1
+        else:
+            kept.append(n)
+    return kept, dropped
+
+
+def _cap_polyphony(notes: list, limit: int) -> Tuple[list, int]:
+    notes = sorted(notes, key=lambda n: n[0])
+    removed = set()
+    for i, n in enumerate(notes):
+        if i in removed:
+            continue
+        active = [j for j, m in enumerate(notes)
+                  if j not in removed and m[0] <= n[0] < m[1]]
+        if len(active) <= limit:
+            continue
+        active.sort(key=lambda j: notes[j][3])
+        for j in active[: len(active) - limit]:
+            removed.add(j)
+    return [n for i, n in enumerate(notes) if i not in removed], len(removed)
+
+
+def _guitar_cleanup(note_events: list) -> Tuple[list, dict]:
+    notes, d1 = _dedupe_onsets(list(note_events))
+    notes, d2 = _prune_harmonics(notes)
+    notes, d3 = _cap_polyphony(notes, GUITAR_MAX_POLYPHONY)
+    notes.sort(key=lambda n: (n[0], n[2]))
+    return notes, {"duplicate_onsets": d1, "harmonics": d2, "polyphony": d3}
+
+
+def _stats(midi_data, extra: dict) -> dict:
+    tracks = []
+    for inst in midi_data.instruments:
+        if not inst.notes:
+            continue
+        tracks.append({
+            "program": int(inst.program),
+            "is_drum": bool(inst.is_drum),
+            "name": "Guitar" if inst.program == GUITAR_PROGRAM else "Electric Piano 1",
+            "notes": len(inst.notes),
+            "low": int(min(n.pitch for n in inst.notes)),
+            "high": int(max(n.pitch for n in inst.notes)),
+        })
+    return {
+        "duration_seconds": round(float(midi_data.get_end_time()), 2),
+        "track_count": len(tracks),
+        "note_count": sum(t["notes"] for t in tracks),
+        "tracks": tracks,
+        **extra,
+    }
+
+
 @app.get("/health")
 async def health():
     """Deliberately does NOT acquire the semaphore or touch the model -
@@ -243,15 +365,31 @@ async def health():
 @app.post("/convert")
 async def convert(
     file: UploadFile = File(...),
-    onset_threshold: float = Form(0.5),
-    frame_threshold: float = Form(0.3),
-    minimum_note_length: float = Form(127.70),
+    onset_threshold: Optional[float] = Form(None),
+    frame_threshold: Optional[float] = Form(None),
+    minimum_note_length: Optional[float] = Form(None),
     minimum_frequency: Optional[float] = Form(None),
     maximum_frequency: Optional[float] = Form(None),
     multiple_pitch_bends: bool = Form(False),
+    instrument: str = Form("any"),
     x_internal_secret: str = Header(default=""),
 ):
     _verify_secret(x_internal_secret)
+
+    instrument = (instrument or "any").lower()
+    if instrument not in ("any", "guitar"):
+        raise HTTPException(400, {"reason": "bad_instrument", "message": "instrument must be 'any' or 'guitar'."})
+    preset = GUITAR_PRESET if instrument == "guitar" else DEFAULT_PRESET
+    if onset_threshold is None:
+        onset_threshold = preset["onset_threshold"]
+    if frame_threshold is None:
+        frame_threshold = preset["frame_threshold"]
+    if minimum_note_length is None:
+        minimum_note_length = preset["minimum_note_length"]
+    if minimum_frequency is None:
+        minimum_frequency = preset["minimum_frequency"]
+    if maximum_frequency is None:
+        maximum_frequency = preset["maximum_frequency"]
 
     suffix = os.path.splitext(file.filename or "")[1].lower() or ".audio"
     input_path = None
@@ -338,6 +476,20 @@ async def convert(
             best = _select_best(results)
             midi_data = best.midi_data if best else None
             note_events = best.note_events if best else []
+            cleanup = {}
+
+            if instrument == "guitar" and note_events:
+                raw_count = len(note_events)
+                note_events, cleanup = _guitar_cleanup(note_events)
+                midi_data = note_events_to_midi(note_events, multiple_pitch_bends=multiple_pitch_bends)
+                for inst in midi_data.instruments:
+                    inst.program = GUITAR_PROGRAM
+                    inst.name = "Guitar"
+                logger.info(
+                    f"[MIDI_WORKER] guitar cleanup: {raw_count} -> {len(note_events)} notes "
+                    f"(dupes={cleanup['duplicate_onsets']}, harmonics={cleanup['harmonics']}, "
+                    f"polyphony={cleanup['polyphony']})"
+                )
             used_onset = best.onset if best else onset_threshold
             used_frame = best.frame if best else frame_threshold
             used_min_len = best.min_len if best else minimum_note_length
@@ -385,13 +537,24 @@ async def convert(
         logger.info(
             f"[MIDI_WORKER] COMPLETE - {len(note_events)} notes over {span:.1f}s "
             f"({density:.2f} notes/sec), {len(midi_bytes)} bytes MIDI from "
-            f"{total} bytes audio (onset={used_onset}, frame={used_frame}, "
+            f"{total} bytes audio (instrument={instrument}, onset={used_onset}, frame={used_frame}, "
             f"min_note_length={used_min_len}ms, tiers_run={tiers_run})"
         )
+        stats = _stats(midi_data, {
+            "instrument": instrument,
+            "notes_dropped_by_cleanup": sum(cleanup.values()) if cleanup else 0,
+            "cleanup": cleanup,
+            "onset_threshold": used_onset,
+            "frame_threshold": used_frame,
+            "min_note_ms": used_min_len,
+            "cascade_tiers_run": tiers_run,
+        })
+
         return Response(
             content=midi_bytes,
             media_type="audio/midi",
             headers={
+                "X-Midi-Stats": json.dumps(stats),
                 "X-Note-Count": str(len(note_events)),
                 "X-Note-Span-Seconds": f"{span:.2f}",
                 "X-Notes-Per-Second": f"{density:.2f}",

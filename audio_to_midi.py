@@ -21,6 +21,8 @@ therefore dispatched via utils.run_blocking() from the async route,
 never awaited directly.
 """
 import os
+import json
+import math
 
 import requests
 
@@ -148,3 +150,98 @@ def convert_to_midi(
         f"{response.text[:200]}"
     )
     raise AudioToolError("MIDI conversion failed unexpectedly.")
+
+
+def midi_pitch_to_hz(pitch: int) -> float:
+    return 440.0 * math.pow(2.0, (pitch - 69) / 12.0)
+
+
+def convert_guitar_to_midi(
+    input_path: str,
+    output_path: str,
+    min_pitch: Optional[int] = None,
+    max_pitch: Optional[int] = None,
+    min_note_ms: Optional[float] = None,
+) -> dict:
+    """
+    Guitar path for /audio-to-midi-hq. Same sidecar, instrument=guitar:
+    the worker applies its guitar preset and note cleanup. Returns the
+    worker's stats dict (parsed from the X-Midi-Stats header) in the
+    same shape the MT3 worker returns, minus "_gpu".
+    """
+    if not MIDI_WORKER_SHARED_SECRET:
+        logger.error("[AUDIO_TO_MIDI_GUITAR] MIDI_WORKER_SHARED_SECRET is not set - refusing to call the worker.")
+        raise AudioToolError("Guitar MIDI transcription is temporarily unavailable. Please try again later.")
+
+    filename = os.path.basename(input_path)
+    data = {"instrument": "guitar"}
+    if min_pitch is not None:
+        data["minimum_frequency"] = midi_pitch_to_hz(int(min_pitch)) * 0.97
+    if max_pitch is not None:
+        data["maximum_frequency"] = midi_pitch_to_hz(int(max_pitch)) * 1.03
+    if min_note_ms:
+        data["minimum_note_length"] = float(min_note_ms)
+
+    try:
+        with open(input_path, "rb") as f:
+            response = requests.post(
+                f"{MIDI_WORKER_URL}/convert",
+                files={"file": (filename, f)},
+                data=data,
+                headers={"x-internal-secret": MIDI_WORKER_SHARED_SECRET},
+                timeout=MIDI_WORKER_TIMEOUT_SECONDS,
+            )
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"[AUDIO_TO_MIDI_GUITAR] Cannot reach midi-worker at {MIDI_WORKER_URL}: {e}")
+        raise AudioToolError("Guitar MIDI transcription is temporarily unavailable. Please try again shortly.")
+    except requests.exceptions.Timeout:
+        logger.warning(f"[AUDIO_TO_MIDI_GUITAR] midi-worker timed out after {MIDI_WORKER_TIMEOUT_SECONDS}s")
+        raise AudioToolError("Guitar MIDI transcription took too long. Try a shorter clip.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[AUDIO_TO_MIDI_GUITAR] Transport error calling midi-worker: {e}", exc_info=True)
+        raise AudioToolError("Guitar MIDI transcription failed unexpectedly.")
+
+    if response.status_code == 200:
+        content = response.content
+        if not content:
+            logger.error("[AUDIO_TO_MIDI_GUITAR] midi-worker returned 200 with an empty body")
+            raise AudioToolError("Guitar MIDI transcription failed unexpectedly.")
+        with open(output_path, "wb") as f:
+            f.write(content)
+        stats = {}
+        try:
+            stats = json.loads(response.headers.get("X-Midi-Stats") or "{}")
+        except ValueError:
+            logger.warning("[AUDIO_TO_MIDI_GUITAR] Could not parse X-Midi-Stats header")
+        stats.setdefault("note_count", int(response.headers.get("X-Note-Count") or 0))
+        stats.setdefault("track_count", 1)
+        stats.setdefault("tracks", [])
+        stats.setdefault("duration_seconds", float(response.headers.get("X-Note-Span-Seconds") or 0))
+        return stats
+
+    reason = None
+    try:
+        detail = response.json().get("detail")
+        if isinstance(detail, dict):
+            reason = detail.get("reason")
+    except (ValueError, AttributeError):
+        pass
+
+    if reason == "no_notes":
+        raise AudioToolError(
+            "No guitar notes were detected in this audio. Try a cleaner recording, "
+            "or turn on 'isolate guitar' if this is a full mix."
+        )
+    if response.status_code == 413 or reason == "too_large":
+        raise AudioToolError("File too large for MIDI conversion.")
+    if response.status_code == 401 or reason in ("unauthorized", "misconfigured"):
+        logger.error(f"[AUDIO_TO_MIDI_GUITAR] midi-worker auth failure (status={response.status_code})")
+        raise AudioToolError("Guitar MIDI transcription is temporarily unavailable. Please try again later.")
+    if response.status_code == 422:
+        raise AudioToolError("Could not transcribe this audio. It may be corrupt or in an unsupported format.")
+
+    logger.error(
+        f"[AUDIO_TO_MIDI_GUITAR] midi-worker returned unexpected status {response.status_code}: "
+        f"{response.text[:200]}"
+    )
+    raise AudioToolError("Guitar MIDI transcription failed unexpectedly.")

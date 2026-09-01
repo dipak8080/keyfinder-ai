@@ -68,6 +68,7 @@ INPUT still travels over HTTP because audio is audio.
 
 import base64
 import os
+import time
 import uuid
 
 from config import (
@@ -82,6 +83,27 @@ from config import (
 from audio_common import AudioToolError
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
+from utils import run_blocking, cleanup_file
+from audio_to_midi import convert_guitar_to_midi
+from separation import run_stem_separation, SeparationError
+
+# --------------------------------------------------------------------------
+# INSTRUMENT ROUTING (2026-09-01)
+#
+# YourMT3 is trained on Slakh/MAESTRO and a little clean acoustic
+# GuitarSet. It is strong on piano and full mixes and bad on electric
+# guitar - riffs came back as sparse, octave-shifted "piano". So the HQ
+# route now picks an engine per instrument:
+#
+#   auto / piano / mix   YourMT3 on RunPod (unchanged path)
+#   guitar               basic-pitch sidecar in guitar mode, optionally
+#                        after an htdemucs_6s guitar-stem isolation pass
+#
+# Same route, same credit, same result shape. "engine" in the stats says
+# which one ran.
+# --------------------------------------------------------------------------
+INSTRUMENTS = ("auto", "piano", "mix", "guitar")
+ISOLATION_MODEL = "htdemucs_6s"
 
 
 # Every error code gpu-worker-mt3/handler.py can return, mapped to what
@@ -180,12 +202,70 @@ def _validate_local_input(input_path: str) -> None:
         raise AudioToolError("That file is empty. Please upload a valid audio file.")
 
 
+async def _transcribe_guitar(
+    input_path: str,
+    output_path: str,
+    job_id: str,
+    isolate: bool,
+    min_pitch: int | None,
+    max_pitch: int | None,
+    min_note_ms: float | None,
+) -> dict:
+    started = time.monotonic()
+    stem_paths: dict = {}
+    source_path = input_path
+    isolate_seconds = 0.0
+
+    try:
+        if isolate:
+            iso_started = time.monotonic()
+            try:
+                stem_paths = await run_stem_separation(input_path, job_id, model=ISOLATION_MODEL)
+            except SeparationError as e:
+                logger.error(f"[MIDI_HQ] guitar isolation failed for job {job_id}: {e}")
+                raise AudioToolError(
+                    "Could not isolate the guitar from this mix. Try again, or upload a solo guitar recording."
+                )
+            isolate_seconds = time.monotonic() - iso_started
+            source_path = stem_paths.get("guitar")
+            if not source_path or not os.path.exists(source_path):
+                raise AudioToolError("Guitar isolation produced no guitar stem for this file.")
+
+        stats = await run_blocking(
+            convert_guitar_to_midi, source_path, output_path,
+            min_pitch=min_pitch, max_pitch=max_pitch, min_note_ms=min_note_ms,
+        )
+    finally:
+        for path in stem_paths.values():
+            cleanup_file(path)
+
+    stats["engine"] = "basic-pitch-guitar"
+    stats["isolated"] = bool(isolate)
+    stats.setdefault("notes_dropped_by_filter", 0)
+    stats["_gpu"] = {
+        "fetch_seconds": 0.0,
+        "infer_seconds": round(isolate_seconds, 2),
+        "total_seconds": round(time.monotonic() - started, 2),
+        "rtf": None,
+    }
+    logger.info(
+        f"[MIDI_HQ] Guitar complete: {stats.get('note_count')} notes, "
+        f"{stats.get('duration_seconds')}s, cleanup dropped "
+        f"{stats.get('notes_dropped_by_cleanup', 0)} "
+        f"(isolated={isolate}, isolate {isolate_seconds:.1f}s)"
+    )
+    return stats
+
+
 async def transcribe_to_midi(
     input_path: str,
     output_path: str,
     min_pitch: int | None = None,
     max_pitch: int | None = None,
     min_note_ms: float | None = None,
+    instrument: str = "auto",
+    isolate: bool = False,
+    job_id: str | None = None,
 ) -> dict:
     """Transcribe input_path on the GPU worker and write MIDI to output_path.
 
@@ -214,6 +294,16 @@ async def transcribe_to_midi(
         )
 
     _validate_local_input(input_path)
+
+    instrument = (instrument or "auto").lower()
+    if instrument not in INSTRUMENTS:
+        raise AudioToolError(f"Unknown instrument '{instrument}'.")
+
+    if instrument == "guitar":
+        return await _transcribe_guitar(
+            input_path, output_path, job_id or uuid.uuid4().hex, isolate,
+            min_pitch, max_pitch, min_note_ms,
+        )
 
     # A fresh handle per job, registered immediately before submit and
     # removed in the `finally` below - so the input URL is live for
@@ -324,6 +414,8 @@ async def transcribe_to_midi(
         f.write(midi_bytes)
 
     stats = {k: v for k, v in result.items() if k != "midi_b64"}
+    stats["engine"] = "yourmt3"
+    stats["isolated"] = False
     gpu = stats.get("_gpu") or {}
 
     logger.info(
