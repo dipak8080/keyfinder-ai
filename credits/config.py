@@ -184,11 +184,10 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     #   1 credit, not 2. $0.024 against $0.20-0.30 of revenue is still a wide
     #   margin, and pricing this above separation would need a reason a user
     #   can see - "the transcription costs double" is not one when both take
-    #   about the same wall-clock time from their side. It is also what keeps
-    #   the refund path safe: refund_job() currently hardcodes a -1 free-op
-    #   adjustment while charge_for_job() bumps by credits_needed, so any rule
-    #   with credits > 1 would silently under-refund the free tier on a failed
-    #   job. Fix that before raising this number.
+    #   about the same wall-clock time from their side. This is now a pricing
+    #   choice and nothing more: migration 003 added job_charges.free_ops, so
+    #   refund_job() returns what charge_for_job() took and credits > 1 is
+    #   safe. The earlier warning here said otherwise; it is obsolete.
     #
     #   free_under_seconds: 0, changed from 600. The original 600 assumed
     #   transcription was cheap at short lengths and worth carving out a free
@@ -203,11 +202,13 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     #   runs a month before they ever see a paywall. 0 only removes the
     #   duration exemption on top of that.
     #
-    # THE COST NUMBER TO WATCH IS NOT THE ONE ABOVE. 95 cold starts against 57
-    # requests in that same window means workers are dying between jobs and
-    # every spin-up is billed. That is a bigger lever on the bill than any
-    # rule in this file, and no paywall setting touches it - it is the
-    # endpoint's idle timeout.
+    # THE FIGURES ABOVE ARE STALE AS OF 2026-09-01 AND WILL READ HIGH.
+    # They were measured with the RunPod idle timeout at 60s, which bills a
+    # full idle minute after every job: ~66 GPU-seconds of work invoiced as
+    # ~126. Idle is now 5s on all three endpoints (FlashBoot was already on,
+    # so cold starts were unaffected). Re-measure from gpu_job_metrics against
+    # RunPod's billed seconds before pricing anything off these numbers - the
+    # two should now agree, where they used to differ by roughly 2x.
     "transcribe": {
         "enabled": False, "free_under_seconds": 0, "credits": 1,
         "paid_rate_limit": 30, "paid_rate_window": 3600,
@@ -241,16 +242,14 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     # roughly $0.002-0.004 a job. CHEAPER than an HQ separation (~$0.018)
     # and far cheaper than a transcription per minute of audio.
     #
-    #   1 credit, and the margin is not the reason. At ~$0.003 against
-    #   $0.20-0.30 of revenue this could carry 2 credits comfortably on
-    #   cost alone. It does not, because refund_job() still hardcodes a -1
-    #   free-op adjustment while charge_for_job() bumps by credits_needed:
-    #   any rule with credits > 1 silently under-refunds the free tier on
-    #   a failed job, permanently eating an op the user never spent.
+    #   1 credit, and at ~$0.003 against $0.20-0.30 of revenue it could
+    #   carry more on cost alone. It stays at 1 because the two tiers are
+    #   sold as one credit per heavy job across the site, and a single
+    #   tool priced differently is a rule the user has to learn.
     #
-    #   That fix is a free_ops column on job_charges, written at charge
-    #   time. Until it lands, 1 is not a pricing decision - it is the only
-    #   safe value, for this rule and every other one in this dict.
+    #   No longer a safety constraint: migration 003 added
+    #   job_charges.free_ops, so a failed free-tier job returns exactly
+    #   the allowance it consumed at any credits value.
     #
     #   free_under_seconds: 0, matching every other rule here. There is no
     #   "short enough to be free" band worth carving out when the whole
@@ -474,9 +473,16 @@ def get_settings() -> Settings:
     settings = Settings(
         db_path=os.getenv("CREDITS_DB_PATH", "data/credits.db"),
         secret_key=secret,
+        # SET THIS EXPLICITLY BEFORE ROTATING CREDITS_SECRET_KEY. Unset, it
+        # falls back to the secret, and security.py salts every IP hash with
+        # it - so rotating the secret silently re-hashes every IP and hands
+        # the whole internet a fresh per-IP free allowance (ledger.py:207).
         ip_hash_salt=os.getenv("IP_HASH_SALT") or secret,
         frontend_url=(os.getenv("FRONTEND_URL") or "https://audioforges.com").rstrip("/"),
         api_base_url=(os.getenv("CREDITS_API_BASE_URL") or "https://api.audioforges.com").rstrip("/"),
+        # UNUSED. Nothing in credits/ reads this field - CORS for the whole
+        # app is the host's own ALLOWED_ORIGINS (a different variable). Kept
+        # only so admin.py can report it; do not treat it as a control.
         allowed_origins=_csv(
             "CREDITS_ALLOWED_ORIGINS",
             ("https://audioforges.com", "https://www.audioforges.com"),
