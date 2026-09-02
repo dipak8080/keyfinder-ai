@@ -18,3 +18,8 @@ run_container.sh
 .env
 .env.*
 run_container.sh
+
+ref/
+*.csv
+*_results.json
+eval_results.json
