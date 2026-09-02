@@ -884,7 +884,12 @@ async def download_audio(
         record_result("/download", succeeded)
 
 
-@router.get("/download/file/{video_id}.{fmt}")
+# GET *and* HEAD. FastAPI does not add HEAD for a @router.get route, so
+# HEAD returned 405 - download managers and some mobile browsers probe
+# with HEAD for the size before starting a large transfer. Starlette's
+# FileResponse answers HEAD with the headers and an empty body by itself,
+# so the handler below needs no branch of its own.
+@router.api_route("/download/file/{video_id}.{fmt}", methods=["GET", "HEAD"])
 async def download_audio_file(
     video_id: str,
     fmt: str,
