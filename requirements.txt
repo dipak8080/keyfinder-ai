@@ -7,7 +7,12 @@ cffi==2.0.0
 charset-normalizer==3.4.4
 click==8.3.1
 decorator==5.2.1
-essentia==2.1b6.dev1389
+# essentia-tensorflow, NOT plain essentia: the TensorFlow build is what
+# provides the TempoCNN algorithm used for BPM detection. With plain
+# essentia the import fails and the engine silently falls back to the
+# DSP detectors (measured 65% vs 85% on GiantSteps). The bundled
+# TensorFlow adds roughly 500MB to the image.
+essentia-tensorflow==2.1b6.dev1389
 fastapi==0.127.0
 h11==0.16.0
 idna==3.11

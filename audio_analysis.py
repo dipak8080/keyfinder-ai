@@ -304,7 +304,12 @@ def _get_tempocnn():
     if _tempocnn_tried:
         return _tempocnn
     _tempocnn_tried = True
-    if TempoCNN is None or not TEMPOCNN_MODEL_PATH:
+    if TempoCNN is None:
+        logger.warning("TempoCNN unavailable: install essentia-tensorflow (plain essentia lacks it). "
+                       "Falling back to DSP tempo detectors.")
+        return None
+    if not TEMPOCNN_MODEL_PATH:
+        logger.warning("TEMPOCNN_MODEL_PATH unset - falling back to DSP tempo detectors.")
         return None
     if not os.path.exists(TEMPOCNN_MODEL_PATH):
         logger.warning(f"TEMPOCNN_MODEL_PATH not found: {TEMPOCNN_MODEL_PATH}")
