@@ -23,7 +23,8 @@ from .ledger import Charge, InsufficientCredits
 class Decision:
     tool: str
     billable: bool
-    credits: int
+    credits: int       # credit cost charged to paying users
+    free_ops: int      # monthly free allowance one job consumes (0 if not billable)
     reason: str  # paywall_disabled | tool_free | under_free_duration | billable
 
 
@@ -32,13 +33,15 @@ def decide(tool: str, input_seconds: float | None) -> Decision:
     rule = s.rule_for(tool)
 
     if not s.paywall_enabled:
-        return Decision(tool, False, 0, "paywall_disabled")
+        return Decision(tool, False, 0, 0, "paywall_disabled")
     if rule is None or not rule.enabled:
-        return Decision(tool, False, 0, "tool_free")
+        return Decision(tool, False, 0, 0, "tool_free")
     if rule.free_under_seconds and input_seconds is not None and input_seconds < rule.free_under_seconds:
-        return Decision(tool, False, 0, "under_free_duration")
+        return Decision(tool, False, 0, 0, "under_free_duration")
     # Unknown duration on a metered tool is billable — never fail open.
-    return Decision(tool, True, rule.credits, "billable")
+    # free_ops is allowance, not credits: one job costs one free op
+    # regardless of credit cost, so any credit price stays coverable.
+    return Decision(tool, True, rule.credits, 1, "billable")
 
 
 def preview(identity: Identity, tool: str, input_seconds: float | None) -> dict:
@@ -51,7 +54,7 @@ def preview(identity: Identity, tool: str, input_seconds: float | None) -> dict:
 
     will_use = "none"
     if decision.billable:
-        will_use = "free" if remaining >= decision.credits else ("credit" if balance >= decision.credits else "blocked")
+        will_use = "free" if remaining >= decision.free_ops else ("credit" if balance >= decision.credits else "blocked")
 
     return {
         "tool": tool, "input_seconds": input_seconds, "billable": decision.billable,
@@ -88,6 +91,7 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
     try:
         charge = ledger_mod.charge_for_job(identity, job_id=job_id, tool=tool,
                                           credits_needed=max(decision.credits, 1),
+                                          free_ops_needed=max(decision.free_ops, 1),
                                           billable=decision.billable)
     except InsufficientCredits as exc:
         raise insufficient_credits_response(exc) from exc

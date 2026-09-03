@@ -357,7 +357,7 @@ def _bump_free(conn: sqlite3.Connection, period: str, scope: str, key: str, delt
 
 
 def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed: int = 1,
-                   billable: bool = True) -> Charge:
+                   free_ops_needed: int = 1, billable: bool = True) -> Charge:
     """Reserve payment BEFORE the GPU work is enqueued.
 
     billable=False records a 'none' charge (paywall off, or under the free
@@ -387,9 +387,12 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
             charge_type, credits = "none", 0
         else:
             remaining = free_remaining(conn, identity, period)
-            if remaining >= credits_needed:
+            if remaining >= free_ops_needed:
+                # Allowance, not credits: a job spends free_ops_needed free
+                # ops (1 per job) whatever its credit_needed cost. Coupling
+                # these put every >1-credit tool out of reach of the pool.
                 charge_type, credits = "free", 0
-                free_ops = credits_needed
+                free_ops = free_ops_needed
                 # BOTH owner keys, not just the active one. For a
                 # signed-in caller that means account:Y AND subject:X -
                 # the subject key is what survives sign-out, and leaving
@@ -397,8 +400,8 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
                 # anonymous caller the helper returns a single key, so
                 # this stays one write.
                 for key in _free_owner_keys(owner_type, owner_id, identity.subject_id):
-                    _bump_free(conn, period, "owner", key, credits_needed)
-                _bump_free(conn, period, "ip", identity.ip_hash, credits_needed)
+                    _bump_free(conn, period, "owner", key, free_ops_needed)
+                _bump_free(conn, period, "ip", identity.ip_hash, free_ops_needed)
             else:
                 balance = get_balance(conn, identity)
                 if balance < credits_needed:
