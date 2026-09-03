@@ -849,6 +849,24 @@ def _reject_if_midi_hq_queue_full():
         )
 
 
+def _download_filename(job_id: str, fmt: str, suffix: str, fallback: str = "audio") -> str:
+    """Content-Disposition name for a processed download: the ORIGINAL
+    upload's name plus the tool's transformation - song.mp3 trimmed becomes
+    song_trimmed.mp3, not trimmed.mp3.
+
+    Falls back to a generic base only when the job has no stored title, so a
+    download never 500s over a missing/odd filename. This is a header value,
+    not a filesystem path, so no traversal concern; path separators and
+    control chars are stripped anyway to keep the header well-formed.
+    """
+    job = get_job(job_id)
+    title = (job.get("title") if job else None) or ""
+    base = os.path.splitext(title)[0].replace("/", "_").replace("\\", "_")
+    base = "".join(c for c in base if c.isprintable() and c not in '"\r\n\t').strip()
+    base = base or fallback
+    return f"{base}_{suffix}.{fmt}"
+
+
 def _resolve_tool_output_path(job_id: str, expected_type: str) -> tuple:
     """
     Shared lookup behind every audio tool's preview and download route.

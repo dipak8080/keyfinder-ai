@@ -166,6 +166,28 @@ def validate_duration(file_path: str, max_seconds: int = MAX_AUDIO_TOOL_DURATION
 
 # ========== OUTPUT PATH HELPERS ==========
 
+def atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write bytes so a reader/DAW never sees a half-written file.
+
+    Writes to a sibling .tmp, fsyncs, then os.replace()s into place -
+    atomic within a filesystem. On any failure the .tmp is removed rather
+    than left as an orphan. Used by every tool that writes final MIDI.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def build_output_path(job_id: str, output_format: str) -> str:
     """Deterministic output path for a job, e.g.
     audio_tools_output/<job_id>.mp3 - kept separate from the input

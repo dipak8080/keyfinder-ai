@@ -131,6 +131,7 @@ from ._shared import (
     _run_tool_job,
     _tool_status,
     _resolve_tool_output_path,
+    _download_filename,
     _reject_if_audio_tools_queue_full,
 )
 
@@ -333,7 +334,7 @@ async def video_to_audio_preview(job_id: str):
 @router.get("/video-to-audio/download/{job_id}")
 async def video_to_audio_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "video_to_audio")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"audio.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "audio"))
 
 
 # ============================================================

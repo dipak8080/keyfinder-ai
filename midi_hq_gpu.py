@@ -80,7 +80,7 @@ from config import (
     MIDI_HQ_TIMEOUT_SECONDS,
     MAX_MIDI_HQ_DURATION_SECONDS,
 )
-from audio_common import AudioToolError
+from audio_common import AudioToolError, atomic_write_bytes
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 from utils import run_blocking, cleanup_file
@@ -410,8 +410,7 @@ async def transcribe_to_midi(
     # partial write would leave a corrupt .mid that opens as an empty
     # project in a DAW - a much worse failure than an error message,
     # because it looks like the tool worked.
-    with open(output_path, "wb") as f:
-        f.write(midi_bytes)
+    atomic_write_bytes(output_path, midi_bytes)
 
     stats = {k: v for k, v in result.items() if k != "midi_b64"}
     stats["engine"] = "yourmt3"

@@ -32,7 +32,7 @@ from config import (
     MIDI_WORKER_SHARED_SECRET,
     MIDI_WORKER_TIMEOUT_SECONDS,
 )
-from audio_common import AudioToolError
+from audio_common import AudioToolError, atomic_write_bytes
 
 from typing import Optional
 
@@ -108,8 +108,7 @@ def convert_to_midi(
         if not content:
             logger.error("[AUDIO_TO_MIDI] midi-worker returned 200 with an empty body")
             raise AudioToolError("MIDI conversion failed unexpectedly.")
-        with open(output_path, "wb") as f:
-            f.write(content)
+        atomic_write_bytes(output_path, content)
         return len(content)
 
     # Structured reason extraction. FastAPI serializes HTTPException's
@@ -206,8 +205,7 @@ def convert_guitar_to_midi(
         if not content:
             logger.error("[AUDIO_TO_MIDI_GUITAR] midi-worker returned 200 with an empty body")
             raise AudioToolError("Guitar MIDI transcription failed unexpectedly.")
-        with open(output_path, "wb") as f:
-            f.write(content)
+        atomic_write_bytes(output_path, content)
         stats = {}
         try:
             stats = json.loads(response.headers.get("X-Midi-Stats") or "{}")

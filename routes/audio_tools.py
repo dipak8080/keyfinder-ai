@@ -172,6 +172,7 @@ from ._shared import (
     _submit_audio_tool,
     _tool_status,
     _resolve_tool_output_path,
+    _download_filename,
     _accept_upload,
     _validate_duration_or_reject,
     _log_queued,
@@ -233,7 +234,7 @@ async def convert_preview(job_id: str):
 @router.get("/convert/download/{job_id}")
 async def convert_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "convert")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"converted.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "converted"))
 
 
 # ---------- /trim ----------
@@ -373,7 +374,7 @@ async def trim_preview(job_id: str):
 @router.get("/trim/download/{job_id}")
 async def trim_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "trim")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"trimmed.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "trimmed"))
 
 
 # ---------- /volume ----------
@@ -416,7 +417,7 @@ async def volume_preview(job_id: str):
 @router.get("/volume/download/{job_id}")
 async def volume_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "volume")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"volume_adjusted.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "volume_adjusted"))
 
 
 # ---------- /pitch ----------
@@ -462,7 +463,7 @@ async def pitch_preview(job_id: str):
 @router.get("/pitch/download/{job_id}")
 async def pitch_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "pitch")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"pitch_shifted.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "pitch_shifted"))
 
 
 # ---------- /tempo ----------
@@ -505,7 +506,7 @@ async def tempo_preview(job_id: str):
 @router.get("/tempo/download/{job_id}")
 async def tempo_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "tempo")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"tempo_changed.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "tempo_changed"))
 
 
 # ---------- /reverse ----------
@@ -544,7 +545,7 @@ async def reverse_preview(job_id: str):
 @router.get("/reverse/download/{job_id}")
 async def reverse_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "reverse")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"reversed.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "reversed"))
 
 
 # ---------- /noise-remove ----------
@@ -590,7 +591,7 @@ async def noise_remove_preview(job_id: str):
 @router.get("/noise-remove/download/{job_id}")
 async def noise_remove_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "noise_remove")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"denoised.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "denoised"))
 
 
 # ---------- /voice-clean ----------
@@ -629,7 +630,7 @@ async def voice_clean_preview(job_id: str):
 @router.get("/voice-clean/download/{job_id}")
 async def voice_clean_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "voice_clean")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"voice_cleaned.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "voice_cleaned"))
 
 
 # ---------- /echo-remove ----------
@@ -668,7 +669,7 @@ async def echo_remove_preview(job_id: str):
 @router.get("/echo-remove/download/{job_id}")
 async def echo_remove_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "echo_remove")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"echo_removed.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "echo_removed"))
 
 
 # ---------- /silence-remove ----------
@@ -726,7 +727,7 @@ async def silence_remove_preview(job_id: str):
 @router.get("/silence-remove/download/{job_id}")
 async def silence_remove_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "silence_remove")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"silence_removed.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "silence_removed"))
 
 
 # ---------- /loudnorm ----------
@@ -775,7 +776,7 @@ async def loudnorm_preview(job_id: str):
 @router.get("/loudnorm/download/{job_id}")
 async def loudnorm_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "loudnorm")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"normalized.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "normalized"))
 
 
 # ---------- /fade ----------
@@ -830,7 +831,7 @@ async def fade_preview(job_id: str):
 @router.get("/fade/download/{job_id}")
 async def fade_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "fade")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"faded.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "faded"))
 
 
 # ---------- /channels ----------
@@ -878,7 +879,7 @@ async def channels_preview(job_id: str):
 @router.get("/channels/download/{job_id}")
 async def channels_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "channels")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"converted.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "converted"))
 
 
 # ---------- /resample ----------
@@ -935,7 +936,7 @@ async def resample_preview(job_id: str):
 @router.get("/resample/download/{job_id}")
 async def resample_download(job_id: str):
     path, fmt = _resolve_tool_output_path(job_id, "resample")
-    return FileResponse(path, media_type="application/octet-stream", filename=f"resampled.{fmt}")
+    return FileResponse(path, media_type="application/octet-stream", filename=_download_filename(job_id, fmt, "resampled"))
 
 
 # ---------- /ringtone ----------
@@ -991,4 +992,4 @@ async def ringtone_preview(job_id: str):
 @router.get("/ringtone/download/{job_id}")
 async def ringtone_download(job_id: str):
     path, _ = _resolve_tool_output_path(job_id, "ringtone")
-    return FileResponse(path, media_type="audio/mp4", filename="ringtone.m4r")
+    return FileResponse(path, media_type="audio/mp4", filename=_download_filename(job_id, "m4r", "ringtone"))

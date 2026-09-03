@@ -13,6 +13,7 @@ without changing anything here.
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -181,9 +182,15 @@ def _write_outputs(
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     tmp = f"{path}.tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    Path(tmp).replace(path)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        _unlink_quietly(tmp)
+        raise
 
 
 def _unlink_quietly(path: str) -> None:
@@ -195,9 +202,15 @@ def _unlink_quietly(path: str) -> None:
 
 def _atomic_write_text(path: str, text: str) -> None:
     tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    Path(tmp).replace(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        _unlink_quietly(tmp)
+        raise
 
 
 # --- the job ----------------------------------------------------------------
