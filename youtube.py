@@ -2507,6 +2507,14 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # client-mismatched for this particular video).
                 continue
 
+            if account_path is None and is_bot_check_error(error_text):
+                # Anon attempt bot-checked. A cookie session often clears
+                # the bot-check from this same IP (verified: cookies +
+                # web_embedded downloaded a video that anon-bot-checked,
+                # no proxy) - try cookie accounts on the FREE direct path
+                # before escalating to the paid proxy.
+                continue
+
             # Failure wasn't confirmed as THIS account's identity being
             # rejected (could be IP-block, transient, or cookie-less) -
             # rotating accounts further won't help. Stop here and let the
