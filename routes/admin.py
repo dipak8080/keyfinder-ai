@@ -190,6 +190,15 @@ from config import (
     MIDI_HQ_ENABLED,
     MAX_MIDI_DURATION_SECONDS,
     MAX_MIDI_HQ_DURATION_SECONDS,
+    # Sheet music (added 2026-09-03). Same shape as the MIDI-HQ block:
+    # a kill switch, a duration cap, a min-duration floor, and the
+    # free-tier rate limit + window, all published to the frontend the
+    # same way every other tool's are.
+    SHEET_MUSIC_ENABLED,
+    SHEET_MUSIC_RATE_LIMIT_MAX_REQUESTS,
+    SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS,
+    MAX_SHEET_MUSIC_DURATION_SECONDS,
+    MIN_SHEET_MUSIC_DURATION_SECONDS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     # The other thirteen windows (added 2026-08-30). Imported so the
     # `windows` map below reads each tool's OWN constant rather than
@@ -358,47 +367,55 @@ def _iter_tool_routes():
     dashboard's picker, and every request they served was bucketed into
     "Other" with no way to filter it back out.
 
-    That this list has now silently gone stale twice is the real finding.
-    The failure is invisible by construction: no error, no empty result,
-    just a slightly shorter dropdown that nobody counts. Anything added
-    under routes/ that registers a product route MUST be added here in
-    the same commit - and if this list goes stale a third time, the fix
-    is to stop maintaining it by hand and enumerate the package with
-    pkgutil instead.
+    That this list went silently stale twice - and would have a THIRD
+    time for /audio-to-sheet - is why, as of 2026-09-03, it is no longer
+    a list. This function now enumerates the package with pkgutil, which
+    is exactly the fix the previous version kept threatening on the next
+    drift. A product module added under routes/ appears in the dashboard
+    automatically now; there is no line to remember here, and no way for
+    it to go stale again.
+
+    What did NOT change is the reason it walks each SUB-ROUTER's own
+    .routes rather than the assembled package router: that reason is a
+    FastAPI-version behaviour, spelled out above, and it holds whether the
+    sub-routers are named by hand or discovered. pkgutil finds the
+    modules; each module's own decorator-built APIRouter is still what
+    gets walked.
     """
     # Imported here, not at module level - see admin_endpoints()'s
-    # docstring for the import-order reasoning.
-    from . import (
-        youtube,
-        separation,
-        separation_upgrade,
-        audio_tools,
-        midi,
-        midi_hq,
-        transcribe,
-        video_transcribe,
-        youtube_transcribe,
-        tiktok,
-        media,
-    )
+    # docstring for the import-order reasoning. By the time any request
+    # reaches this handler every sibling module is long since imported, so
+    # import_module() just returns the cached module.
+    import importlib
+    import pkgutil
 
-    sub_routers = [
-        youtube.router,
-        separation.router,
-        separation_upgrade.router,
-        audio_tools.router,
-        midi.router,
-        midi_hq.router,
-        transcribe.router,
-        video_transcribe.router,
-        youtube_transcribe.router,
-        tiktok.router,
-        media.router,
-        router,  # this module's own
-    ]
+    package = importlib.import_module(__package__)  # the routes/ package
+    seen: set[int] = set()
 
-    for sub in sub_routers:
+    for mod_info in pkgutil.iter_modules(package.__path__):
+        name = mod_info.name
+        # Skip helper/private modules (_shared) and this module itself -
+        # admin's own router is appended last so admin_endpoints() can
+        # still filter /admin/* out by path. __init__ is never listed by
+        # iter_modules(), so the include_router()-assembled package router
+        # (whose .routes are unreliable across FastAPI versions, see the
+        # docstring) is never walked here.
+        if name.startswith("_") or name == "admin":
+            continue
+        module = importlib.import_module(f"{__package__}.{name}")
+        sub = getattr(module, "router", None)
+        if sub is None:
+            # Not a route module (no APIRouter to contribute) - skip.
+            continue
         for route in getattr(sub, "routes", []):
+            if id(route) not in seen:
+                seen.add(id(route))
+                yield route
+
+    # This module's own router last.
+    for route in getattr(router, "routes", []):
+        if id(route) not in seen:
+            seen.add(id(route))
             yield route
 
 
@@ -965,6 +982,11 @@ async def limits():
             # rejected rather than spending a worker round trip on it.
             "midi_min_seconds": MIN_MIDI_DURATION_SECONDS,
             "midi_hq_min_seconds": MIN_MIDI_HQ_DURATION_SECONDS,
+            # /audio-to-sheet's MAX duration already rides through
+            # audio_tools_per_tool_seconds (key "audio_to_sheet") since it
+            # is in AUDIO_TOOL_MAX_DURATION_SECONDS; only its floor needs
+            # its own key, same as the two MIDI tools above.
+            "sheet_min_seconds": MIN_SHEET_MUSIC_DURATION_SECONDS,
         },
         # ---------- RETENTION (added 2026-08-30) ----------
         # Published because these are PRIVACY CLAIMS now, not internal
@@ -1090,6 +1112,9 @@ async def limits():
             # `windows` below.
             "audio_to_midi": MIDI_RATE_LIMIT_MAX_REQUESTS,
             "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
+            # ADDED 2026-09-03. Free-tier per-IP limit for /audio-to-sheet;
+            # its window is in `windows` below (3600, unlike audio-to-midi).
+            "audio_to_sheet": SHEET_MUSIC_RATE_LIMIT_MAX_REQUESTS,
             # LEGACY, kept deliberately. /limits is a public contract the
             # frontend reads, and dropping a key it may still index would
             # turn a backend config change into `undefined` rendered in a
@@ -1138,6 +1163,7 @@ async def limits():
                 "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_midi": MIDI_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
+                "audio_to_sheet": SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS,
                 "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
                 "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
             },
@@ -1186,6 +1212,13 @@ async def limits():
             "midi_hq_enabled": MIDI_HQ_ENABLED,
             "midi_max_duration_seconds": MAX_MIDI_DURATION_SECONDS,
             "midi_hq_max_duration_seconds": MAX_MIDI_HQ_DURATION_SECONDS,
+            # ADDED 2026-09-03, same argument as midi_hq_enabled: a kill
+            # switch the frontend reads so it can hide the tool rather than
+            # let someone submit into a guaranteed 503, plus the duration
+            # cap so it can reject over-long files from static data before
+            # the upload.
+            "sheet_music_enabled": SHEET_MUSIC_ENABLED,
+            "sheet_music_max_duration_seconds": MAX_SHEET_MUSIC_DURATION_SECONDS,
         },
     }
 
@@ -1294,6 +1327,13 @@ async def root():
             # cost anything". Both belong here; neither belongs in
             # paywall_tools.
             "midi_hq_enabled": MIDI_HQ_ENABLED,
+            # ADDED 2026-09-03. Read by getFeatureFlags() the same way
+            # midi_hq_enabled is - "can this tool run", independent of
+            # "does it cost anything" (that is paywall_tools). Without it a
+            # frontend would have to tie the sheet-music UI to the paywall
+            # flag, and turning OFF charging would make the tool vanish
+            # instead of becoming free.
+            "sheet_music_enabled": SHEET_MUSIC_ENABLED,
             "paywall_enabled": paywall_enabled,
             "paywall_tools": paywall_tools,
         },

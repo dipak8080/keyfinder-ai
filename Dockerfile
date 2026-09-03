@@ -8,6 +8,11 @@ FROM python:3.11-slim
 # - unzip: Deno installer
 # - build-essential / python3 / pkg-config + Cairo stack: required to
 #   compile the native `canvas` dependency during bgutil's `npm ci`
+#   (libcairo2-dev also satisfies cairosvg's libcairo2 runtime need for
+#   the audio-to-sheet engrave stage - no extra system package required)
+# - fonts-dejavu-core: a text font so Verovio renders score titles/tempo
+#   marks cleanly (the music glyphs ship inside the verovio wheel; this
+#   is only for the surrounding text). ~1MB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     rubberband-cli \
@@ -23,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     libgif-dev \
     librsvg2-dev \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20.x - PO Token generation for yt-dlp (bgutil)

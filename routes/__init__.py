@@ -30,11 +30,12 @@ Target structure:
       audio_tools.py           # the 13 ffmpeg/rubberband tools + fade/channels/resample/ringtone
       midi.py                   # /audio-to-midi
       midi_hq.py                 # /audio-to-midi-hq
-      transcribe.py               # /speech-to-text
-      video_transcribe.py          # /video-to-text
-      youtube_transcribe.py         # /youtube/transcribe
-      media.py                       # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
-      admin.py                        # /admin/*, /limits, /health, /
+      sheet_music.py              # /audio-to-sheet
+      transcribe.py                # /speech-to-text
+      video_transcribe.py           # /video-to-text
+      youtube_transcribe.py          # /youtube/transcribe
+      media.py                        # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
+      admin.py                         # /admin/*, /limits, /health, /
 
 The six concurrency semaphores that used to be module-level globals in
 routes.py now live in utils.py, alongside the two that were already
@@ -136,6 +137,23 @@ Those two bound different resources - a CPU sidecar on this box versus
 paid GPU capacity - and sharing would let a busy midi-worker block a
 paid job that never touches it. See utils.py's semaphore block.
 --------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+ADDED 2026-09-03: sheet_music.py
+
+/audio-to-sheet turns audio into engraved notation (PDF + SVG +
+MusicXML + MIDI). It is a standalone route for the same rate-limit
+reason as midi_hq above, and because it is a distinct product: the
+sheet/ package chains transcription -> notation (music21) -> engraving
+(Verovio), and picks its transcription engine per instrument (Transkun
+for piano, YourMT3 otherwise) inside the runner, not here.
+
+Its own concurrency pool (_sheet_semaphore) lives in the route module
+rather than utils.py, since a sheet job spends both GPU (transcription)
+and CPU (engrave) that no existing pool bounds. Metered per the
+"audio-to-sheet" credit rule; the short-clip free tier comes from that
+rule's free_under_seconds, not from any branching here.
+--------------------------------------------------------------------------
 """
 from fastapi import APIRouter
 
@@ -146,6 +164,7 @@ from .separation_upgrade import router as _separation_upgrade_router
 from .audio_tools import router as _audio_tools_router
 from .midi import router as _midi_router
 from .midi_hq import router as _midi_hq_router
+from .sheet_music import router as _sheet_music_router
 from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
@@ -165,6 +184,7 @@ router.include_router(_separation_upgrade_router)
 router.include_router(_audio_tools_router)
 router.include_router(_midi_router)
 router.include_router(_midi_hq_router)
+router.include_router(_sheet_music_router)
 router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)

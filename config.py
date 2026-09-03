@@ -770,6 +770,7 @@ MAX_AUDIO_TOOL_DURATION_SECONDS = int(os.environ.get("MAX_AUDIO_TOOL_DURATION_SE
 AUDIO_TOOL_MAX_DURATION_SECONDS = {
     "pitch": 900,   # 15 min - comfortably inside pitch's 600s timeout
     "tempo": 900,   # 15 min - same
+    "audio_to_sheet": 900,   # 15 min - matches MAX_SHEET_MUSIC_DURATION_SECONDS
 }
 
 # ---------- AUDIO TOOLS: FORMAT VALIDATION ----------
@@ -1631,3 +1632,82 @@ TIKTOK_BASE_BACKOFF_SECONDS = float(os.environ.get("TIKTOK_BASE_BACKOFF_SECONDS"
 # files are ~400 KB, so the only real cost is a semaphore slot.
 TIKTOK_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("TIKTOK_RATE_LIMIT_MAX_REQUESTS", "30"))
 TIKTOK_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("TIKTOK_RATE_LIMIT_WINDOW_SECONDS", "3600"))
+
+
+
+
+
+
+# ---------- AUDIO TO SHEET MUSIC (audio -> engraved notation) ----------
+# A SEPARATE TOOL, not a mode on /audio-to-midi-hq. The MIDI tools stop at
+# a note stream; this one carries it all the way to engraved notation
+# (PDF + SVG + MusicXML + MIDI) via the sheet/ package: transcription ->
+# music21 quantise/hand-split -> Verovio engrave. It also picks its
+# transcription engine per instrument INSIDE the runner - Transkun for
+# piano (a solo-piano specialist, gpu-worker-piano), YourMT3 otherwise
+# (the same gpu-worker-mt3 the HQ MIDI tool uses) - so it is engine-
+# agnostic at this layer and needs no endpoint id of its own here beyond
+# the piano one below.
+#
+# The transcription stage reuses the existing GPU workers and their
+# concurrency; what is NEW and local is the CPU engrave stage (music21 +
+# Verovio + cairosvg), which is what _sheet_semaphore in
+# routes/sheet_music.py bounds.
+
+# Kill switch, mirroring MIDI_HQ_ENABLED / SEPARATION_HQ_ENABLED. Flip to
+# false to stop accepting sheet-music jobs with a clean 503 rather than
+# queueing into a broken pipeline. Env-driven, read once at boot.
+SHEET_MUSIC_ENABLED = os.environ.get("SHEET_MUSIC_ENABLED", "false").lower() == "true"
+
+# Upper duration cap, enforced on THIS side via ffprobe at submit time -
+# reject early rather than pay a GPU round trip. Kept in step with the
+# per-tool entry added to AUDIO_TOOL_MAX_DURATION_SECONDS below; both must
+# move together, same as the MIDI/pitch/tempo caps.
+MAX_SHEET_MUSIC_DURATION_SECONDS = int(os.environ.get("MAX_SHEET_MUSIC_DURATION_SECONDS", "900"))  # 15 min
+
+# Below this there is not enough signal to transcribe and the result is a
+# guaranteed empty score - an instant, explainable 400 beats a wasted GPU
+# round trip. Same reasoning as MIN_MIDI_HQ_DURATION_SECONDS.
+MIN_SHEET_MUSIC_DURATION_SECONDS = float(os.environ.get("MIN_SHEET_MUSIC_DURATION_SECONDS", "2.0"))
+
+# Accepted inputs - the same superset the MIDI tools take (adds opus/webm
+# over the audio-tools matrix). Aliased to MIDI_INPUT_FORMATS so the three
+# transcription-family tools can never disagree about what they accept,
+# which would be a confusing thing to discover by being rejected on one
+# and not another.
+SHEET_MUSIC_INPUT_FORMATS = MIDI_INPUT_FORMATS
+
+# Its OWN concurrency pool and queue, mirroring MAX_CONCURRENT_MIDI_HQ /
+# MAX_QUEUED_MIDI_HQ. A sheet job spends GPU (transcription, on the shared
+# worker pools) AND CPU (engrave, on this box) that no existing pool
+# bounds - so it gets its own. The semaphore lives in
+# routes/sheet_music.py; these are the numbers behind it.
+MAX_CONCURRENT_SHEET_MUSIC = int(os.environ.get("MAX_CONCURRENT_SHEET_MUSIC", "2"))
+MAX_QUEUED_SHEET_MUSIC = int(os.environ.get("MAX_QUEUED_SHEET_MUSIC", "6"))
+
+# FREE-tier rate-limit safety net, same pattern as MIDI_HQ_RATE_LIMIT_*:
+# not the primary control (FREE_MONTHLY_OPS and the credit balance are),
+# and credits/limits.py derives the ENFORCED free limit from
+# FREE_MONTHLY_OPS when the rule's free_rate_limit is 0. See
+# credits/config.py's INVARIANT block.
+SHEET_MUSIC_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SHEET_MUSIC_RATE_LIMIT_MAX_REQUESTS", "30"))
+SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
+
+# The RunPod Serverless endpoint running gpu-worker-piano (Transkun).
+# Empty means the piano ENGINE reports itself unavailable and piano jobs
+# fall back to YourMT3 (see piano_gpu.is_available / runner._default_
+# transcribe) - a missing env var degrades one engine, never crashes the
+# app at boot. The shared GPU_WORKER_SHARED_SECRET / VPS_PUBLIC_BASE_URL /
+# RUNPOD_API_KEY above are reused; only the endpoint id is new.
+RUNPOD_PIANO_ENDPOINT_ID = os.environ.get("RUNPOD_PIANO_ENDPOINT_ID", "")
+
+# Both sides of the deadline - see run_worker_job(). Sized like
+# MIDI_HQ_TIMEOUT_SECONDS: generous against a few GPU-seconds of Transkun
+# inference, with the headroom for a cold start (checkpoint load), not for
+# the inference itself.
+PIANO_TIMEOUT_SECONDS = int(os.environ.get("PIANO_TIMEOUT_SECONDS", "600"))  # 10 min
+
+# MUST EQUAL PIANO_MAX_SECONDS ON THE WORKER (gpu-worker-piano). The worker
+# enforces its own ceiling as a backstop; if these drift, a user waits for
+# a job that was always going to be rejected on the far side.
+MAX_PIANO_DURATION_SECONDS = int(os.environ.get("MAX_PIANO_DURATION_SECONDS", "900"))  # 15 min

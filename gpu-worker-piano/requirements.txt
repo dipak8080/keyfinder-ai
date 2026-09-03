@@ -1,0 +1,25 @@
+# gpu-worker-piano/requirements.txt
+#
+# torch + torchaudio are NOT here: they are installed first from the cu121
+# index in the Dockerfile, so transkun's resolver finds them already
+# satisfied and cannot pull a CPU-only wheel (which still "works" - twenty
+# times slower, on a billed GPU, with nothing in the logs to say why).
+#
+# transkun is PINNED. The pretrained checkpoint it ships inside the wheel
+# (pretrained/2.0.pt) is tied to this version - a bump could change the
+# weights or the conf the handler loads by path, so it is not a casual move.
+transkun==2.0.1
+
+# Named explicitly because handler.py imports each of these DIRECTLY, rather
+# than relying on them arriving as transkun's transitive dependencies - a
+# future transkun release could drop one and the failure would surface only
+# at import time inside the worker.
+pretty_midi
+numpy
+moduleconf
+pydub
+soxr
+
+# The worker's transport + platform, not pulled by transkun.
+requests
+runpod

@@ -271,6 +271,46 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
+    # ---- AUDIO TO SHEET MUSIC ------------------------------------------
+    # /audio-to-sheet. A distinct PRODUCT from the MIDI tools, not a mode
+    # on one: it carries a transcription all the way to engraved notation
+    # (PDF + SVG + MusicXML + MIDI). One route, one key.
+    #
+    # 3 CREDITS, not 1 - the deliberate exception to "one credit per heavy
+    # job" that the transcribe and audio-to-midi-hq notes above establish
+    # as the norm. Two reasons it earns the exception:
+    #
+    #   COST. It is a MULTI-STAGE GPU+CPU job, not a single inference:
+    #   audio -> MIDI on the GPU worker (Transkun for piano, YourMT3
+    #   otherwise), optionally an htdemucs isolation pass in front, then a
+    #   CPU engrave stage (music21 quantise/hand-split + Verovio render).
+    #   That is materially more work than one HQ-MIDI pass.
+    #
+    #   VALUE. The market is priced and it is not cheap - AnthemScore is a
+    #   $31-107 one-time desktop buy, Klangio/Songscription are $8-30/mo
+    #   subscriptions, a human transcriber is $20-100+ a song. At ~3 x
+    #   $0.20-0.30 a credit this still massively undercuts all of them
+    #   while covering the extra stages, where 1 credit would leave money
+    #   on a genuinely higher-value output.
+    #
+    #   credits > 1 IS SAFE HERE for the same reason it is on transcribe:
+    #   migration 003 added job_charges.free_ops, so refund_job() returns
+    #   exactly what charge_for_job() took at any credits value. The old
+    #   "unsafe above 1 credit" warning is obsolete.
+    #
+    # free_under_seconds: 30 - THE FREE TIER, and the one rule in this
+    # dict that carves out a duration band (every other is 0). This is
+    # deliberate and product-shaped: clips of 30s or under transcribe free,
+    # unlimited (subject to the per-IP rate limit), exactly the
+    # "unlimited 30-second transcriptions" free tier the competitors use.
+    # It is the quality-proof surface the paid conversion runs through -
+    # someone tests a 30s clip free, sees the score, then pays for the
+    # full song. FREE_MONTHLY_OPS still applies to runs LONGER than 30s.
+    "audio-to-sheet": {
+        "enabled": False, "free_under_seconds": 30, "credits": 3,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
+    },
 }
 
 DEFAULT_PACKS: dict[str, dict[str, Any]] = {

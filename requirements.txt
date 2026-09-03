@@ -107,6 +107,31 @@ onnxruntime==1.29.0
 # way to produce a resolution conflict during some future, unrelated
 # dependency bump.
 
+# ---------- AUDIO TO SHEET MUSIC (/audio-to-sheet) ----------
+# The sheet/ package's pipeline: transcription -> notation -> engrave.
+# Modest footprint (~60-80MB total, mostly music21), nothing like the
+# torch/essentia layers.
+#
+#   music21     MIDI -> MusicXML: quantise to the detected tempo grid,
+#               insert key/time-sig, split piano into two staves.
+#   verovio     MusicXML -> SVG/PDF engraving. Bundles its own music
+#               fonts in the wheel, so no font package is needed for the
+#               NOTATION itself.
+#   cairosvg    per-page SVG -> PDF. Uses the libcairo2 already present on
+#               this image via libcairo2-dev (installed for bgutil's
+#               canvas build) - NO new system dependency.
+#   pypdf       merge the per-page PDFs into one document.
+#   pretty_midi MIDI parsing + note-count summary in the sheet pipeline.
+#
+# pretty_midi is left with a >= floor rather than a hard pin: it is a
+# small pure-Python package and a hard == here risks a resolution
+# conflict on a no-cache build if anything else ever constrains it.
+music21==9.3.0
+verovio==5.6.0
+cairosvg==2.7.1
+pypdf==6.1.1
+pretty_midi>=0.2.10
+
 # ---------- NOT INSTALLED: yt-dlp browser impersonation ----------
 # Deliberately left out for now, documented so the gap is a decision
 # rather than an oversight.
