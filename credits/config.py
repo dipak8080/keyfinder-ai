@@ -304,10 +304,13 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
     # unlimited (subject to the per-IP rate limit), exactly the
     # "unlimited 30-second transcriptions" free tier the competitors use.
     # It is the quality-proof surface the paid conversion runs through -
-    # someone tests a 30s clip free, sees the score, then pays for the
+    # someone tests a ~30s clip free, sees the score, then pays for the
+    # full song. Set to 33 (not 30) so a real 30-second file — which
+    # ffprobe often measures at 30.0-30.2s — stays on the free side of
+    # the boundary. FREE_MONTHLY_OPS still applies to longer runs..
     # full song. FREE_MONTHLY_OPS still applies to runs LONGER than 30s.
     "audio-to-sheet": {
-        "enabled": False, "free_under_seconds": 30, "credits": 3,
+        "enabled": False, "free_under_seconds": 33, "credits": 3,
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
