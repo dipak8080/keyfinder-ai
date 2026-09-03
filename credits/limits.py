@@ -143,7 +143,11 @@ def peek_affordability(request: Request, rule) -> tuple[bool, str | None, int, i
         return (True, owner_key, balance, 0)
 
     needed = rule.credits if rule else 1
-    return (remaining >= needed or balance >= needed, owner_key, balance, remaining)
+    # One free op covers one whole job, whatever its credit cost - same
+    # rule as ledger.charge_for_job. Gating the free path on `remaining >=
+    # needed` put every >1-credit tool (audio-to-sheet: 3) out of reach of
+    # the free pool and 402'd here before the guard ever ran.
+    return (remaining >= 1 or balance >= needed, owner_key, balance, remaining)
 
 
 def peek_owner_and_balance(request: Request) -> tuple[str | None, int]:
