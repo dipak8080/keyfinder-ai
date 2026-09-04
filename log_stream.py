@@ -252,6 +252,57 @@ CORRECTNESS PASS (2026-08-15b): SEARCH, ESCAPING, COUNTS
      surfaced anywhere. The count is now returned by the HTTP data
      endpoint, so silent log loss under load is visible rather than
      needing to be inferred from gaps.
+
+FEATURE + HARDENING (2026-09-04): SILENT ERROR VISIBILITY
+ 24. The dashboard bucketed everything by HTTP status, so a handler that
+     caught its own exception, logged it at ERROR, and still returned a
+     200 (with an {"error": ...} body for the UI) was completely
+     invisible on the HTTP tab. Two real cases: a midi-worker that was
+     unreachable (DNS failure), and rubberband failing on an unsupported
+     input file - both logged ERROR + WARNING, both returned 200, both
+     showed up in Success. The only way to notice was to already suspect
+     something and go read the System tab.
+
+     request_logs gains `error_logged` (0/1) and `error_count`. These
+     are set the SAME way tool/tier is - via the per-request mutable dict
+     in _job_ctx - so no route has to opt in: BufferLogHandler.emit()
+     flips the flag automatically the instant ANY code logs at >= ERROR
+     while a request is in flight, from the handler itself, an API
+     client, a subprocess wrapper, anything. RequestLoggerMiddleware
+     reads it after call_next and stamps it onto the row.
+
+     Surfaced three ways:
+       - a "silent" count: rows that returned < 400 but logged an error
+         (the true hidden-failure bucket - deliberately non-overlapping
+         with client/server so it can't double-count a 5xx).
+       - an `errored` filter param that matches EVERY error_logged row
+         regardless of status, so a 4xx-with-error is still findable.
+       - the row itself carries error_logged/error_count out to the
+         frontend for a per-row marker.
+
+     LIMIT: this captures SYNCHRONOUS failures - anything that logs the
+     error before the response returns (both examples above). A failure
+     inside a background task that outlives the response (an HQ /separate
+     job that dies minutes later) is logged after the HTTP row is already
+     written, so it won't retro-flag that row; that path is what job
+     outcome tracking is for. For a failure that only ever logs at
+     WARNING and never ERROR, call mark_request_errored() explicitly at
+     the point you log "... FAILED".
+
+ 25. HARDENING: the writer thread flushed http_rows and sys_rows under a
+     SINGLE try + single commit, so one malformed row in either list
+     (wrong tuple arity, a bad type) rolled back and dropped the ENTIRE
+     batch - up to ~500 good rows from BOTH tables - on one poison row.
+     The two inserts are now independent: a bad HTTP batch can't take the
+     system batch down with it, and vice versa, and rows lost to a failed
+     insert are added to the same dropped-row counter (#23) so DB-side
+     loss is as visible as queue-overflow loss instead of vanishing.
+
+ 26. HARDENING: _dropped_rows was a bare `global x += 1` incremented from
+     every request/logging thread - a read-modify-write that can lose
+     increments under contention, undercounting the one number that
+     exists to make loss visible. Now guarded by a lock (cheap - only
+     touched on the drop path, which by definition is not the hot path).
 --------------------------------------------------------------------------
 """
 
@@ -311,10 +362,10 @@ _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default="-"
 )
 
-# Tool/tier identity for THIS request - deliberately structured
-# differently from _request_id_ctx above, because it becomes known at a
-# DIFFERENT TIME and therefore has to cross a task boundary the other
-# direction.
+# Tool/tier identity + error state for THIS request - deliberately
+# structured differently from _request_id_ctx above, because it becomes
+# known at a DIFFERENT TIME and therefore has to cross a task boundary the
+# other direction.
 #
 # THE PROBLEM THIS SOLVES (subtle, and it silently produces wrong data if
 # you get it wrong):
@@ -324,18 +375,17 @@ _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
 #   in a SEPARATE anyio task. contextvars propagate parent -> child (the
 #   child task gets a copy of the context at spawn time), but NEVER child
 #   -> parent. request_id works fine because it's .set() BEFORE
-#   call_next, so the handler inherits it. Tool/tier is the opposite
-#   case: only the handler knows it, and the middleware needs to read it
-#   AFTER call_next returns, to stamp the HTTP row. A plain
-#   ContextVar.set() inside the handler would be invisible up there -
-#   every request_logs row would silently record "-".
+#   call_next, so the handler inherits it. Tool/tier (and the error flag)
+#   is the opposite case: only the handler knows it, and the middleware
+#   needs to read it AFTER call_next returns, to stamp the HTTP row. A
+#   plain ContextVar.set() inside the handler would be invisible up there.
 #
 # So the contextvar holds a MUTABLE DICT rather than a string. The
 # middleware installs a fresh one per request before call_next; the
-# handler's set_job_context() mutates that same dict in place. Both tasks
-# hold a reference to the identical object, so the mutation is visible
-# from both sides - no propagation required, because nothing needs to
-# propagate.
+# handler's set_job_context() / the log handler's mark_request_errored()
+# mutate that same dict in place. Both tasks hold a reference to the
+# identical object, so the mutation is visible from both sides - no
+# propagation required, because nothing needs to propagate.
 #
 # Background tasks spawned by the handler (asyncio.create_task) inherit
 # the reference too, which is exactly right: a job's later log lines
@@ -395,6 +445,11 @@ def write_system_log_direct(
     what makes this safe to call concurrently with the main process's
     writer thread - that's the whole reason WAL was enabled in the first
     place (see fix #10 at the top of this file).
+
+    NOTE: a subprocess logging an error here cannot flip the parent
+    request's error_logged flag (separate address space, and the HTTP row
+    was already written before the subprocess even started) - that's the
+    same background-task limitation documented under fix #24.
     """
     try:
         conn = _new_conn()
@@ -428,8 +483,13 @@ def new_job_context() -> dict:
     call_next - see the long comment above for why the object has to
     exist before the handler task is spawned rather than being created
     lazily by set_job_context().
+
+    Carries the error state (fix #24) alongside tool/tier so the same
+    single per-request object serves both, and so a request that only
+    ever errors (never calls set_job_context) still has somewhere to
+    record it.
     """
-    tags = {"tool": "-", "tier": "-"}
+    tags = {"tool": "-", "tier": "-", "errored": False, "error_count": 0}
     _job_ctx.set(tags)
     return tags
 
@@ -458,13 +518,35 @@ def set_job_context(tool: str, tier: str = "standard") -> None:
 
     Falls back to installing a holder if none exists, so this is safe to
     call from a context with no middleware above it (a test, a startup
-    task, a worker script) instead of silently doing nothing.
+    task, a worker script) instead of silently doing nothing. Any error
+    state already recorded on an existing holder is preserved.
     """
     tags = _job_ctx.get()
     if tags is None:
         tags = new_job_context()
     tags["tool"] = tool
     tags["tier"] = tier
+
+
+def mark_request_errored() -> None:
+    """
+    Flags the CURRENT request/job as having produced an error, and bumps
+    its error count. Called automatically by BufferLogHandler.emit() for
+    every record at >= ERROR (fix #24), so no route has to remember to
+    call it - but exposed publicly for the one case the automatic hook
+    can't see: a failure that you only ever log at WARNING/INFO (e.g. a
+    "... FAILED: <friendly message>" line). Call it there explicitly.
+
+    Mutates the shared per-request dict in place, same contract as
+    set_job_context(), so the flag is visible to the middleware after
+    call_next. Falls back to installing a holder if none exists so it's
+    safe from anywhere.
+    """
+    tags = _job_ctx.get()
+    if tags is None:
+        tags = new_job_context()
+    tags["errored"] = True
+    tags["error_count"] = (tags.get("error_count") or 0) + 1
 
 
 # ---------- JOB TAG REGISTRY ----------
@@ -678,6 +760,20 @@ def _init_db():
             conn.execute("ALTER TABLE request_logs ADD COLUMN tier TEXT")
         except sqlite3.OperationalError:
             pass
+
+        # Migration for silent-error visibility (fix #24). DEFAULT 0 is
+        # deliberate: SQLite backfills existing rows with the default on
+        # read, so pre-migration rows count as "no error logged" without a
+        # NULL to guard against in the SUM() aggregations below.
+        try:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN error_logged INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE request_logs ADD COLUMN error_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
         # Supports the new tool/tier filters in get_http_logs(). Without
         # this, "show me every HQ job" is a full scan of request_logs.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_tool ON request_logs(tool)")
@@ -696,6 +792,12 @@ def _init_db():
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_tool_id ON request_logs(tool, id)"
+        )
+        # Same composite reasoning for the new `errored` filter: "rows that
+        # logged an error, newest first".
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_error_id "
+            "ON request_logs(error_logged, id)"
         )
 
         # System logs now share this same SQLite file (and volume mount) as
@@ -778,17 +880,28 @@ _BATCH_WINDOW = 0.25    # seconds to wait accumulating a batch
 
 _write_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=_MAX_QUEUE)
 _dropped_rows = 0
+_dropped_lock = threading.Lock()
+
+
+def _bump_dropped(n: int = 1) -> None:
+    """Thread-safe increment of the dropped-row counter (fix #26). A bare
+    `global += n` from many threads can lose increments to a read-modify-
+    write race, undercounting the exact signal this counter exists for."""
+    global _dropped_rows
+    with _dropped_lock:
+        _dropped_rows += n
 
 
 def get_dropped_row_count() -> int:
-    """How many log rows the bounded queue has discarded since start.
+    """How many log rows have been discarded since start - both from the
+    bounded queue overflowing (fix #23) and from a batch insert failing
+    in the writer (fix #25).
 
-    Surfaced by the HTTP data endpoint (fix #23). This used to be
-    incremented and then never read anywhere, which meant the one
-    condition it exists to signal - the writer falling far enough behind
-    that logging is silently lossy - was invisible. A gap in the log is
-    exactly the kind of thing you'd otherwise spend an hour chasing as a
-    bug in the code that failed to log.
+    Surfaced by the HTTP data endpoint. This used to be incremented and
+    then never read anywhere, which meant the one condition it exists to
+    signal - logging having gone lossy - was invisible. A gap in the log
+    is exactly the kind of thing you'd otherwise spend an hour chasing as
+    a bug in the code that failed to log.
     """
     return _dropped_rows
 
@@ -796,11 +909,10 @@ def get_dropped_row_count() -> int:
 def _enqueue(kind: int, row: tuple) -> None:
     """Never blocks, never raises. Dropping a log line is always better
     than adding latency to a real request or deadlocking the logger."""
-    global _dropped_rows
     try:
         _write_queue.put_nowait((kind, row))
     except queue.Full:
-        _dropped_rows += 1
+        _bump_dropped()
 
 
 def _writer_loop() -> None:
@@ -822,22 +934,39 @@ def _writer_loop() -> None:
             http_rows = [r for k, r in batch if k == _HTTP]
             sys_rows = [r for k, r in batch if k == _SYS]
 
+            # Each table's insert is isolated (fix #25). Previously both
+            # ran under one try + one commit, so a single malformed row in
+            # EITHER list rolled back and dropped the whole batch from BOTH
+            # tables. Now a poison HTTP batch can't take the system batch
+            # down with it, and rows lost to a failed insert are counted as
+            # dropped so the loss stays visible instead of vanishing.
             if http_rows:
-                conn.executemany(
-                    "INSERT INTO request_logs "
-                    "(timestamp, method, path, status_code, duration_ms, client_ip, "
-                    "request_id, tool, tier) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    http_rows,
-                )
+                try:
+                    conn.execute("BEGIN")
+                    conn.executemany(
+                        "INSERT INTO request_logs "
+                        "(timestamp, method, path, status_code, duration_ms, client_ip, "
+                        "request_id, tool, tier, error_logged, error_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        http_rows,
+                    )
+                    conn.commit()
+                except Exception:
+                    _safe_rollback(conn)
+                    _bump_dropped(len(http_rows))
             if sys_rows:
-                conn.executemany(
-                    "INSERT INTO system_logs "
-                    "(timestamp, level, logger, message, request_id, tool, tier) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    sys_rows,
-                )
-            conn.commit()
+                try:
+                    conn.execute("BEGIN")
+                    conn.executemany(
+                        "INSERT INTO system_logs "
+                        "(timestamp, level, logger, message, request_id, tool, tier) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        sys_rows,
+                    )
+                    conn.commit()
+                except Exception:
+                    _safe_rollback(conn)
+                    _bump_dropped(len(sys_rows))
         except Exception:
             # Never let the writer thread die - a dead writer would
             # silently stop all logging for the life of the container.
@@ -852,6 +981,13 @@ def _writer_loop() -> None:
                     pass
                 conn = _new_conn()
             time.sleep(0.5)
+
+
+def _safe_rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 _writer_thread = threading.Thread(target=_writer_loop, name="log-writer", daemon=True)
@@ -922,16 +1058,14 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         # "-" and splitting into a separate orphan group in the dashboard.
         _request_id_ctx.set(request_id)
 
-        # Install the tool/tier holder BEFORE call_next. This ordering is
-        # required, not incidental: call_next runs the route handler in a
-        # separate anyio task that inherits a COPY of the context as it
-        # exists right now. The handler's set_job_context() then mutates
-        # this same dict object, which is how its value gets back here
-        # despite child->parent context propagation not existing. See the
-        # _job_ctx comment near the top of this file for the full
-        # explanation - creating this holder after call_next, or letting
-        # set_job_context() create it lazily, would both silently record
-        # "-" on every single HTTP row.
+        # Install the tool/tier/error holder BEFORE call_next. This
+        # ordering is required, not incidental: call_next runs the route
+        # handler in a separate anyio task that inherits a COPY of the
+        # context as it exists right now. The handler's set_job_context()
+        # and the log handler's mark_request_errored() then mutate this
+        # same dict object, which is how their values get back here despite
+        # child->parent context propagation not existing. See the _job_ctx
+        # comment near the top of this file for the full explanation.
         tags = new_job_context()
 
         start = time.perf_counter()
@@ -939,13 +1073,14 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         duration_ms = (time.perf_counter() - start) * 1000
 
         # Read AFTER the handler has run, so a handler that called
-        # set_job_context() is reflected here. Reading `tags` directly
-        # rather than _current_tags() because this task's own contextvar
-        # holds the identical object either way, and being explicit about
-        # which dict is being read makes the mutation contract above
-        # visible at the point it matters.
+        # set_job_context() - or any ERROR logged synchronously during the
+        # request - is reflected here. Reading `tags` directly rather than
+        # a helper because this task's own contextvar holds the identical
+        # object either way.
         tool = tags.get("tool") or "-"
         tier = tags.get("tier") or "-"
+        error_logged = 1 if tags.get("errored") else 0
+        error_count = int(tags.get("error_count") or 0)
 
         # Was "/admin/logs" only - which meant every OTHER admin call
         # (/admin/endpoints, /admin/status, /admin/clear-cache,
@@ -970,6 +1105,8 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
                         request_id,
                         tool,
                         tier,
+                        error_logged,
+                        error_count,
                     ),
                 )
             except Exception:
@@ -1036,13 +1173,20 @@ def _noise_exclusion_sql() -> str:
 # Built once at import instead of re-joining 17 strings on every request.
 _NOISE_SQL = _noise_exclusion_sql()
 
+# `silent` (fix #24): returned < 400 (looked fully successful) but logged
+# an error. Deliberately scoped to < 400 so it never overlaps the client
+# (4xx) or server (5xx) buckets - the headline number stays clean and
+# can't double-count a 5xx. The `errored` FILTER below is broader (any
+# error_logged row, any status), so a 4xx-with-error is still findable
+# even though it isn't in this count.
 _COUNTS_SQL = f"""
     SELECT
         COUNT(*)                                                       AS total,
         COALESCE(SUM(status_code < 400), 0)                            AS success,
         COALESCE(SUM(status_code >= 400 AND status_code < 500
                      AND {_NOISE_SQL}), 0)                             AS client,
-        COALESCE(SUM(status_code >= 500), 0)                           AS server
+        COALESCE(SUM(status_code >= 500), 0)                           AS server,
+        COALESCE(SUM(status_code < 400 AND error_logged = 1), 0)       AS silent
     FROM request_logs
 """
 
@@ -1254,39 +1398,32 @@ def get_tool_counts() -> dict:
 def _status_counts(conn) -> dict:
     """
     Shared by the full-window and delta code paths in get_http_logs()
-    below, so the two can never define "success"/"client"/"server"
-    differently by accident.
+    below, so the two can never define the buckets differently by accident.
 
-    Three buckets, not two:
+    Four buckets:
       - success: < 400
       - client:  400-499, EXCLUDING known bot/scanner noise - what's left
                  is a real caller's request being rejected for a normal
                  reason (bad upload, rate limit, queue full). Expected
-                 traffic, not a bug, but at least now it's actually
-                 traffic from someone using the site.
-      - server:  >= 500 - the backend itself broke. This is the number
-                 worth watching; a spike here means something is actually
-                 wrong.
+                 traffic, not a bug.
+      - server:  >= 500 - the backend itself broke. A spike here means
+                 something is actually wrong.
+      - silent:  < 400 but an error was logged during the request (fix
+                 #24). This is the bucket that catches a handler that
+                 caught its own exception, logged it, and still returned
+                 200 - a real failure the status code hides.
 
     NOTE: "total" and "success" deliberately still count EVERYTHING,
-    noise included - the Total box should reflect true traffic volume
-    (useful context: "833 total, most of it noise" is itself information
-    worth having), and success is unaffected by noise almost by
-    definition (a 404 or 405 scanner hit is never a 2xx). Only "client"
-    gets the noise filter, since that is the one number noise was
-    actually distorting.
+    noise included - the Total box should reflect true traffic volume,
+    and success is unaffected by noise almost by definition. Only "client"
+    gets the noise filter, since that is the one number noise distorts.
 
-    NOTE 2: "server" counts every 5xx, so a 502/503/504 is included here
-    but will NOT match a search for "500". That is intentional - the
-    search box matches an exact status code and the 5xx chip matches the
-    class - but it does mean the Server Errors box and a "500" search can
-    legitimately disagree. The 5xx chip is the control that always agrees
-    with this number.
+    NOTE 2: "silent" is a SUBSET of "success" (both require < 400), not a
+    fifth disjoint slice - a silent-error row is counted in success too.
+    That's intentional: it stayed in Success historically, and the point
+    of the silent count is to say "N of your successes weren't."
 
-    PERF: one scan, not four, and memoised for _COUNTS_TTL seconds. The
-    poll loop asks for these counts every few seconds per open tab; at
-    14k+ rows four full scans per poll was the single most expensive
-    thing this module did.
+    PERF: one scan, not five, and memoised for _COUNTS_TTL seconds.
     """
     now = time.monotonic()
     cached = _counts_cache["val"]
@@ -1299,6 +1436,7 @@ def _status_counts(conn) -> dict:
         "success": row["success"],
         "client": row["client"],
         "server": row["server"],
+        "silent": row["silent"],
     }
     with _counts_lock:
         _counts_cache["at"] = now
@@ -1382,6 +1520,7 @@ def get_http_logs(
     method: str = Query(None, description="HTTP method filter, e.g. 'POST'."),
     q: str = Query(None, description="Global substring search across path, client_ip and method; plus request_id and tool for non-numeric terms. A bare 3-digit value also matches status_code exactly."),
     status_class: str = Query(None, description="'4xx' or '5xx'."),
+    errored: bool = Query(False, description="Only rows where an ERROR-level log fired during the request (any status). Catches silent failures that returned 2xx."),
     hide_noise: bool = Query(False, description="Exclude known bot/scanner paths."),
     since: str = Query(None, description="ISO UTC timestamp, inclusive lower bound."),
     until: str = Query(None, description="ISO UTC timestamp, exclusive upper bound."),
@@ -1420,6 +1559,13 @@ def get_http_logs(
     what the handler actually decided this request/job IS, which stays
     correct even when several tiers share the same polling routes. See
     set_job_context()'s docstring for the full reasoning.
+
+    `errored` (fix #24) is a THIRD axis: "did any code log an error while
+    handling this request", regardless of what status it returned. It's
+    what surfaces the 200-that-actually-failed case. Unlike the `silent`
+    COUNT (which is < 400 only, to stay non-overlapping with the other
+    buckets), this filter matches every error_logged row so a 4xx that
+    also broke internally is still findable.
 
     ROW ORDER: the default and before_id branches return NEWEST-FIRST and
     the client reverses them; the after_id branch returns oldest-first.
@@ -1470,6 +1616,10 @@ def get_http_logs(
         where.append("status_code >= 400 AND status_code < 500")
     elif status_class == "5xx":
         where.append("status_code >= 500")
+    if errored:
+        # Every row that logged an error, any status. Broader than the
+        # `silent` count on purpose - see the docstring.
+        where.append("error_logged = 1")
     if hide_noise:
         where.append(f"({_NOISE_SQL})")
     if since:
@@ -1560,10 +1710,12 @@ def get_http_logs(
         "filtered_total": filtered_total,
         "max_id": max_id,
         "truncated": truncated,
-        # Non-zero means the write queue overflowed and log rows were
-        # discarded - see get_dropped_row_count(). Surfaced so a gap in
-        # the log is attributable rather than mysterious.
+        # Non-zero means logging went lossy - either the write queue
+        # overflowed or a batch insert failed (fixes #23, #25). Surfaced
+        # so a gap in the log is attributable rather than mysterious.
         "dropped_rows": get_dropped_row_count(),
+        # error_logged / error_count ride out on each row via SELECT * -
+        # the frontend reads them for the per-row failure marker.
         "logs": [dict(r) for r in rows],
     })
 
@@ -1613,10 +1765,23 @@ class BufferLogHandler(logging.Handler):
     running inside a request. It used to open a connection, insert, and
     commit - a full fsync - on every single log line. Now it formats the
     record and appends to the writer queue.
+
+    It is ALSO where silent-error detection happens (fix #24): any record
+    at >= ERROR flips the current request's errored flag via
+    mark_request_errored(), before enqueueing the line. That's what makes
+    the feature automatic - no route has to opt in, because every path to
+    an error ends at a logger.error()/exception() call, and they all pass
+    through here.
     """
 
     def emit(self, record):
         try:
+            if record.levelno >= logging.ERROR:
+                # Flip the current request/job's error flag. Cheap dict
+                # mutation on the shared per-request object; no-op (just
+                # installs a throwaway holder) if there's no request in
+                # flight, e.g. a startup error.
+                mark_request_errored()
             tool, tier = _current_tags()
             _enqueue(
                 _SYS,
@@ -1891,7 +2056,7 @@ def delete_logs(request: Request, key: str = Query(...), older_than_days: int = 
 # from the Next.js /admin/logs page - the Next.js page is what you
 # actually use day to day, but this one hits the exact same
 # get_http_logs()/get_system_logs() endpoints and must stay consistent
-# with the same {success, client, server} shape.
+# with the same {success, client, server, silent} shape.
 # ============================================================
 
 @router.get("/admin/logs", response_class=HTMLResponse)
@@ -1921,6 +2086,7 @@ def logs_dashboard(request: Request, key: str = Query(...)):
   .success { color: #4ade80; }
   .client-error { color: #fbbf24; }
   .server-error { color: #f87171; }
+  .silent-error { color: #f87171; }
   .controls { margin-bottom: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .controls-label { font-size: 12px; color: #666; margin-right: 4px; }
   select, input[type=text], input[type=date] {
@@ -1946,6 +2112,8 @@ def logs_dashboard(request: Request, key: str = Query(...)):
   .status-2xx { color: #4ade80; }
   .status-4xx { color: #fbbf24; }
   .status-5xx { color: #f87171; }
+  .row-silent { background: rgba(248, 113, 113, 0.07); }
+  .silent-badge { display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; color: #f87171; border: 1px solid rgba(248,113,113,.4); background: rgba(248,113,113,.12); border-radius: 4px; padding: 0 4px; }
   .level-INFO { color: #60a5fa; }
   .level-WARNING { color: #fbbf24; }
   .level-ERROR { color: #f87171; }
@@ -1977,6 +2145,7 @@ def logs_dashboard(request: Request, key: str = Query(...)):
       <div class="stat-box"><div class="label">Success</div><div class="value success" id="success">-</div></div>
       <div class="stat-box"><div class="label">Client Errors</div><div class="value client-error" id="clientErrors">-</div></div>
       <div class="stat-box"><div class="label">Server Errors</div><div class="value server-error" id="serverErrors">-</div></div>
+      <div class="stat-box" title="Returned <400 but logged an ERROR — a failure the status code hides."><div class="label">Silent Errors</div><div class="value silent-error" id="silentErrors">-</div></div>
     </div>
 
     <div class="controls">
@@ -1990,6 +2159,9 @@ def logs_dashboard(request: Request, key: str = Query(...)):
       <input type="text" id="pathFilter" placeholder="Search path, e.g. /download" oninput="applyFilter()" style="width:220px;">
       <label style="font-size:13px;color:#888;">
         <input type="checkbox" id="hideNoise" onchange="applyFilter()"> Hide bot/scanner noise
+      </label>
+      <label style="font-size:13px;color:#f87171;">
+        <input type="checkbox" id="erroredOnly" onchange="applyFilter()"> Only errored
       </label>
       <button class="reset-btn" onclick="resetFilters()">Reset</button>
     </div>
@@ -2056,21 +2228,21 @@ let isPaused = false;
 let pendingCount = 0;
 
 // Track counts as real numbers, never re-parse DOM text (which starts as
-// "-" and turns any increment into NaN forever). Three buckets now, not
-// two - see the FIXES APPLIED note at the top of this file for why
-// "failed" was replaced with separate client (4xx) and server (5xx)
-// counts: a 404 from a bot or a 429 rate-limit is normal client
-// behavior, not evidence the app is broken.
+// "-" and turns any increment into NaN forever). Five buckets now - see
+// the FIXES APPLIED note at the top of this file for why "failed" became
+// separate client/server counts, and #24 for the silent-error bucket.
 let totalCount = 0;
 let successCount = 0;
 let clientErrorCount = 0;
 let serverErrorCount = 0;
+let silentErrorCount = 0;
 
 function renderCounters() {
   document.getElementById("total").innerText = totalCount;
   document.getElementById("success").innerText = successCount;
   document.getElementById("clientErrors").innerText = clientErrorCount;
   document.getElementById("serverErrors").innerText = serverErrorCount;
+  document.getElementById("silentErrors").innerText = silentErrorCount;
 }
 
 // Injected from config.NOISE_PATH_MARKERS by logs_dashboard() below -
@@ -2142,7 +2314,8 @@ function saveFilterPrefs() {
   const prefs = {
     method: document.getElementById("methodFilter").value,
     path: document.getElementById("pathFilter").value,
-    hideNoise: document.getElementById("hideNoise").checked
+    hideNoise: document.getElementById("hideNoise").checked,
+    erroredOnly: document.getElementById("erroredOnly").checked
   };
   localStorage.setItem("audioforges_log_filters", JSON.stringify(prefs));
 }
@@ -2153,6 +2326,7 @@ function loadFilterPrefs() {
     if (saved.method) document.getElementById("methodFilter").value = saved.method;
     if (saved.path) document.getElementById("pathFilter").value = saved.path;
     if (saved.hideNoise) document.getElementById("hideNoise").checked = saved.hideNoise;
+    if (saved.erroredOnly) document.getElementById("erroredOnly").checked = saved.erroredOnly;
   } catch (e) { /* ignore corrupt/missing prefs */ }
 }
 
@@ -2191,11 +2365,13 @@ function applyFilter() {
   const methodVal = document.getElementById("methodFilter").value;
   const pathVal = document.getElementById("pathFilter").value.toLowerCase();
   const hideNoise = document.getElementById("hideNoise").checked;
+  const erroredOnly = document.getElementById("erroredOnly").checked;
 
   const filtered = allHttpLogs.filter(log => {
     if (methodVal && log.method !== methodVal) return false;
     if (pathVal && !log.path.toLowerCase().includes(pathVal)) return false;
     if (hideNoise && isNoise(log.path)) return false;
+    if (erroredOnly && !log.error_logged) return false;
     if (!passesDateFilter(log)) return false;
     return true;
   });
@@ -2206,7 +2382,7 @@ function applyFilter() {
   const wasNearBottom = tableWrap
     ? tableWrap.scrollHeight - tableWrap.scrollTop - tableWrap.clientHeight < 60
     : true;
-  document.getElementById("http-rows").innerHTML = filtered.map(renderHttpRow).join("");
+  document.getElementById("http-rows").innerHTML = filtered.map(l => renderHttpRow(l)).join("");
   document.getElementById("http-empty").style.display = filtered.length === 0 ? "block" : "none";
   if (tableWrap && wasNearBottom) {
     tableWrap.scrollTop = tableWrap.scrollHeight;
@@ -2217,15 +2393,20 @@ function resetFilters() {
   document.getElementById("methodFilter").value = "";
   document.getElementById("pathFilter").value = "";
   document.getElementById("hideNoise").checked = false;
+  document.getElementById("erroredOnly").checked = false;
   document.getElementById("customDate").value = "";
   setDateFilter("all");
 }
 
 function renderHttpRow(log, isNew) {
-  return `<tr class="${isNew ? 'new-row' : ''}">
+  const silent = log.error_logged && log.status_code < 400;
+  const badge = log.error_logged
+    ? `<span class="silent-badge" title="${log.error_count || 1} error(s) logged during this request">failed</span>`
+    : "";
+  return `<tr class="${isNew ? 'new-row' : ''} ${silent ? 'row-silent' : ''}">
     <td>${toNepalTime(log.timestamp)}</td>
     <td>${log.method}</td>
-    <td>${log.path}</td>
+    <td>${log.path}${badge}</td>
     <td class="${statusClass(log.status_code)}">${log.status_code}</td>
     <td>${formatDuration(log.duration_ms)}</td>
     <td>${log.client_ip}</td>
@@ -2270,6 +2451,7 @@ async function loadInitialHttp() {
     successCount = data.success;
     clientErrorCount = data.client;
     serverErrorCount = data.server;
+    silentErrorCount = data.silent || 0;
     renderCounters();
     allHttpLogs = data.logs.reverse();
     applyFilter();
@@ -2293,6 +2475,7 @@ httpSource.onmessage = (event) => {
   totalCount++;
   if (log.status_code < 400) {
     successCount++;
+    if (log.error_logged) silentErrorCount++;
   } else if (log.status_code < 500) {
     clientErrorCount++;
   } else {
