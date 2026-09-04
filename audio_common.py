@@ -17,6 +17,7 @@ from config import (
     logger,
     FFMPEG_PATH,
     FFPROBE_PATH,
+    RUBBERBAND_PATH,
     AUDIO_TOOLS_DIR,
     UPLOAD_DIR,
     ALLOWED_AUDIO_INPUT_FORMATS,
@@ -383,6 +384,33 @@ def run_subprocess(cmd: list, timeout: int = AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECON
     if result.returncode != 0:
         logger.error(f"[AUDIO_TOOLS] Subprocess failed (exit {result.returncode}): {result.stderr.strip()}")
         raise AudioToolError("Audio processing failed. The file may be corrupt or in an unsupported format.")
+
+
+def run_rubberband(input_path: str, output_path: str, rb_args: list,
+                   timeout: int = AUDIO_TOOL_SUBPROCESS_TIMEOUT_SECONDS) -> None:
+    """Run rubberband, decoding the input to WAV first and re-encoding the
+    result to output_path's format.
+
+    rubberband reads through libsndfile - WAV/AIFF/FLAC/OGG only - so a
+    typical m4a/mp3/aac upload handed to it directly fails with "Format
+    not recognised". Every caller therefore goes input -> ffmpeg -> temp
+    WAV -> rubberband -> temp WAV -> ffmpeg -> output. Temp files are
+    removed even on failure. run_subprocess adds -vn to the ffmpeg steps,
+    so embedded cover art can't break the decode.
+    """
+    base = os.path.splitext(output_path)[0]
+    tmp_in = f"{base}.rb_in.wav"
+    tmp_out = f"{base}.rb_out.wav"
+    try:
+        run_subprocess([FFMPEG_PATH, "-y", "-i", input_path, tmp_in], timeout=timeout)
+        run_subprocess([RUBBERBAND_PATH, *rb_args, tmp_in, tmp_out], timeout=timeout)
+        run_subprocess([FFMPEG_PATH, "-y", "-i", tmp_out, output_path], timeout=timeout)
+    finally:
+        for _p in (tmp_in, tmp_out):
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
 
 
 def new_job_id() -> str:

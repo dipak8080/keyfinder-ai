@@ -13,8 +13,8 @@ reasoning as pitch_changer.py's choice, in reverse: rubberband's
 Output format matches input format (chain with /convert for format
 changes).
 """
-from config import logger, RUBBERBAND_PATH, TEMPO_MIN_FACTOR, TEMPO_MAX_FACTOR
-from audio_common import AudioToolError, run_subprocess
+from config import logger, TEMPO_MIN_FACTOR, TEMPO_MAX_FACTOR
+from audio_common import AudioToolError, run_rubberband
 
 
 def change_tempo(input_path: str, output_path: str, tempo_factor: float) -> None:
@@ -34,14 +34,6 @@ def change_tempo(input_path: str, output_path: str, tempo_factor: float) -> None
     # (matches this function's tempo_factor semantics 1:1, no
     # conversion needed). -c 5 same as pitch_changer.py, kept explicit
     # for the same future-proofing reason.
-    cmd = [
-        RUBBERBAND_PATH,
-        "--tempo", str(tempo_factor),
-        "-c", "5",
-        input_path,
-        output_path,
-    ]
-
-    run_subprocess(cmd)
+    run_rubberband(input_path, output_path, ["--tempo", str(tempo_factor), "-c", "5"])
 
     logger.info(f"[TEMPO] {input_path} (x{tempo_factor:.2f}) -> {output_path}")

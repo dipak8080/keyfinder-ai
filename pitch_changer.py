@@ -12,8 +12,8 @@ naive ffmpeg speed change for its higher-quality path).
 Output format matches input format (chain with /convert for format
 changes).
 """
-from config import logger, RUBBERBAND_PATH, PITCH_SHIFT_MIN_SEMITONES, PITCH_SHIFT_MAX_SEMITONES
-from audio_common import AudioToolError, run_subprocess
+from config import logger, PITCH_SHIFT_MIN_SEMITONES, PITCH_SHIFT_MAX_SEMITONES
+from audio_common import AudioToolError, run_rubberband
 
 
 def shift_pitch(input_path: str, output_path: str, semitones: float) -> None:
@@ -34,14 +34,6 @@ def shift_pitch(input_path: str, output_path: str, semitones: float) -> None:
     # -c 5 (crispness) is rubberband's default general-purpose setting,
     # left explicit here rather than relying on its own default so
     # behavior can't silently change on a future rubberband version bump.
-    cmd = [
-        RUBBERBAND_PATH,
-        "--pitch", str(semitones),
-        "-c", "5",
-        input_path,
-        output_path,
-    ]
-
-    run_subprocess(cmd)
+    run_rubberband(input_path, output_path, ["--pitch", str(semitones), "-c", "5"])
 
     logger.info(f"[PITCH] {input_path} ({semitones:+.1f} semitones) -> {output_path}")
