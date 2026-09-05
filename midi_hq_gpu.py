@@ -102,7 +102,11 @@ from separation import run_stem_separation, SeparationError
 # Same route, same credit, same result shape. "engine" in the stats says
 # which one ran.
 # --------------------------------------------------------------------------
-INSTRUMENTS = ("auto", "piano", "mix", "guitar")
+# auto / mix   htdemucs_6s split, then per-stem engines (midi_stems.py)
+# piano        Transkun on RunPod (piano_gpu.py)
+# guitar       basic-pitch sidecar, guitar mode
+# yourmt3      raw YourMT3 on the whole file (fallback / internal)
+INSTRUMENTS = ("auto", "piano", "mix", "guitar", "yourmt3")
 ISOLATION_MODEL = "htdemucs_6s"
 
 
@@ -304,6 +308,24 @@ async def transcribe_to_midi(
             input_path, output_path, job_id or uuid.uuid4().hex, isolate,
             min_pitch, max_pitch, min_note_ms,
         )
+
+    if instrument in ("auto", "mix"):
+        from midi_stems import transcribe_stems
+        return await transcribe_stems(
+            input_path, output_path, job_id=job_id,
+            min_pitch=min_pitch, max_pitch=max_pitch, min_note_ms=min_note_ms,
+        )
+
+    if instrument == "piano":
+        import piano_gpu
+        if piano_gpu.is_available():
+            stats = await piano_gpu.transcribe_to_midi(
+                input_path, output_path, isolate=isolate, job_id=job_id,
+            )
+            stats.setdefault("engine", "transkun")
+            stats.setdefault("notes_dropped_by_filter", 0)
+            return stats
+        logger.warning("[MIDI_HQ] piano worker unavailable, falling back to YourMT3")
 
     # A fresh handle per job, registered immediately before submit and
     # removed in the `finally` below - so the input URL is live for

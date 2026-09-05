@@ -137,6 +137,7 @@ TOOL = "AUDIO_TO_MIDI_HQ"
 METRIC = "/audio-to-midi-hq"
 JOB_TYPE = "audio_to_midi_hq"
 TOOL_KEY = "audio-to-midi-hq"   # credits rule key, see credits/config.py
+MIX_TOOL_KEY = "audio-to-midi-hq-mix"   # 3-credit rule for instrument=auto|mix
 
 
 def _require_available() -> None:
@@ -344,8 +345,9 @@ async def audio_to_midi_hq_route(
     instrument = (instrument or "auto").lower()
     if instrument not in INSTRUMENTS:
         raise HTTPException(400, f"instrument must be one of: {', '.join(INSTRUMENTS)}.")
-    if isolate and instrument != "guitar":
-        raise HTTPException(400, "isolate is only supported with instrument=guitar.")
+    if isolate and instrument not in ("guitar", "piano"):
+        raise HTTPException(400, "isolate is only supported with instrument=guitar or piano.")
+    tool_key = MIX_TOOL_KEY if instrument in ("auto", "mix") else TOOL_KEY
 
     _validated_input_format(file.filename)
     original_filename = file.filename
@@ -395,7 +397,7 @@ async def audio_to_midi_hq_route(
     # the enqueue raises. The charge is idempotent per job_id.
     try:
         async with paywall.guard(
-            identity, job_id=job_id, tool=TOOL_KEY, input_seconds=duration
+            identity, job_id=job_id, tool=tool_key, input_seconds=duration
         ) as charge:
             # Opened INSIDE the guard so charge_type is the real outcome
             # rather than a guess made before the decision - that is what
@@ -403,7 +405,7 @@ async def audio_to_midi_hq_route(
             # jobs that never could be.
             metering.record_job_created(
                 job_id=job_id,
-                tool=TOOL_KEY,
+                tool=tool_key,
                 subject_id=identity.subject_id,
                 account_id=identity.account_id,
                 ip_hash=identity.ip_hash,
@@ -462,7 +464,7 @@ async def audio_to_midi_hq_route(
                 # midi_hq_gpu from the worker's own report; this only
                 # writes the terminal status, and record_job_finished
                 # COALESCEs so the two cannot blank each other.
-                metered_tool=TOOL_KEY,
+                metered_tool=tool_key,
                 success_detail=lambda r: (
                     f"{r.get('note_count')} notes, "
                     f"{r.get('track_count')} track(s), "

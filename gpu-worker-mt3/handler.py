@@ -259,6 +259,42 @@ def _filter_midi(
     return midi, kept, dropped
 
 
+def _merge_fragments(
+    midi: "pretty_midi.PrettyMIDI",
+    *,
+    gap_ms: float,
+    sliver_ms: float,
+) -> tuple["pretty_midi.PrettyMIDI", int]:
+    """Join same-pitch notes separated by less than gap_ms; drop slivers."""
+    if not gap_ms and not sliver_ms:
+        return midi, 0
+    gap = (gap_ms or 0) / 1000.0
+    sliver = (sliver_ms or 0) / 1000.0
+    merged = 0
+    for inst in midi.instruments:
+        by_pitch: dict[int, list] = {}
+        for n in sorted(inst.notes, key=lambda x: (x.pitch, x.start)):
+            by_pitch.setdefault(n.pitch, []).append(n)
+        out = []
+        for notes in by_pitch.values():
+            cur = notes[0]
+            for n in notes[1:]:
+                if n.start - cur.end <= gap:
+                    cur.end = max(cur.end, n.end)
+                    cur.velocity = max(cur.velocity, n.velocity)
+                    merged += 1
+                else:
+                    out.append(cur)
+                    cur = n
+            out.append(cur)
+        if sliver:
+            before = len(out)
+            out = [n for n in out if (n.end - n.start) >= sliver]
+            merged += before - len(out)
+        inst.notes = sorted(out, key=lambda x: (x.start, x.pitch))
+    return midi, merged
+
+
 def _summarise(midi: "pretty_midi.PrettyMIDI") -> dict:
     """What the VPS logs and what the frontend can show.
 
@@ -328,6 +364,8 @@ def handler(job):
     min_pitch = payload.get("min_pitch")
     max_pitch = payload.get("max_pitch")
     min_note_ms = payload.get("min_note_ms")
+    merge_gap_ms = payload.get("merge_gap_ms", 80)
+    sliver_ms = payload.get("sliver_ms", 30)
 
     tmp_dir = tempfile.mkdtemp(prefix="mt3_")
     audio_path = os.path.join(tmp_dir, f"input{suffix}")
@@ -413,6 +451,12 @@ def handler(job):
             return {"error": "NO_NOTES_DETECTED"}
 
         # ---------- post-process ----------
+        midi, merged = _merge_fragments(
+            midi,
+            gap_ms=float(merge_gap_ms or 0),
+            sliver_ms=float(sliver_ms or 0),
+        )
+
         midi, kept, dropped = _filter_midi(
             midi,
             min_pitch=int(min_pitch) if min_pitch is not None else None,
@@ -445,7 +489,7 @@ def handler(job):
             f"[MT3_GPU] ok {duration:.1f}s audio -> {stats['note_count']} notes "
             f"across {stats['track_count']} track(s), {len(midi_bytes)}B "
             f"(fetch {fetch_seconds:.1f}s, infer {infer_seconds:.1f}s, "
-            f"filtered out {dropped})",
+            f"merged {merged}, filtered out {dropped})",
             flush=True,
         )
 
@@ -453,6 +497,7 @@ def handler(job):
             "midi_b64": base64.b64encode(midi_bytes).decode("ascii"),
             "input_seconds": round(duration, 2),
             "notes_dropped_by_filter": dropped,
+            "notes_merged": merged,
             **stats,
             # Same key and shape the Whisper worker uses, so
             # credits/metering.py needs no per-tool special case and the

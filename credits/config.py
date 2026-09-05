@@ -271,6 +271,13 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
+    # Full-mix runs of /audio-to-midi-hq (instrument=auto|mix): one Demucs
+    # split plus up to three transcriptions, so priced like /audio-to-sheet.
+    "audio-to-midi-hq-mix": {
+        "enabled": False, "free_under_seconds": 0, "credits": 3,
+        "paid_rate_limit": 30, "paid_rate_window": 3600,
+        "free_rate_limit": 0,
+    },
     # ---- AUDIO TO SHEET MUSIC ------------------------------------------
     # /audio-to-sheet. A distinct PRODUCT from the MIDI tools, not a mode
     # on one: it carries a transcription all the way to engraved notation
