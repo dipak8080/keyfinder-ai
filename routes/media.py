@@ -95,6 +95,8 @@ from config import (
     JOIN_RATE_LIMIT_WINDOW_SECONDS,
     SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS,
     SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS,
+    SILENCE_SPLIT_MIN_SEGMENT_SECONDS,
+    SILENCE_SPLIT_MIN_SEGMENT_MAX_SECONDS,
     SILENCE_THRESHOLD_MIN_DB,
     SILENCE_THRESHOLD_MAX_DB,
     SILENCE_MIN_DURATION_SECONDS,
@@ -476,6 +478,7 @@ async def silence_split_route(
     target_format: str = Form("mp3"),
     threshold_db: float = Form(-30.0),
     min_duration_seconds: float = Form(0.5),
+    min_segment_seconds: float = Form(SILENCE_SPLIT_MIN_SEGMENT_SECONDS),
 ):
     """Poll GET /silence-split/status/{job_id} - the response lists the
     available segment names once complete."""
@@ -499,6 +502,12 @@ async def silence_split_route(
             f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} "
             f"and {SILENCE_MAX_DURATION_SECONDS}."
         )
+    if min_segment_seconds < SILENCE_SPLIT_MIN_SEGMENT_SECONDS or min_segment_seconds > SILENCE_SPLIT_MIN_SEGMENT_MAX_SECONDS:
+        raise HTTPException(
+            400,
+            f"min_segment_seconds must be between {SILENCE_SPLIT_MIN_SEGMENT_SECONDS} "
+            f"and {SILENCE_SPLIT_MIN_SEGMENT_MAX_SECONDS}."
+        )
 
     original_filename = file.filename
 
@@ -520,7 +529,8 @@ async def silence_split_route(
         job_id=job_id,
         semaphore=_audio_tools_semaphore,
         work=lambda: run_blocking(
-            split_on_silence, input_path, job_id, target_format, threshold_db, min_duration_seconds
+            split_on_silence, input_path, job_id, target_format,
+            threshold_db, min_duration_seconds, min_segment_seconds,
         ),
         on_success=lambda segments: mark_stems_complete(job_id, original_filename, segments),
         generic_error="Splitting failed unexpectedly.",
@@ -528,7 +538,10 @@ async def silence_split_route(
         success_detail=lambda segments: f"{len(segments)} segments",
     ))
 
-    _log_queued("SILENCE_SPLIT", job_id, original_filename, size, f"threshold={threshold_db}dB")
+    _log_queued(
+        "SILENCE_SPLIT", job_id, original_filename, size,
+        f"threshold={threshold_db}dB min_dur={min_duration_seconds}s min_seg={min_segment_seconds}s",
+    )
     return JSONResponse({"job_id": job_id, "status": "processing"})
 
 

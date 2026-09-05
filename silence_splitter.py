@@ -70,6 +70,7 @@ from config import (
     SILENCE_SPLIT_MIN_SEGMENT_SECONDS,
     SILENCE_SPLIT_DETECT_TIMEOUT_SECONDS,
     SILENCE_SPLIT_CUT_TIMEOUT_SECONDS,
+    SILENCE_SPLIT_AUTO_MERGE,
 )
 from audio_common import AudioToolError, validate_duration, as_audio_only_ffmpeg
 
@@ -177,12 +178,39 @@ def _segments_from_silences(
     ]
 
 
+def _merge_to_limit(
+    segments: List[Tuple[float, float]],
+    max_segments: int,
+) -> List[Tuple[float, float]]:
+    """
+    Repeatedly joins the two adjacent segments separated by the
+    shortest silence gap until the count fits under max_segments.
+    Merging across the shortest gaps first keeps the long, deliberate
+    gaps (track boundaries) as cut points and absorbs the brief ones
+    (sentence pauses) into their neighbours.
+    """
+    segments = list(segments)
+    while len(segments) > max_segments:
+        best_index = 0
+        best_gap = None
+        for i in range(len(segments) - 1):
+            gap = segments[i + 1][0] - segments[i][1]
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_index = i
+        a_start, _ = segments[best_index]
+        _, b_end = segments[best_index + 1]
+        segments[best_index:best_index + 2] = [(a_start, b_end)]
+    return segments
+
+
 def split_on_silence(
     input_path: str,
     job_id: str,
     target_format: str,
     threshold_db: float,
     min_duration_seconds: float,
+    min_segment_seconds: float = SILENCE_SPLIT_MIN_SEGMENT_SECONDS,
 ) -> Dict[str, str]:
     """
     Detects silence in input_path and cuts it into one file per
@@ -205,7 +233,7 @@ def split_on_silence(
     total_duration = validate_duration(input_path)
 
     silences = _detect_silences(input_path, threshold_db, min_duration_seconds)
-    segments = _segments_from_silences(total_duration, silences, SILENCE_SPLIT_MIN_SEGMENT_SECONDS)
+    segments = _segments_from_silences(total_duration, silences, min_segment_seconds)
 
     if not segments:
         raise AudioToolError(
@@ -221,6 +249,16 @@ def split_on_silence(
         raise AudioToolError(
             "No silence was detected in this file, so there's nothing to split. "
             "Try lowering the threshold if you expected a split here."
+        )
+
+    if len(segments) > SILENCE_SPLIT_MAX_SEGMENTS and SILENCE_SPLIT_AUTO_MERGE:
+        raw_count = len(segments)
+        segments = _merge_to_limit(segments, SILENCE_SPLIT_MAX_SEGMENTS)
+        logger.warning(
+            f"[SILENCE_SPLIT] Job {job_id}: {raw_count} raw segments exceeded the "
+            f"{SILENCE_SPLIT_MAX_SEGMENTS} limit; merged across shortest gaps down to "
+            f"{len(segments)} (threshold={threshold_db}dB min_dur={min_duration_seconds}s "
+            f"min_seg={min_segment_seconds}s)"
         )
 
     if len(segments) > SILENCE_SPLIT_MAX_SEGMENTS:
