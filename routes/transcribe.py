@@ -303,6 +303,7 @@ async def speech_to_text_route(
         },
         "billing": {
             "charged": charge.charge_type,
+            "credits": charge.credits,
             "balance": charge.balance_after,
             "free_remaining": charge.free_remaining_after,
         },

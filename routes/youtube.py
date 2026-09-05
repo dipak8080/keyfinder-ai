@@ -1449,6 +1449,7 @@ async def youtube_separate_hq_route(
     if charge.charge_type != "none":
         payload["billing"] = {
             "charged": charge.charge_type,
+            "credits": charge.credits,
             "balance": charge.balance_after,
             "free_remaining": charge.free_remaining_after,
         }
@@ -1599,6 +1600,7 @@ async def youtube_stems_hq_route(
     if charge.charge_type != "none":
         payload["billing"] = {
             "charged": charge.charge_type,
+            "credits": charge.credits,
             "balance": charge.balance_after,
             "free_remaining": charge.free_remaining_after,
         }

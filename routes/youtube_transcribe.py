@@ -372,6 +372,7 @@ async def youtube_transcribe_route(
         "options": {"language": language, "task": task, "mode": mode},
         "billing": {
             "charged": charge.charge_type,
+            "credits": charge.credits,
             "balance": charge.balance_after,
             "free_remaining": charge.free_remaining_after,
         },
