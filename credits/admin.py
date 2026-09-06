@@ -235,9 +235,11 @@ async def recent_jobs(
             f"""SELECT m.job_id, m.tool, m.status, m.input_seconds, m.gpu_seconds,
                        m.est_cost_usd, m.charge_type, m.paywall_enabled, m.error,
                        m.created_at, m.ended_at,
-                       c.status AS charge_status, c.refund_reason
+                       c.status AS charge_status, c.refund_reason,
+                       a.email AS email
                 FROM gpu_job_metrics m
                 LEFT JOIN job_charges c ON c.job_id = m.job_id
+                LEFT JOIN accounts a ON a.id = m.account_id
                 {where}
                 ORDER BY m.created_at DESC, m.job_id DESC
                 LIMIT ? OFFSET ?""",
