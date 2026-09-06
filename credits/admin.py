@@ -120,6 +120,8 @@ async def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
 async def costs(
     days: int = Query(default=30, ge=1, le=365),
     tool: str | None = Query(default=None, max_length=64),
+    date_from: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ) -> dict:
     """Day by day, tool by tool. This is the data that decides the price.
 
@@ -135,6 +137,26 @@ async def costs(
     narrowing it to one tool would make a partial figure look like a
     complete one.
     """
+    if date_from and date_to:
+        clauses = ["day >= ?", "day <= ?"]
+        params: list = [date_from, date_to]
+        if tool:
+            clauses.append("tool = ?")
+            params.append(tool)
+        with connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM gpu_cost_daily WHERE {' AND '.join(clauses)}"
+                " ORDER BY day DESC, tool",
+                tuple(params),
+            ).fetchall()
+        return {
+            "daily": [dict(r) for r in rows],
+            "totals": metering.totals(days),
+            "tool": tool,
+            "date_from": date_from,
+            "date_to": date_to,
+        }
+
     daily = metering.daily_costs(days)
     if tool:
         daily = [row for row in daily if row.get("tool") == tool]
@@ -150,6 +172,9 @@ async def recent_jobs(
     charge_type: str | None = Query(default=None, max_length=16),
     days: int | None = Query(default=None, ge=1, le=365),
     email: str | None = Query(default=None, max_length=254),
+    date_from: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    has_account: bool | None = Query(default=None),
 ) -> dict:
     """Recent GPU jobs with cost and billing outcome joined together.
 
@@ -205,16 +230,27 @@ async def recent_jobs(
         clauses.append("m.tool = ?")
         params.append(tool)
     if status:
-        clauses.append("m.status = ?")
-        params.append(status)
+        if status == "failed_all":
+            clauses.append("m.status IN ('failed','timeout','cancelled')")
+        else:
+            clauses.append("m.status = ?")
+            params.append(status)
     if charge_type:
         clauses.append("m.charge_type = ?")
         params.append(charge_type)
-    if days:
+    if date_from:
+        clauses.append("m.created_at >= ?")
+        params.append(f"{date_from}T00:00:00Z")
+    if date_to:
+        clauses.append("m.created_at < strftime('%Y-%m-%dT%H:%M:%SZ', ?, '+1 day')")
+        params.append(f"{date_to}T00:00:00Z")
+    if days and not (date_from or date_to):
         # Same expression metering.totals() uses, so a count here and a
         # cost figure there always describe the same window.
         clauses.append("m.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)")
         params.append(f"-{days} days")
+    if has_account is not None:
+        clauses.append("m.account_id IS NOT NULL" if has_account else "m.account_id IS NULL")
     if email:
         # Joined through accounts rather than matched on the metrics row:
         # gpu_job_metrics stores account_id, not the address, and the
@@ -254,6 +290,7 @@ async def recent_jobs(
         "filters": {
             "tool": tool, "status": status, "charge_type": charge_type,
             "days": days, "email": email,
+            "date_from": date_from, "date_to": date_to, "has_account": has_account,
         },
     }
 
