@@ -436,6 +436,7 @@ async def _run_tool_job(
     """
     started = time.monotonic()
     succeeded = False
+    failure: Optional[str] = None
 
     async with semaphore:
         waited = time.monotonic() - started
@@ -467,12 +468,14 @@ async def _run_tool_job(
             # Expected, user-actionable failure - the message is written
             # for the person who uploaded the file, so it passes through
             # to them unchanged.
+            failure = str(e)
             mark_failed(job_id, str(e))
             logger.warning(
                 f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
             )
 
         except SeparationError as e:
+            failure = str(e)
             mark_failed(job_id, str(e))
             logger.warning(
                 f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
@@ -482,11 +485,13 @@ async def _run_tool_job(
             # Shutdown. Mark it so a client polling across a redeploy
             # gets a real answer instead of an eternal "processing", then
             # re-raise so the task actually stops.
+            failure = "cancelled: server restarted while this job was running"
             mark_failed(job_id, "The server restarted while this job was running.")
             logger.warning(f"[{tool}] job={job_id} CANCELLED (shutdown)")
             raise
 
         except Exception as e:
+            failure = f"{type(e).__name__}: {e}"[:500]
             mark_failed(job_id, generic_error)
             logger.error(
                 f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s "
@@ -537,7 +542,9 @@ async def _run_tool_job(
             if metered_tool:
                 from credits import metering
                 metering.record_job_finished(
-                    job_id, status="completed" if succeeded else "failed"
+                    job_id,
+                    status="completed" if succeeded else "failed",
+                    error=None if succeeded else (failure or generic_error),
                 )
 
             fail_if_unfinished(job_id, generic_error)
