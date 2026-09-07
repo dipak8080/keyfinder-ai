@@ -2507,12 +2507,25 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # client-mismatched for this particular video).
                 continue
 
-            if account_path is None and is_bot_check_error(error_text):
-                # Anon attempt bot-checked. A cookie session often clears
-                # the bot-check from this same IP (verified: cookies +
-                # web_embedded downloaded a video that anon-bot-checked,
-                # no proxy) - try cookie accounts on the FREE direct path
-                # before escalating to the paid proxy.
+            if is_bot_check_error(error_text):
+                # Bot-check on the direct path - from ANY attempt, anon or
+                # cookie. Originally only the anon attempt rotated onward,
+                # on the theory that a bot-check against a cookie session
+                # was IP-shaped and account-swapping couldn't fix it.
+                # DISPROVED 2026-09-07 (CLI, video 0GmFUOuDqKM): from the
+                # same VPS IP, anon bot-checked, account 1 (stale cookies)
+                # bot-checked, account 2 downloaded fine. The check is
+                # session-shaped: a different account can clear it. Under
+                # the old rule, one stale first account stopped rotation
+                # and the working account 2 was never tried - requests
+                # died at the proxy tier (whose exits were also being
+                # challenged for weak sessions) and returned 503.
+                # Rotating is free (~1s, no bandwidth); the proxy tier
+                # below still catches the day every session is challenged.
+                # Deliberately NOT disabling the account here - a
+                # bot-check is not proof the cookies are dead (see the
+                # 2026-08-08 mass-disable incident above for why disabling
+                # on ambiguous signals is dangerous).
                 continue
 
             # Failure wasn't confirmed as THIS account's identity being
