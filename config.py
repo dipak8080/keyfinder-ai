@@ -1450,6 +1450,17 @@ MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECO
 # midi-worker's Dockerfile installs ffmpeg for exactly this reason.
 MIDI_INPUT_FORMATS = frozenset(ALLOWED_AUDIO_INPUT_FORMATS) | {"opus", "webm"}
 
+# Input formats accepted by /voice-clean SPECIFICALLY - same pattern and
+# same reasoning as MIDI_INPUT_FORMATS above: input-only widening, kept
+# out of _SUPPORTED_AUDIO_FORMATS so opus/webm never become OUTPUT
+# formats anywhere. Motivation (2026-09-07 request log): a user uploaded
+# a .opus file to /voice-clean and was rejected with a 400 - .opus is
+# what WhatsApp/Telegram voice notes are, i.e. the single most on-target
+# input a voice-cleanup tool has. ffmpeg decodes both fine. The route
+# forces a supported OUTPUT format for these inputs, so nothing
+# downstream has to learn to encode opus.
+VOICE_CLEAN_INPUT_FORMATS = frozenset(ALLOWED_AUDIO_INPUT_FORMATS) | {"opus", "webm"}
+
 
 
 

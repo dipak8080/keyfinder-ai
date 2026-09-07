@@ -97,6 +97,7 @@ from config import (
     AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_CONVERT_RATE_LIMIT_WINDOW_SECONDS,
     AUDIO_CONVERSION_MATRIX,
+    VOICE_CLEAN_INPUT_FORMATS,
     AUDIO_TRIM_RATE_LIMIT_MAX_REQUESTS,
     AUDIO_TRIM_RATE_LIMIT_WINDOW_SECONDS,
     TRIM_END_TOLERANCE_SECONDS,
@@ -606,6 +607,11 @@ async def noise_remove_download(job_id: str):
 )
 async def voice_clean_route(file: UploadFile = File(...)):
     """Speech-optimized cleanup preset."""
+    # opus/webm (voice notes) are accepted as INPUT only - see
+    # VOICE_CLEAN_INPUT_FORMATS in config.py. Their output is forced to
+    # mp3 because out_fmt otherwise mirrors the source extension, and no
+    # tool here encodes opus.
+    ext = (os.path.splitext(file.filename or "")[1] or "").lstrip(".").lower()
     return await _submit_audio_tool(
         file,
         job_type="voice_clean",
@@ -613,6 +619,8 @@ async def voice_clean_route(file: UploadFile = File(...)):
         metric="/voice-clean",
         build_work=lambda inp, out: (lambda: run_blocking(clean_voice, inp, out)),
         generic_error="Voice cleanup failed unexpectedly.",
+        allowed_input_formats=VOICE_CLEAN_INPUT_FORMATS,
+        output_format="mp3" if ext in ("opus", "webm") else None,
     )
 
 
