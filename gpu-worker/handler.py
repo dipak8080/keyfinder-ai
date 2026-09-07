@@ -199,6 +199,32 @@ def _upload_result(job_id: str, name: str, file_path: str) -> None:
     )
 
 
+MIN_DURATION_SECONDS = 3.0
+
+
+def _normalise_input(input_path: str, work_dir: str) -> str:
+    """Re-encode whatever the user uploaded into plain stereo 44.1k PCM.
+
+    Demucs crashes with an opaque AssertionError in reflect padding when
+    fed audio that decodes to NaN samples or exotic layouts. One cheap
+    CPU transcode up front turns every input into the one shape the
+    model was trained on, and turns undecodable files into a clean,
+    user-facing error instead of a GPU-side traceback.
+    """
+    clean_path = os.path.join(work_dir, "input_clean.wav")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", input_path,
+         "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", clean_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not os.path.exists(clean_path) or os.path.getsize(clean_path) == 0:
+        raise ValueError(
+            "This file could not be decoded as audio. It may be corrupted "
+            "or not actually an audio file."
+        )
+    return clean_path
+
+
 def _run_demucs_gpu(input_path: str, work_dir: str, model: str, overlap: float, two_stems: bool):
     """
     Unchanged from v1: forces the GPU explicitly via `-d cuda` so a real
@@ -215,7 +241,16 @@ def _run_demucs_gpu(input_path: str, work_dir: str, model: str, overlap: float, 
     gpu_seconds = time.monotonic() - started
 
     if result.returncode != 0:
-        raise RuntimeError(f"Demucs failed (exit {result.returncode}): {result.stderr[-2000:]}")
+        stderr = result.stderr[-2000:]
+        if "AssertionError" in stderr and "pad1d" in stderr:
+            # Known Demucs failure mode on degenerate input (too short,
+            # silent, or NaN samples). The traceback is useless to the
+            # person who uploaded the file; this message is not.
+            raise RuntimeError(
+                "This audio couldn't be processed - it appears to be too "
+                "short or contains no usable audio data."
+            )
+        raise RuntimeError(f"Demucs failed (exit {result.returncode}): {stderr}")
 
     input_stem = os.path.splitext(os.path.basename(input_path))[0]
     track_dir = os.path.join(work_dir, model, input_stem)
@@ -270,9 +305,24 @@ def handler(job):
                 )
             }
 
+        if duration < MIN_DURATION_SECONDS:
+            return {
+                "error": (
+                    f"Track is only {duration:.1f}s long - separation needs at "
+                    f"least {MIN_DURATION_SECONDS:.0f} seconds of audio."
+                )
+            }
+
+        try:
+            clean_path = _normalise_input(input_path, work_dir)
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"Could not prepare the audio for separation: {e}"}
+
         try:
             track_dir, gpu_seconds = _run_demucs_gpu(
-                input_path, work_dir, model, overlap, two_stems=(task == "separate"),
+                clean_path, work_dir, model, overlap, two_stems=(task == "separate"),
             )
         except Exception as e:
             return {"error": f"Separation failed while processing the audio: {e}"}
