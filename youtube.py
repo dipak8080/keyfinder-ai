@@ -513,6 +513,16 @@ AGE_RESTRICTED_MARKERS = (
     "sign in to confirm your age",
     "age-restricted",
     "this video may be inappropriate for some users",
+    # Generic login wall. yt-dlp emits a bare "Please sign in." for
+    # videos that require ANY logged-in viewer (age/region gate probed
+    # via certain clients). VERIFIED 2026-09-08, video k8-FLPy_e2U:
+    # production burned 9 attempts ("Failed after all attempts") because
+    # this phrasing matched no marker, while the same video downloaded
+    # first-try via cookies_2 + web_embedded in a CLI test. Distinct
+    # from the bot-check text ("sign in to confirm you're not a bot"),
+    # which never contains this phrase - and like every marker in this
+    # list, only a different account fixes it, never a different IP.
+    "please sign in",
 )
 
 # Errors meaning this video is locked behind a YouTube channel membership
