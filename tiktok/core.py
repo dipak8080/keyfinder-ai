@@ -237,6 +237,13 @@ UNAVAILABLE_MARKERS = (
     "removed",
 )
 
+# OBSERVED 2026-09-09: FFmpegExtractAudio's ffprobe found no audio
+# stream in the downloaded file. Not retryable - the same format will
+# be silent again.
+NO_AUDIO_MARKERS = (
+    "unable to obtain file audio codec",
+)
+
 # yt-dlp's own "I don't recognise this response" message. Deliberately
 # treated as RETRYABLE rather than given a specific user message: it
 # means the page shape changed under the extractor, which is sometimes
@@ -273,6 +280,11 @@ def is_unavailable_error(text: str) -> bool:
     return any(m in n for m in UNAVAILABLE_MARKERS)
 
 
+def is_no_audio_error(text: str) -> bool:
+    n = _norm(text)
+    return any(m in n for m in NO_AUDIO_MARKERS)
+
+
 def is_retryable_error(text: str) -> bool:
     """The ONLY errors that get a retry.
 
@@ -281,7 +293,8 @@ def is_retryable_error(text: str) -> bool:
     retryable direction is cheap (a few wasted seconds); being wrong in
     the other direction loses a request that would have succeeded."""
     if (is_photo_error(text) or is_age_gated_error(text)
-            or is_blocked_error(text) or is_unavailable_error(text)):
+            or is_blocked_error(text) or is_unavailable_error(text)
+            or is_no_audio_error(text)):
         return False
     n = _norm(text)
     return any(m in n for m in TRANSIENT_MARKERS)
@@ -313,6 +326,11 @@ def classify(text: str) -> Tuple[str, str]:
             "This TikTok isn't available - it may have been deleted, made "
             "private, or restricted. Try a different video."
         ))
+    if is_no_audio_error(text):
+        return ("no_audio", (
+            "This TikTok doesn't have an audio track that can be extracted, "
+            "so there's nothing to convert. Try a different video."
+        ))
     return ("unknown", (
         "Something went wrong while downloading this TikTok. Please try "
         "again, or try a different video."
@@ -325,12 +343,12 @@ def classify(text: str) -> Tuple[str, str]:
 
 def _base_opts(outtmpl: str) -> dict:
     return {
-        # TikTok serves MUXED mp4 only - there is no audio-only format
-        # to select, unlike YouTube's format 251. So the video bytes are
-        # always downloaded and ffmpeg strips the audio afterwards.
-        # 'bestaudio/best' still works because yt-dlp treats a muxed
-        # stream as satisfying bestaudio when nothing better exists.
-        "format": "bestaudio/best",
+        # TikTok labels EVERY format acodec=aac, but its HEVC (bytevc1)
+        # web streams are frequently video-only in reality, so
+        # bestaudio/best picks the highest-bitrate HEVC file and gets
+        # silence. h264 streams carry audio. yt-dlp #15642, closed as
+        # not-a-bug; the selector is the fix.
+        "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
         "outtmpl": outtmpl,
         "quiet": True,
         "noplaylist": True,
