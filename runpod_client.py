@@ -64,8 +64,18 @@ class RunPodJobError(Exception):
     from a RunPod Serverless job. Deliberately NOT tool-specific so any
     future GPU-backed tool's module can import and re-raise this the
     same way separation.py does.
+
+    worker_error: the raw error string the WORKER returned, when there is
+    one (RunPod marks a job FAILED whenever the handler returns an
+    "error" key, so worker-reported user errors like NO_NOTES_DETECTED
+    arrive as FAILED jobs, not as output dicts). Callers that keep a
+    worker-error -> user-message mapping must match against THIS, not
+    against result.get("error") - for a FAILED job there is no result.
+    None when the failure was transport-level (timeout, cancel, HTTP).
     """
-    pass
+    def __init__(self, message: str, worker_error: str | None = None):
+        super().__init__(message)
+        self.worker_error = worker_error
 
 
 _RUNPOD_API_BASE = "https://api.runpod.ai/v2"
@@ -236,7 +246,8 @@ async def poll_job(
             # Already terminal - no cancel needed, nothing is billing.
             raise RunPodJobError(
                 f"RunPod job {job_id} ended with status={status}: "
-                f"{data.get('error') or 'no error detail returned'}"
+                f"{data.get('error') or 'no error detail returned'}",
+                worker_error=data.get("error"),
             )
 
         if time.monotonic() >= deadline:

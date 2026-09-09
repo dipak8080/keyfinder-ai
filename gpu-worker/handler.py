@@ -103,49 +103,94 @@ ROFORMER_STEMS_SECOND_STAGE = "htdemucs_ft"
 # expensive part, and RunPod serverless workers handle one job at a
 # time, so a single global instance is both safe and the fast path for
 # warm requests.
+#
+# The separator writes into ONE fixed directory for the life of the
+# process, and each job MOVES its outputs into its own work_dir. The
+# obvious-looking alternative - retargeting output_dir per job - does
+# not work: the loaded model instance snapshots its config (including
+# output_dir) at load_model() time, so a mutated attribute on the
+# wrapper is silently ignored on warm reuse and files land in a
+# previous job's already-deleted directory.
 _ROFORMER = None
+ROFORMER_OUTPUT_DIR = "/worker/roformer_out"
 
 
-def _get_roformer(output_dir: str):
+def _get_roformer():
     global _ROFORMER
     from audio_separator.separator import Separator
 
     if _ROFORMER is None:
+        os.makedirs(ROFORMER_OUTPUT_DIR, exist_ok=True)
         sep = Separator(
             model_file_dir=os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "/worker/models"),
-            output_dir=output_dir,
+            output_dir=ROFORMER_OUTPUT_DIR,
             output_format="WAV",
             use_autocast=True,
         )
         sep.load_model(model_filename=ROFORMER_MODEL_FILENAME)
         _ROFORMER = sep
-    # output_dir is a plain attribute on the Separator; pointing it at the
-    # current job's work dir keeps every artifact inside the directory
-    # that the handler's finally-block already cleans up.
-    _ROFORMER.output_dir = output_dir
     return _ROFORMER
 
 
 def _run_roformer_gpu(input_path: str, work_dir: str):
     """
     Returns ({"vocals": path, "instrumental": path}, gpu_seconds).
-    custom_output_names makes the output filenames deterministic instead
-    of the package's default "<input> (Vocals) <model>.wav" pattern.
+
+    Trusts separate()'s RETURN VALUE (the fully written output paths)
+    rather than predicting filenames - stem naming varies per model
+    config, and a custom_output_names key that doesn't match a stem is
+    silently ignored, producing a default-named file instead.
     """
-    sep = _get_roformer(work_dir)
+    sep = _get_roformer()
+
+    # One job at a time per worker, so the shared dir only ever holds
+    # the current job's outputs - clear leftovers from the previous one.
+    for stale in os.listdir(ROFORMER_OUTPUT_DIR):
+        try:
+            os.remove(os.path.join(ROFORMER_OUTPUT_DIR, stale))
+        except OSError:
+            pass
+
     started = time.monotonic()
-    sep.separate(
+    # Keys are matched case-insensitively against the model config's own
+    # stem names. This checkpoint names its stems "vocals" and "other"
+    # (verified empirically); "Instrumental" is included for any future
+    # checkpoint that uses it. Unmatched keys are ignored, so covering
+    # both costs nothing and guarantees deterministic filenames either
+    # way. NEVER classify by substring: an unmatched stem falls back to
+    # a default filename that embeds the MODEL name - which for this
+    # model contains the word "vocals" - and that is exactly the bug
+    # that shipped vocals and instrumental swapped.
+    returned = sep.separate(
         input_path,
-        custom_output_names={"Vocals": "roformer_vocals", "Instrumental": "roformer_instrumental"},
+        custom_output_names={
+            "Vocals": "roformer_vocals",
+            "Instrumental": "roformer_instrumental",
+            "Other": "roformer_instrumental",
+        },
     )
     gpu_seconds = time.monotonic() - started
+
+    by_name = {}
+    for path in returned or []:
+        full = path if os.path.isabs(path) else os.path.join(ROFORMER_OUTPUT_DIR, path)
+        if os.path.exists(full):
+            by_name[os.path.basename(full)] = full
+
+    vocals_src = by_name.get("roformer_vocals.wav")
+    instrumental_src = by_name.get("roformer_instrumental.wav")
+    if not vocals_src or not instrumental_src:
+        raise RuntimeError(
+            f"RoFormer outputs missing or unrecognised - expected roformer_vocals.wav "
+            f"and roformer_instrumental.wav, got: {sorted(by_name)} (returned: {returned})"
+        )
 
     sources = {
         "vocals": os.path.join(work_dir, "roformer_vocals.wav"),
         "instrumental": os.path.join(work_dir, "roformer_instrumental.wav"),
     }
-    if not all(os.path.exists(p) for p in sources.values()):
-        raise RuntimeError("RoFormer separation completed but output files were not found.")
+    shutil.move(vocals_src, sources["vocals"])
+    shutil.move(instrumental_src, sources["instrumental"])
     return sources, gpu_seconds
 
 MAX_EXTENSION_LENGTH = 10

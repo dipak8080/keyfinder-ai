@@ -165,6 +165,16 @@ async def transcribe_to_midi(
                 PIANO_TIMEOUT_SECONDS,
             )
         except RunPodJobError as e:
+            # Worker-reported errors arrive HERE, not in the result dict:
+            # RunPod marks any job whose handler returns an "error" key as
+            # FAILED, so this except-branch is the real consumer of
+            # _WORKER_ERRORS. Mapping only result.get("error") (below)
+            # left that mapping as dead code and every user with a
+            # non-piano file was told to "try again in a moment".
+            code = (e.worker_error or "").strip()
+            if code in _WORKER_ERRORS:
+                logger.info(f"[PIANO] Worker rejected the input: {code}")
+                raise AudioToolError(_WORKER_ERRORS[code])
             logger.error(f"[PIANO] RunPod job failed: {e}")
             raise AudioToolError(_GENERIC_ERROR)
         except Exception as e:  # noqa: BLE001

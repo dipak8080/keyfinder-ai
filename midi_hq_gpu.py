@@ -375,6 +375,18 @@ async def transcribe_to_midi(
         # run_worker_job has already cancelled the remote job on every
         # give-up path, so nothing is still billing by the time this
         # runs. See runpod_client.py's hardening note 1.
+        #
+        # Worker-reported errors arrive HERE, not in the result dict:
+        # RunPod marks any job whose handler returns an "error" key as
+        # FAILED. Matching only result.get("error") left _WORKER_ERRORS
+        # dead and sent every NO_NOTES_DETECTED user a "try again"
+        # message for a deterministic input problem.
+        code = (e.worker_error or "").strip()
+        if code in _WORKER_ERRORS:
+            logger.info(f"[MIDI_HQ] Worker rejected the input: {code}")
+            raise AudioToolError(_WORKER_ERRORS[code])
+        if code in _INTERNAL_ERRORS:
+            logger.error(f"[MIDI_HQ] Worker reported an internal failure: {code}")
         logger.error(f"[MIDI_HQ] RunPod job failed: {e}")
         raise AudioToolError(_GENERIC_ERROR)
 
