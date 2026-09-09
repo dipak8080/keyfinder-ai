@@ -85,8 +85,9 @@ class TikTokError(Exception):
 
     kind = "unknown"
 
-    def __init__(self, message: str, kind: Optional[str] = None):
+    def __init__(self, message: str, kind: Optional[str] = None, debug: str = ""):
         self.message = message
+        self.debug = debug
         if kind:
             self.kind = kind
         super().__init__(message)
@@ -491,7 +492,7 @@ def extract_and_download(url: str, out_dir: str, job_id: str) -> Tuple[str, str,
                 logger.warning(
                     f"[TIKTOK] job={job_id} {kind} (not retrying): {last_error_text[:200]}"
                 )
-                raise TikTokError(message, kind=kind)
+                raise TikTokError(message, kind=kind, debug=last_error_text[:500])
 
             if attempt < MAX_ATTEMPTS:
                 backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
@@ -508,4 +509,4 @@ def extract_and_download(url: str, out_dir: str, job_id: str) -> Tuple[str, str,
                 )
 
     kind, message = classify(last_error_text)
-    raise TikTokError(message, kind=kind)
+    raise TikTokError(message, kind=kind, debug=last_error_text[:500])

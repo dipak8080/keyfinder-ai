@@ -221,6 +221,11 @@ async def tiktok_to_mp3(url: str = Form(...)):
             )
             status = _STATUS_BY_KIND.get(kind, 503)
             logger.warning(f"[TIKTOK] job={job_id} failed kind={kind}: {message}")
+            # Logged HERE, in the parent, so it lands in system_logs under
+            # this request_id. The worker subprocess has no log capture.
+            debug = result.get("debug")
+            if debug:
+                logger.warning(f"[TIKTOK] job={job_id} raw error: {debug}")
             raise _error(status, kind, message)
 
         if not os.path.exists(mp3_path):

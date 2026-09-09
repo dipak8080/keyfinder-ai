@@ -85,7 +85,8 @@ def main():
         # Already classified AND already user-facing - core.py never
         # lets raw yt-dlp text into `message`. The parent maps `kind` to
         # a status code and returns `error` verbatim.
-        result = {"ok": False, "kind": e.kind, "error": e.message}
+        result = {"ok": False, "kind": e.kind, "error": e.message,
+                  "debug": getattr(e, "debug", "")}
 
     except Exception as e:
         # Anything core.py did not anticipate. The traceback goes to the
@@ -99,6 +100,7 @@ def main():
             "kind": "crashed",
             "error": "Something went wrong while converting this TikTok. "
                      "Please try again.",
+            "debug": str(e)[:500],
         }
 
     _write(output_path, result)
