@@ -280,14 +280,32 @@ FEATURE + HARDENING (2026-09-04): SILENT ERROR VISIBILITY
        - the row itself carries error_logged/error_count out to the
          frontend for a per-row marker.
 
-     LIMIT: this captures SYNCHRONOUS failures - anything that logs the
-     error before the response returns (both examples above). A failure
-     inside a background task that outlives the response (an HQ /separate
-     job that dies minutes later) is logged after the HTTP row is already
-     written, so it won't retro-flag that row; that path is what job
-     outcome tracking is for. For a failure that only ever logs at
+     LIMIT (CLOSED by fix #27 below): originally this captured only
+     SYNCHRONOUS failures. For a failure that only ever logs at
      WARNING and never ERROR, call mark_request_errored() explicitly at
-     the point you log "... FAILED".
+     the point you log "... FAILED" - that works from background tasks
+     too now.
+
+ASYNC ERROR VISIBILITY (2026-09-09): RETROACTIVE FLAGGING
+ 27. Fix #24's documented LIMIT was, in practice, most of the failures
+     that matter: every async tool (separation, stems, sheet music, HQ
+     MIDI, transcription) submits via a POST that returns immediately -
+     its HTTP row is written with error_logged=0 - and the real work
+     fails in a background task seconds or minutes later. Observed
+     concretely: a piano sheet-music job whose GPU worker failed logged
+     a clear ERROR, yet the dashboard's Silent Errors count stayed at
+     zero and the failure was only found by manually reading the System
+     tab - the exact workflow fix #24 was built to end.
+
+     The background task inherits the submit request's request_id (the
+     contextvar is deliberately never reset), and the HTTP row stores
+     that same id - so the row IS identifiable after the fact. When
+     mark_request_errored() runs after the middleware has stamped the
+     row (tags["closed"], set at response time), it now enqueues an
+     UPDATE ... WHERE request_id = ? through the same writer queue the
+     inserts use. FIFO ordering guarantees the insert lands first; the
+     counts cache is invalidated on flag application so the Silent
+     Errors box moves within seconds of a background failure.
 
  25. HARDENING: the writer thread flushed http_rows and sys_rows under a
      SINGLE try + single commit, so one malformed row in either list
@@ -545,6 +563,26 @@ def mark_request_errored() -> None:
     tags = _job_ctx.get()
     if tags is None:
         tags = new_job_context()
+    if tags.get("closed"):
+        # FIX #27: the HTTP row for this request is ALREADY WRITTEN - the
+        # response went out and the middleware stamped error_logged from
+        # this dict at that moment. This error came from a background
+        # task that outlived the response (an async job failing after
+        # submit), which is exactly the class of failure fix #24's LIMIT
+        # note documented as invisible: every async tool's real failures
+        # (separation, stems, sheet music, HQ MIDI, transcription) fired
+        # seconds-to-minutes after their submit row said error_logged=0,
+        # so none of them could EVER appear in the Silent Errors bucket.
+        #
+        # The request_id contextvar is inherited by the background task
+        # (deliberately never reset - see RequestLoggerMiddleware), so we
+        # know exactly which row to fix. Enqueue an UPDATE through the
+        # same writer queue the inserts use: FIFO order guarantees the
+        # insert is applied before this update within and across batches.
+        req_id = _request_id_ctx.get()
+        if req_id and req_id != "-":
+            _enqueue(_FLAG, (req_id,))
+        return
     tags["errored"] = True
     tags["error_count"] = (tags.get("error_count") or 0) + 1
 
@@ -873,6 +911,9 @@ _init_db()
 
 _HTTP = 0
 _SYS = 1
+# Retroactive error flag for an already-written request_logs row (fix
+# #27) - payload is (request_id,). See mark_request_errored().
+_FLAG = 2
 
 _MAX_QUEUE = 20000      # ~20k pending rows before we start dropping
 _BATCH_MAX = 500        # rows per flush
@@ -933,6 +974,7 @@ def _writer_loop() -> None:
 
             http_rows = [r for k, r in batch if k == _HTTP]
             sys_rows = [r for k, r in batch if k == _SYS]
+            flag_rows = [r for k, r in batch if k == _FLAG]
 
             # Each table's insert is isolated (fix #25). Previously both
             # ran under one try + one commit, so a single malformed row in
@@ -967,6 +1009,28 @@ def _writer_loop() -> None:
                 except Exception:
                     _safe_rollback(conn)
                     _bump_dropped(len(sys_rows))
+            if flag_rows:
+                # Aggregated per request_id so N errors from one job are
+                # one UPDATE with the right count. Runs AFTER the HTTP
+                # insert block on purpose: a flag for a row enqueued in
+                # this same batch must see it already inserted. Invalidate
+                # the counts cache so the Silent Errors box moves within
+                # a couple of seconds of a background failure rather than
+                # whenever the next insert happens to bust it.
+                counts_per_id: dict = {}
+                for (rid,) in flag_rows:
+                    counts_per_id[rid] = counts_per_id.get(rid, 0) + 1
+                try:
+                    conn.execute("BEGIN")
+                    conn.executemany(
+                        "UPDATE request_logs SET error_logged = 1, "
+                        "error_count = error_count + ? WHERE request_id = ?",
+                        [(n, rid) for rid, n in counts_per_id.items()],
+                    )
+                    conn.commit()
+                    _invalidate_counts()
+                except Exception:
+                    _safe_rollback(conn)
         except Exception:
             # Never let the writer thread die - a dead writer would
             # silently stop all logging for the life of the container.
@@ -1081,6 +1145,14 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         tier = tags.get("tier") or "-"
         error_logged = 1 if tags.get("errored") else 0
         error_count = int(tags.get("error_count") or 0)
+
+        # From this point the HTTP row's error columns are decided - any
+        # error logged LATER (a background task the request spawned) can
+        # no longer travel through this dict. Mark the holder closed so
+        # mark_request_errored() switches to retro-flagging the already-
+        # written row by request_id instead (fix #27). The dict is shared
+        # with every task this request spawned, so they all see it.
+        tags["closed"] = True
 
         # Was "/admin/logs" only - which meant every OTHER admin call
         # (/admin/endpoints, /admin/status, /admin/clear-cache,
