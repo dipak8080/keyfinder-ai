@@ -35,6 +35,23 @@ WORKDIR /worker
 # no GPU at all; this one exists specifically because it does).
 RUN pip install --no-cache-dir demucs==4.0.1 runpod requests
 
+# audio-separator brings the MelBand RoFormer vocal model (the HQ vocal
+# path - see handler.py's _run_roformer_gpu). [gpu] pulls onnxruntime-gpu;
+# torch is NOT reinstalled (the base image's CUDA build satisfies its
+# constraint). Pinned exactly, same reasoning as demucs above.
+# NOTE: this bumps numpy to >=2. The Demucs warmup below runs AFTER this
+# install on purpose - if the numpy major bump ever breaks demucs, the
+# IMAGE BUILD fails loudly at that step instead of jobs failing at runtime.
+RUN pip install --no-cache-dir "audio-separator[gpu]==0.47.0"
+
+# Deterministic, image-baked location for RoFormer weights (the package
+# honours this env var at runtime too - see its Separator.__init__).
+# Created explicitly: audio-separator REFUSES a model_file_dir that does
+# not already exist (FileNotFoundError at Separator init) rather than
+# creating it.
+ENV AUDIO_SEPARATOR_MODEL_DIR=/worker/models
+RUN mkdir -p /worker/models
+
 # Bakes BOTH models this app actually uses (standard + HQ tier) into the
 # IMAGE, rather than letting Demucs download them lazily on a job's first
 # real request. This matters more here than it would on a normal server:
@@ -64,6 +81,21 @@ tone = os.path.join(work, 'warmup.wav'); \
 subprocess.run(['ffmpeg', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10', '-ac', '2', tone], check=True); \
 subprocess.run(['demucs', '-n', 'htdemucs', '-d', 'cpu', '-o', work, tone], check=True); \
 subprocess.run(['demucs', '-n', 'htdemucs_ft', '-d', 'cpu', '-o', work, tone], check=True); \
+"
+
+# Same bake-the-weights treatment for the RoFormer model: one CPU
+# separation of a short tone at BUILD time makes audio-separator download
+# the checkpoint + its yaml config into /worker/models, which then ships
+# inside the image layer - a cold worker never pays for the download.
+RUN python -c "\
+import subprocess, tempfile, os; \
+work = tempfile.mkdtemp(); \
+tone = os.path.join(work, 'warmup.wav'); \
+subprocess.run(['ffmpeg', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10', '-ac', '2', tone], check=True); \
+sep_mod = __import__('audio_separator.separator', fromlist=['Separator']); \
+sep = sep_mod.Separator(model_file_dir='/worker/models', output_dir=work, output_format='WAV'); \
+sep.load_model(model_filename='vocals_mel_band_roformer.ckpt'); \
+sep.separate(tone); \
 "
 
 COPY handler.py .

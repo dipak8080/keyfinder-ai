@@ -346,7 +346,12 @@ os.makedirs(SEPARATION_DIR, exist_ok=True)
 # the persistent volume) should be listed here. A model listed here but
 # NOT cached will make its first request spend several minutes
 # downloading ~1GB of weights and almost certainly blow the timeout.
-ALLOWED_SEPARATION_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s")
+# "melband_roformer" is not a Demucs model name: the GPU worker maps it
+# to the MIT-licensed MelBand RoFormer vocal model (via audio-separator),
+# with a second-stage Demucs pass for drums/bass/other on stems jobs.
+# See gpu-worker/handler.py's ROFORMER section - the weights are baked
+# into the GPU worker image, so the "already on disk" rule above holds.
+ALLOWED_SEPARATION_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s", "melband_roformer")
 
 # Which stems each model actually produces, in the order Demucs names
 # them. Used by separation.py to know which output files to expect from a
@@ -358,6 +363,7 @@ MODEL_STEM_NAMES = {
     "htdemucs": ("vocals", "drums", "bass", "other"),
     "htdemucs_ft": ("vocals", "drums", "bass", "other"),
     "htdemucs_6s": ("vocals", "drums", "bass", "other", "guitar", "piano"),
+    "melband_roformer": ("vocals", "drums", "bass", "other"),
 }
 
 # ----- STANDARD (fast) separation path -----
@@ -390,16 +396,21 @@ DEMUCS_TIMEOUT_SECONDS = int(os.environ.get("DEMUCS_TIMEOUT_SECONDS", "600"))
 MAX_SEPARATION_DURATION_SECONDS = int(os.environ.get("MAX_SEPARATION_DURATION_SECONDS", "600"))
 
 # ----- HIGH QUALITY (slow) separation path -----
-# htdemucs_ft is a "bag of 4" - four separate model instances, each
-# fine-tuned toward one stem, ensembled. It is the highest-quality model
-# Demucs ships (better SDR across every stem than plain htdemucs), and it
-# costs roughly 4x the CPU time because it's effectively 4 forward passes
-# instead of 1.
+# melband_roformer: MelBand RoFormer vocal model (Kimberley Jensen
+# weights, MIT). Vocals SDR ~12.6 on audio-separator's benchmark
+# registry vs ~10.8 for htdemucs_ft and ~9.9 for htdemucs - a bigger
+# quality jump than htdemucs -> htdemucs_ft was. On stems jobs the GPU
+# worker runs it two-stage: RoFormer strips vocals, then htdemucs_ft
+# splits the vocal-free instrumental into drums/bass/other (which also
+# cleans up THOSE stems - Demucs never has to reason about vocals).
+#
+# htdemucs_ft remains the right fallback if RoFormer ever misbehaves:
+# set SEPARATION_MODEL_HQ=htdemucs_ft in env, no code change.
 #
 # NOT htdemucs_6s: that model adds guitar/piano stems but scores WORSE on
 # the four core stems (vocals/drums/bass/other) because its capacity is
 # split six ways. It's a different feature, not a quality upgrade.
-SEPARATION_MODEL_HQ = os.environ.get("SEPARATION_MODEL_HQ", "htdemucs_ft")
+SEPARATION_MODEL_HQ = os.environ.get("SEPARATION_MODEL_HQ", "melband_roformer")
 
 # Raising overlap from Demucs' 0.25 default reduces chunk-boundary
 # artifacts on longer tracks. Cheapest quality knob available (~1.3x
@@ -434,7 +445,7 @@ SEPARATION_HQ_ENABLED = os.environ.get("SEPARATION_HQ_ENABLED", "true").lower() 
 # bad value falls back to the known-good default rather than raising: a
 # typo'd env var shouldn't take the whole API down on boot, it should
 # just mean separation runs the model we know is cached.
-for _var_name, _fallback in (("SEPARATION_MODEL", "htdemucs"), ("SEPARATION_MODEL_HQ", "htdemucs_ft")):
+for _var_name, _fallback in (("SEPARATION_MODEL", "htdemucs"), ("SEPARATION_MODEL_HQ", "melband_roformer")):
     _value = globals()[_var_name]
     if _value not in ALLOWED_SEPARATION_MODELS:
         logger.error(

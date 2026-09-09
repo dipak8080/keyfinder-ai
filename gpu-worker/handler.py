@@ -74,13 +74,79 @@ import runpod
 # config.py's ALLOWED_SEPARATION_MODELS / MODEL_STEM_NAMES whenever
 # either changes there - same deliberate-duplication pattern already
 # used elsewhere in this codebase.
-ALLOWED_SEPARATION_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s")
+ALLOWED_SEPARATION_MODELS = ("htdemucs", "htdemucs_ft", "htdemucs_6s", "melband_roformer")
 
 MODEL_STEM_NAMES = {
     "htdemucs": ("vocals", "drums", "bass", "other"),
     "htdemucs_ft": ("vocals", "drums", "bass", "other"),
     "htdemucs_6s": ("vocals", "drums", "bass", "other", "guitar", "piano"),
+    "melband_roformer": ("vocals", "drums", "bass", "other"),
 }
+
+# ---------- MelBand RoFormer (HQ vocal path) ----------
+# "melband_roformer" is not a Demucs model: it runs via audio-separator
+# using the MIT-licensed Kimberley Jensen MelBand RoFormer vocal weights
+# (vocals SDR ~12.6 on the package's own benchmark registry vs ~10.8 for
+# htdemucs_ft - the whole reason this path exists). It produces exactly
+# two sources (vocals / instrumental), so:
+#   task "separate": RoFormer output is the final answer.
+#   task "stems":    two-stage - RoFormer extracts vocals, then Demucs
+#                    splits the RoFormer INSTRUMENTAL into drums/bass/
+#                    other. Running Demucs on vocal-free audio also
+#                    cleans up its stems (the standard leaderboard
+#                    ensemble trick). Demucs' own residual "vocals" stem
+#                    from that second pass is discarded.
+ROFORMER_MODEL_FILENAME = "vocals_mel_band_roformer.ckpt"
+ROFORMER_STEMS_SECOND_STAGE = "htdemucs_ft"
+
+# Loaded once per worker process and kept warm - model init is the
+# expensive part, and RunPod serverless workers handle one job at a
+# time, so a single global instance is both safe and the fast path for
+# warm requests.
+_ROFORMER = None
+
+
+def _get_roformer(output_dir: str):
+    global _ROFORMER
+    from audio_separator.separator import Separator
+
+    if _ROFORMER is None:
+        sep = Separator(
+            model_file_dir=os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "/worker/models"),
+            output_dir=output_dir,
+            output_format="WAV",
+            use_autocast=True,
+        )
+        sep.load_model(model_filename=ROFORMER_MODEL_FILENAME)
+        _ROFORMER = sep
+    # output_dir is a plain attribute on the Separator; pointing it at the
+    # current job's work dir keeps every artifact inside the directory
+    # that the handler's finally-block already cleans up.
+    _ROFORMER.output_dir = output_dir
+    return _ROFORMER
+
+
+def _run_roformer_gpu(input_path: str, work_dir: str):
+    """
+    Returns ({"vocals": path, "instrumental": path}, gpu_seconds).
+    custom_output_names makes the output filenames deterministic instead
+    of the package's default "<input> (Vocals) <model>.wav" pattern.
+    """
+    sep = _get_roformer(work_dir)
+    started = time.monotonic()
+    sep.separate(
+        input_path,
+        custom_output_names={"Vocals": "roformer_vocals", "Instrumental": "roformer_instrumental"},
+    )
+    gpu_seconds = time.monotonic() - started
+
+    sources = {
+        "vocals": os.path.join(work_dir, "roformer_vocals.wav"),
+        "instrumental": os.path.join(work_dir, "roformer_instrumental.wav"),
+    }
+    if not all(os.path.exists(p) for p in sources.values()):
+        raise RuntimeError("RoFormer separation completed but output files were not found.")
+    return sources, gpu_seconds
 
 MAX_EXTENSION_LENGTH = 10
 
@@ -321,20 +387,37 @@ def handler(job):
             return {"error": f"Could not prepare the audio for separation: {e}"}
 
         try:
-            track_dir, gpu_seconds = _run_demucs_gpu(
-                clean_path, work_dir, model, overlap, two_stems=(task == "separate"),
-            )
+            if model == "melband_roformer":
+                roformer_sources, gpu_seconds = _run_roformer_gpu(clean_path, work_dir)
+                if task == "separate":
+                    sources = roformer_sources
+                else:
+                    # Stage 2: Demucs on the vocal-free instrumental.
+                    track_dir, demucs_seconds = _run_demucs_gpu(
+                        roformer_sources["instrumental"], work_dir,
+                        ROFORMER_STEMS_SECOND_STAGE, overlap, two_stems=False,
+                    )
+                    gpu_seconds += demucs_seconds
+                    sources = {
+                        "vocals": roformer_sources["vocals"],
+                        "drums": os.path.join(track_dir, "drums.wav"),
+                        "bass": os.path.join(track_dir, "bass.wav"),
+                        "other": os.path.join(track_dir, "other.wav"),
+                    }
+            else:
+                track_dir, gpu_seconds = _run_demucs_gpu(
+                    clean_path, work_dir, model, overlap, two_stems=(task == "separate"),
+                )
+                if task == "separate":
+                    sources = {
+                        "vocals": os.path.join(track_dir, "vocals.wav"),
+                        "instrumental": os.path.join(track_dir, "no_vocals.wav"),
+                    }
+                else:
+                    expected_stems = MODEL_STEM_NAMES[model]
+                    sources = {s: os.path.join(track_dir, f"{s}.wav") for s in expected_stems}
         except Exception as e:
             return {"error": f"Separation failed while processing the audio: {e}"}
-
-        if task == "separate":
-            sources = {
-                "vocals": os.path.join(track_dir, "vocals.wav"),
-                "instrumental": os.path.join(track_dir, "no_vocals.wav"),
-            }
-        else:
-            expected_stems = MODEL_STEM_NAMES[model]
-            sources = {s: os.path.join(track_dir, f"{s}.wav") for s in expected_stems}
 
         if not all(os.path.exists(p) for p in sources.values()):
             return {"error": "Separation completed but output files were not found."}
