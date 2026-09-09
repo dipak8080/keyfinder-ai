@@ -1652,6 +1652,11 @@ TIKTOK_MP3_BITRATE = os.environ.get("TIKTOK_MP3_BITRATE", "128k")
 TIKTOK_MAX_ATTEMPTS = int(os.environ.get("TIKTOK_MAX_ATTEMPTS", "3"))
 TIKTOK_BASE_BACKOFF_SECONDS = float(os.environ.get("TIKTOK_BASE_BACKOFF_SECONDS", "1.5"))
 
+# Browser fingerprint yt-dlp impersonates for TikTok. Needs curl-cffi
+# (requirements.txt). Accepts "chrome", "safari", "edge" or a pinned
+# form like "chrome-131" - see `yt-dlp --list-impersonate-targets`.
+TIKTOK_IMPERSONATE_TARGET = os.environ.get("TIKTOK_IMPERSONATE_TARGET", "chrome")
+
 # Far more generous than /download's 10/hour, deliberately. That limit
 # exists because a YouTube download can cost paid proxy bandwidth.
 # TikTok has no proxy tier at all (see tiktok/core.py's docstring) and

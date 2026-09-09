@@ -22,14 +22,20 @@ most important design decision in this file. Every one of those exists
 in youtube.py to solve a problem TikTok does not have, and each one is
 a thing that can break at 3am.
 
-DO NOT ADD curl_cffi. yt-dlp's TikTok extractor emits
-"attempting impersonation, but no impersonate target is available" and
-it is tempting to satisfy it. Installing curl_cffi 0.15.0 alongside
-yt-dlp 2026.07.04 BREAKS TikTok extraction completely - every URL,
-including ones that worked minutes earlier, returns "Unexpected response
-from webpage request". Confirmed 2026-08-18 by clean-container test:
-identical yt-dlp version WITHOUT curl_cffi extracted the same URL fine.
-The warning is cosmetic; extraction works without it.
+IMPERSONATION IS NOW REQUIRED (2026-09). TikTok returns a non-media
+response to un-impersonated requests; yt-dlp downloads it and ffprobe
+then fails in postprocessing with "unable to obtain file audio codec".
+The fix has TWO parts and needs BOTH: curl_cffi installed (the
+[curl-cffi] extra in requirements.txt) AND an explicit impersonate
+target set in _base_opts. Installing curl_cffi alone does NOT make
+yt-dlp use it - the target must be passed in opts. The value lives in
+config.py as TIKTOK_IMPERSONATE_TARGET; change it there if a given
+fingerprint stops working.
+
+(Historical note: an earlier revision of this file claimed curl_cffi
+BROKE TikTok. That was observed with curl_cffi present but NO explicit
+target, where yt-dlp's auto-selection misbehaved. Setting the target
+explicitly is the controlled path and is what this file now does.)
 """
 import os
 import re
@@ -38,6 +44,7 @@ import subprocess
 from typing import Optional, Tuple
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from config import (
     logger,
@@ -45,6 +52,7 @@ from config import (
     TIKTOK_MP3_BITRATE as MP3_BITRATE,
     TIKTOK_MAX_ATTEMPTS as MAX_ATTEMPTS,
     TIKTOK_BASE_BACKOFF_SECONDS as BASE_BACKOFF_SECONDS,
+    TIKTOK_IMPERSONATE_TARGET,
     FFMPEG_PATH as FFMPEG,
     FFPROBE_PATH as FFPROBE,
 )
@@ -327,6 +335,10 @@ def _base_opts(outtmpl: str) -> dict:
         "quiet": True,
         "noplaylist": True,
         "ffmpeg_location": FFMPEG,
+        # Without this TikTok serves a non-media page and ffprobe fails
+        # in postprocessing. curl_cffi must be installed (requirements.txt);
+        # if the target is unavailable yt-dlp raises at construction.
+        "impersonate": ImpersonateTarget.from_str(TIKTOK_IMPERSONATE_TARGET),
         # Same reasoning as the YouTube path: this container has no
         # usable IPv6 route (Docker does not forward it in by default),
         # so pinning to IPv4 avoids a dead path on any IPv6-only host.
