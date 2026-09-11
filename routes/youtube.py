@@ -335,6 +335,10 @@ from youtube import (
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
 from cache import get_cached_audio, put_cached_audio, get_cached_path, put_cached_file
+from youtube_source import (
+    SOURCE_CODECS, SOURCE_MAX_SECONDS,
+    probe_audio, finalize_source, cleanup_downloads,
+)
 from monitoring import record_result
 from download_progress import make_progress_hook
 from jobs import (
@@ -401,7 +405,7 @@ if not os.environ.get("DOWNLOAD_URL_SECRET"):
         "signed download links survive an admin-key rotation and a container restart."
     )
 
-_MEDIA_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav"}
+_MEDIA_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "webm": "audio/webm", "m4a": "audio/mp4"}
 
 
 def _sign_download_token(video_id: str, fmt: str, expires_at: int) -> str:
@@ -497,8 +501,16 @@ async def download_audio(
     url: str = Form(...),
     format: str = Form("mp3"),
     response: str = Form("base64"),
+    source: str = Form(""),
 ):
     """
+    `source` ("opus" or "aac", WAV + url mode only): the browser can decode
+    that codec and will build the WAV itself, so the server sends YouTube's
+    original stream (webm/m4a, ~10x smaller) instead of a WAV. The response
+    `format` says which one came back; videos over SOURCE_MAX_SECONDS, or a
+    codec mismatch, still come back as "wav". Adds `sample_rate` (and
+    `duration` when known) for the browser's decoder.
+
     `response` selects the body shape:
 
       "base64" (default) - {"title", "audio", "format"}, the original
@@ -528,6 +540,10 @@ async def download_audio(
     if response not in ("base64", "url"):
         raise HTTPException(400, "response must be 'base64' or 'url'")
 
+    source = (source or "").strip().lower()
+    if source and source not in SOURCE_CODECS:
+        raise HTTPException(400, f"source must be one of: {', '.join(SOURCE_CODECS)}")
+
     if not is_valid_youtube_url(url):
         logger.warning(f"[DOWNLOAD] Rejected - not a recognizable YouTube URL: {url}")
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
@@ -542,7 +558,27 @@ async def download_audio(
             f"from {url} - falling back to base64."
         )
 
-    if video_id:
+    use_source = want_url and format == "wav" and source in SOURCE_CODECS
+
+    if use_source:
+        src_fmt = SOURCE_CODECS[source][0]
+        src_path, src_title = await run_blocking(get_cached_path, video_id, src_fmt)
+        if src_path:
+            duration, sample_rate = await run_blocking(probe_audio, src_path)
+            logger.info(f"[CACHE] HIT '{src_title}' ({src_fmt} source) in {time.monotonic() - started:.2f}s")
+            record_result("/download", True)
+            return JSONResponse(_source_payload(video_id, src_fmt, src_title, src_path, sample_rate, duration))
+
+        # A cached WAV is only worth serving when it's too long for the browser path anyway
+        wav_path, wav_title = await run_blocking(get_cached_path, video_id, "wav")
+        if wav_path:
+            wav_duration, _ = await run_blocking(probe_audio, wav_path)
+            if wav_duration is not None and wav_duration > SOURCE_MAX_SECONDS:
+                logger.info(f"[CACHE] HIT '{wav_title}' (wav, long) in {time.monotonic() - started:.2f}s")
+                record_result("/download", True)
+                return JSONResponse(_url_payload(video_id, "wav", wav_title, _size_or_none(wav_path)))
+
+    if video_id and not use_source:
         if want_url:
             # Path-based lookup: no bytes read, nothing to encode. This is
             # the single biggest win in the change - a cache HIT on a
@@ -626,7 +662,7 @@ async def download_audio(
                 'player_client': ['android_vr', 'android', 'web'],
             },
         },
-        'postprocessors': [{
+        'postprocessors': [] if use_source else [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': format,
             'preferredquality': '192',
@@ -647,6 +683,9 @@ async def download_audio(
     # download_worker.py runs in a separate process and reconstructs its
     # own logger/hooks internally - neither survives a JSON boundary, so
     # strip them here rather than pass them across.
+    if use_source:
+        ydl_opts['format'] = SOURCE_CODECS[source][1]
+
     serializable_ydl_opts = {
         k: v for k, v in ydl_opts.items()
         if k not in ("logger", "progress_hooks")
@@ -808,6 +847,32 @@ async def download_audio(
                 "or try a different video."
             )
 
+        if use_source:
+            try:
+                final_path, final_fmt, sample_rate, duration = await run_blocking(
+                    finalize_source, temp_id, source
+                )
+            except FileNotFoundError:
+                logger.error(f"[DOWNLOAD] Expected source output missing after download: {temp_id}")
+                raise HTTPException(500, "Failed: audio file was not produced by the downloader")
+
+            pending_cleanup = final_path
+            raw_size = os.path.getsize(final_path)
+            cached_path = await run_blocking(put_cached_file, video_id, final_fmt, final_path, title)
+            if not cached_path:
+                logger.error(f"[DOWNLOAD] Could not move '{title}' ({final_fmt}) into the cache")
+                raise HTTPException(500, "Something went wrong while preparing this download. Please try again.")
+            pending_cleanup = None
+
+            logger.info(
+                f"[DOWNLOAD] COMPLETE '{title}' ({final_fmt}{' source' if final_fmt != 'wav' else ''}) "
+                f"{_mb(raw_size)} url-mode in {time.monotonic() - started:.1f}s"
+            )
+            succeeded = True
+            if final_fmt == "wav":
+                return JSONResponse(_url_payload(video_id, "wav", title, raw_size))
+            return JSONResponse(_source_payload(video_id, final_fmt, title, cached_path, sample_rate, duration, raw_size))
+
         if not os.path.exists(output_file):
             logger.error(f"[DOWNLOAD] Expected output missing after download: {output_file}")
             raise HTTPException(500, "Failed: audio file was not produced by the downloader")
@@ -877,6 +942,8 @@ async def download_audio(
     finally:
         if pending_cleanup:
             cleanup_file(pending_cleanup)
+        if use_source and not succeeded:
+            cleanup_downloads(temp_id)
         if audio_data is not None:
             del audio_data
         release_memory_to_os()
@@ -911,8 +978,8 @@ async def download_audio_file(
     already half finished. The signature and the TTL are what bound abuse
     here.
     """
-    if fmt not in ("mp3", "wav"):
-        raise HTTPException(400, "Format must be 'mp3' or 'wav'")
+    if fmt not in _MEDIA_TYPES:
+        raise HTTPException(400, "Unsupported format")
 
     if disposition not in ("attachment", "inline"):
         raise HTTPException(400, "disposition must be 'attachment' or 'inline'")
@@ -991,6 +1058,30 @@ async def download_audio_file(
         # already have with a valid token.
         content_disposition_type=disposition,
     )
+
+
+def _size_or_none(path: str) -> Optional[int]:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _source_payload(
+    video_id: str,
+    fmt: str,
+    title: Optional[str],
+    path: str,
+    sample_rate: Optional[int],
+    duration: Optional[float],
+    size_bytes: Optional[int] = None,
+) -> dict:
+    payload = _url_payload(video_id, fmt, title, size_bytes if size_bytes is not None else _size_or_none(path))
+    if sample_rate:
+        payload["sample_rate"] = sample_rate
+    if duration:
+        payload["duration"] = round(duration, 2)
+    return payload
 
 
 def _read_file_bytes(path: str) -> bytes:
