@@ -122,6 +122,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import cookie_health
+from youtube import reset_account_state
 from config import (
     logger,
     YT_COOKIES_PATH_DEFAULT,
@@ -432,6 +433,7 @@ async def upload_cookies(
     # this is belt-and-braces - but doing it explicitly means the very
     # next status poll is correct rather than merely self-correcting.
     cookie_health.clear(path)
+    reset_account_state(path)
 
     # Parsed immediately and returned with the upload response, so a
     # logged-out or already-expired export is caught at upload time

@@ -339,10 +339,23 @@ CLIENT_LADDER_NO_COOKIES = (
     ['visionos'],
     ['android_vr', 'android'],
 )
+# 2026-09-11 (M5YZm8chnrs, MZm-vC9CBe4, NYyiXUS8NMc, all non-embeddable):
+# web_embedded says unavailable, and the old next rung (cookieless tv_simply)
+# was bot-checked from the VPS IP, so every such song went to the proxy with
+# its audio IP-bound to the exit (direct media 403 for tv_simply and visionos).
+# mweb and web WITH cookies downloaded all three direct. tv/tv_downgraded:
+# page reload error.
 CLIENT_LADDER_WITH_COOKIES = (
     ['web_embedded'],
+    ['mweb'],
+    ['web'],
     ['tv_simply'],
     ['visionos'],
+)
+# The paid tier keeps its verified pair (canary proxy leg tests exactly these).
+CLIENT_LADDER_PROXY_WITH_COOKIES = (
+    ['web_embedded'],
+    ['tv_simply'],
 )
 
 # Clients yt-dlp skips when a cookiefile is attached. A rung made only of
@@ -350,12 +363,14 @@ CLIENT_LADDER_WITH_COOKIES = (
 _COOKIELESS_CLIENTS = frozenset({'tv_simply', 'visionos', 'android_vr', 'android'})
 
 
-def _client_ladder(has_cookies: bool):
-    return CLIENT_LADDER_WITH_COOKIES if has_cookies else CLIENT_LADDER_NO_COOKIES
+def _client_ladder(has_cookies: bool, proxy: bool = False):
+    if not has_cookies:
+        return CLIENT_LADDER_NO_COOKIES
+    return CLIENT_LADDER_PROXY_WITH_COOKIES if proxy else CLIENT_LADDER_WITH_COOKIES
 
 
-def _ladder_len(has_cookies: bool) -> int:
-    return len(_client_ladder(has_cookies))
+def _ladder_len(has_cookies: bool, proxy: bool = False) -> int:
+    return len(_client_ladder(has_cookies, proxy))
 
 
 class _TryNextClientSet(Exception):
@@ -368,7 +383,7 @@ class _TryNextClientSet(Exception):
         super().__init__(str(original))
 
 
-def _apply_player_clients(opts: dict, has_cookies: bool, rung: int = 0) -> dict:
+def _apply_player_clients(opts: dict, has_cookies: bool, rung: int = 0, proxy: bool = False) -> dict:
     """
     Overrides extractor_args.youtube.player_client on `opts` based on
     whether THIS specific attempt has a cookiefile attached, returning
@@ -378,7 +393,7 @@ def _apply_player_clients(opts: dict, has_cookies: bool, rung: int = 0) -> dict:
     audio formats) in favor of clients that actually work with cookies
     attached.
     """
-    ladder = _client_ladder(has_cookies)
+    ladder = _client_ladder(has_cookies, proxy)
     clients = list(ladder[min(rung, len(ladder) - 1)])
     extractor_args = dict(opts.get('extractor_args') or {})
     youtube_args = dict(extractor_args.get('youtube') or {})
@@ -1814,6 +1829,19 @@ def _disable_cookie_account(path: str):
     )
 
 
+def reset_account_state(path: str):
+    """A replaced cookie file is a new session. Counters, cooldown and the
+    alert window belonged to the old bytes."""
+    with _account_health_lock:
+        _account_health.pop(path, None)
+    with _cookie_accounts_lock:
+        _cookie_account_disabled_until.pop(path, None)
+    with _cookie_alert_lock:
+        _cookie_warning_events.pop(path, None)
+        _cookie_alert_last_sent.pop(path, None)
+    logger.info(f"[COOKIES] Counters and cooldown reset for replaced file {path}")
+
+
 def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
     """
     Phase 2 of a split-tunnel request: turn an already-extracted info
@@ -1910,6 +1938,7 @@ def extract_info_with_retry(
     url: str,
     media_opts: Optional[dict] = None,
     max_client_rungs: Optional[int] = None,
+    proxy: bool = False,
 ):
     """
     Walks the client ladder, running the full backoff-retry cycle at each
@@ -1929,13 +1958,13 @@ def extract_info_with_retry(
     existed.
     """
     has_cookies = bool(ydl_opts.get("cookiefile"))
-    total = _ladder_len(has_cookies)
+    total = _ladder_len(has_cookies, proxy)
     limit = total if max_client_rungs is None else max(1, min(max_client_rungs, total))
 
     for rung in range(limit):
-        rung_opts = _apply_player_clients(dict(ydl_opts), has_cookies, rung)
+        rung_opts = _apply_player_clients(dict(ydl_opts), has_cookies, rung, proxy)
         rung_media = (
-            _apply_player_clients(dict(media_opts), has_cookies, rung)
+            _apply_player_clients(dict(media_opts), has_cookies, rung, proxy)
             if media_opts is not None else None
         )
         try:
@@ -2358,7 +2387,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 proxied_opts["cookiefile"] = proxy_account
             else:
                 proxied_opts.pop("cookiefile", None)
-            proxied_opts = _apply_player_clients(proxied_opts, has_cookies=bool(proxy_account))
+            proxied_opts = _apply_player_clients(proxied_opts, has_cookies=bool(proxy_account), proxy=True)
 
             _reset_cookie_flag()
             _set_active_account(proxy_account)
@@ -2381,7 +2410,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # Capped: each rung here is a PAID extraction, unlike
                 # the free direct path which walks the whole ladder.
                 result = extract_info_with_retry(
-                    proxied_opts, url, media_opts, max_client_rungs=2
+                    proxied_opts, url, media_opts, max_client_rungs=2, proxy=True
                 )
                 logger.info(f"[PROXY] Proxy attempt succeeded ({reason}).")
                 record_account_result(proxy_account, True, "proxy")
