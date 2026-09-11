@@ -15,6 +15,8 @@ import os
 import time
 import uuid
 
+from jobs import new_routed_id
+
 from config import (
     logger,
     RUNPOD_API_KEY,
@@ -143,7 +145,7 @@ async def transcribe_to_midi(
                 raise AudioToolError("Piano isolation produced no piano stem for this file.")
 
         # ---------- ship to the worker ----------
-        token = uuid.uuid4().hex
+        token = new_routed_id()
         suffix = os.path.splitext(source_path)[1] or ".wav"
         payload = {
             "vps_base_url": VPS_PUBLIC_BASE_URL,

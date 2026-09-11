@@ -63,15 +63,10 @@ yt-dlp[default,curl-cffi]==2026.8.19
 # Must match the git clone tag in the Dockerfile. Needs Node >= 22.
 bgutil-ytdlp-pot-provider==2.0.0
 
-# ---------- SEPARATION (Demucs) ----------
-# CPU-only torch build - the default `pip install torch` often pulls a
-# CUDA build (~2GB+) with GPU libraries this VPS (no GPU) will never use.
-# Installing from PyTorch's dedicated CPU wheel index avoids that entirely
-# - meaningfully smaller download, faster install, less disk usage.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu
-torchaudio==2.5.1+cpu
-demucs==4.0.1
+# ---------- SEPARATION ----------
+# Removed 2026-09-11: torch, torchaudio, demucs. Every separation path
+# (separate, stems, MIDI stems, piano isolation) runs on the RunPod GPU
+# worker via separation.py; nothing on the VPS imported them.
 
 # ---------- SPEECH TO TEXT (faster-whisper) ----------
 # Pinned like everything else in this file. Two reasons beyond general

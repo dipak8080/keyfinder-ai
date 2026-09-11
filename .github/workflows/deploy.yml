@@ -5,6 +5,12 @@ on:
     branches:
       - main
 
+# Two pushes used to run two deploys at once on the same VPS, racing on
+# the build and the container swap. Queue them instead, never cancel.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -65,7 +71,11 @@ jobs:
 
             WHISPER_MODEL_SIZE=$(_read_env WHISPER_MODEL_SIZE small)
             WHISPER_COMPUTE_TYPE=$(_read_env WHISPER_COMPUTE_TYPE int8)
-            echo "Whisper build args: model=$WHISPER_MODEL_SIZE compute_type=$WHISPER_COMPUTE_TYPE"
+            # The local model is only loaded with TRANSCRIPTION_BACKEND=local,
+            # so only then is it worth baking into the image (~480MB).
+            TRANSCRIPTION_BACKEND=$(_read_env TRANSCRIPTION_BACKEND local | tr 'A-Z' 'a-z')
+            if [ "$TRANSCRIPTION_BACKEND" = gpu ]; then BAKE_WHISPER_MODEL=0; else BAKE_WHISPER_MODEL=1; fi
+            echo "Whisper build args: model=$WHISPER_MODEL_SIZE compute_type=$WHISPER_COMPUTE_TYPE bake=$BAKE_WHISPER_MODEL (backend=$TRANSCRIPTION_BACKEND)"
 
             # ============================================================
             # MIDI-WORKER (isolated sidecar) - built and deployed FIRST,
@@ -81,6 +91,14 @@ jobs:
             # loudly and falls through, rather than tripping `set -e` and
             # aborting the whole deploy.
             # ============================================================
+            # Skip entirely when midi-worker/ is unchanged since the last
+            # healthy deploy: no rebuild, and no /audio-to-midi downtime.
+            MIDI_TREE=$(git rev-parse HEAD:midi-worker 2>/dev/null || echo none)
+            MIDI_STAMP=/home/deploy/app/data/.midi_worker_tree
+            if [ "$MIDI_TREE" = "$(cat "$MIDI_STAMP" 2>/dev/null)" ] \
+               && [ "$(docker inspect -f '{{.State.Running}}' midi-worker 2>/dev/null)" = "true" ]; then
+              echo "midi-worker unchanged and running - skipping rebuild."
+            else
             echo "Building midi-worker..."
             if docker build -t midi-worker:latest ./midi-worker; then
               docker stop midi-worker 2>/dev/null || true
@@ -99,6 +117,7 @@ jobs:
                 sleep 10
                 if docker exec midi-worker python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)" 2>/dev/null; then
                   echo "midi-worker health check passed."
+                  echo "$MIDI_TREE" > "$MIDI_STAMP"
                   MIDI_HEALTHY=true
                   break
                 fi
@@ -113,119 +132,139 @@ jobs:
             else
               echo "WARNING: midi-worker image failed to build. /audio-to-midi will be unavailable until this is fixed manually. Continuing with main app deploy."
             fi
-
-            # ============================================================
-            # MAIN APP - unchanged logic below, this is the deploy that
-            # actually gates success/failure and rollback for this workflow.
-            # ============================================================
-
-            # Tag current container as rollback point (safe – won't abort if it fails)
-            if docker inspect audioforges-api > /dev/null 2>&1; then
-              if docker commit audioforges-api audioforges-api:rollback; then
-                echo "Tagged current container as rollback point."
-              else
-                echo "Could not commit existing container (layers missing?) – removing it and continuing."
-                docker rm -f audioforges-api || true
-              fi
-            else
-              echo "No existing container found - skipping rollback tag."
             fi
 
-            # Build latest image. The Whisper build args make the baked
-            # model match .env - see the block above for why this matters.
+            # ============================================================
+            # MAIN APP - BLUE/GREEN (2026-09-11)
+            #
+            # Two slots behind nginx: a = 127.0.0.1:8000, b = 127.0.0.1:8002.
+            # The new image starts on the idle slot, is health-checked, then
+            # nginx switches with a graceful reload via af-switch (the one
+            # sudo rule the deploy user has). The old container keeps serving
+            # its own jobs - job ids carry the slot letter and nginx routes
+            # them back to it - and deploy/drain_old.sh stops it once idle.
+            #
+            # A failed health check only removes the new container. The old
+            # one never stopped, so there is nothing to roll back and users
+            # never see an outage.
+            # ============================================================
+            ACTIVE=$(grep -o 'af_slot_[ab]' /etc/nginx/conf.d/audioforges-active.conf 2>/dev/null | head -1 | cut -d_ -f3)
+            ACTIVE=${ACTIVE:-a}
+            if [ "$ACTIVE" = a ]; then ACTIVE_PORT=8000; NEW=b; NEW_PORT=8002; else ACTIVE_PORT=8002; NEW=a; NEW_PORT=8000; fi
+            echo "Active slot: $ACTIVE (port $ACTIVE_PORT). Deploying to slot $NEW (port $NEW_PORT)."
+
+            LIVE_PORT=$(docker port audioforges-api 8000/tcp 2>/dev/null | head -1 | awk -F: '{print $NF}')
+            if [ -n "$LIVE_PORT" ] && [ "$LIVE_PORT" != "$ACTIVE_PORT" ]; then
+              echo "ABORT: audioforges-api is on port $LIVE_PORT but nginx says slot $ACTIVE ($ACTIVE_PORT)."
+              echo "Was it restarted by hand? Fix with: sudo af-switch <slot matching port $LIVE_PORT>. Site untouched."
+              exit 1
+            fi
+
+            # A container still draining from the previous deploy sits on the
+            # slot we are about to use. Give its jobs up to 10 minutes.
+            if docker inspect audioforges-api-old >/dev/null 2>&1; then
+              echo "Previous slot still draining - waiting up to 10 min for its jobs..."
+              for i in $(seq 1 40); do
+                docker inspect audioforges-api-old >/dev/null 2>&1 || break
+                n=$(curl -s -m 5 "http://127.0.0.1:$NEW_PORT/internal/drain-status" \
+                    | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("processing", 0)))' 2>/dev/null || echo 0)
+                [ "$n" -eq 0 ] && break
+                sleep 15
+              done
+              docker rm -f audioforges-api-old >/dev/null 2>&1 || true
+            fi
+            docker rm -f audioforges-api-next >/dev/null 2>&1 || true
+
+            # Built while the live container keeps serving.
             docker build \
               --build-arg WHISPER_MODEL_SIZE="$WHISPER_MODEL_SIZE" \
               --build-arg WHISPER_COMPUTE_TYPE="$WHISPER_COMPUTE_TYPE" \
+              --build-arg BAKE_WHISPER_MODEL="$BAKE_WHISPER_MODEL" \
               -t audioforges-api:latest .
 
-            # Replace existing container
-            docker stop audioforges-api || true
-            docker rm audioforges-api || true
+            # Two containers must fit under the shared Docker memory cap
+            # (~5.7 GiB on this LXC). Wait for headroom rather than risk the
+            # OOM killer taking the live container.
+            to_mib() { awk '{v=$1; u=$1; gsub(/[0-9.]/,"",u); gsub(/[A-Za-z]/,"",v); if(u=="GiB")v*=1024; else if(u=="KiB")v/=1024; else if(u=="B")v/=1048576; s+=v} END{printf "%d", s}'; }
+            LIMIT_MIB=$(docker stats --no-stream --format '{{.MemUsage}}' audioforges-api 2>/dev/null | awk '{print $3}' | to_mib)
+            if [ "${LIMIT_MIB:-0}" -gt 0 ]; then
+              for i in $(seq 1 20); do
+                USED_MIB=$(docker stats --no-stream --format '{{.MemUsage}}' | to_mib)
+                [ $((LIMIT_MIB - USED_MIB)) -ge 1536 ] && break
+                echo "Memory tight (${USED_MIB}/${LIMIT_MIB} MiB) - waiting for headroom ($i/20)..."
+                sleep 15
+              done
+              if [ $((LIMIT_MIB - USED_MIB)) -lt 1536 ]; then
+                echo "ABORT: not enough memory for a second container. Site untouched - re-run this deploy when load drops."
+                exit 1
+              fi
+            fi
 
-            # Start new container - now on audioforges-net so it can reach
-            # midi-worker by container name.
-            #
-            # PORT BINDING (2026-08-17): published on 127.0.0.1 ONLY, never
-            # 0.0.0.0. Docker writes its port publishing rules into iptables'
-            # nat table, which is evaluated BEFORE ufw's INPUT filter - so a
-            # plain "-p 8000:8000" is reachable from the public internet even
-            # though ufw only allows 443/80 from Cloudflare ranges. That made
-            # http://<vps-ip>:8000 a full bypass of Cloudflare: no WAF rules,
-            # no rate limiting, no TLS, straight to the app. Binding to the
-            # loopback address means only host-local processes can reach it,
-            # which is exactly nginx (proxy_pass http://127.0.0.1:8000) and
-            # the health checks below. If this ever reverts to "8000:8000",
-            # the entire edge perimeter becomes decorative.
+            # PORT BINDING (2026-08-17): 127.0.0.1 ONLY, never 0.0.0.0.
+            # Docker's NAT rules run before ufw, so a plain "-p 8000:8000"
+            # is reachable from the internet and bypasses Cloudflare.
             docker run -d \
-              --name audioforges-api \
+              --name audioforges-api-next \
               --restart unless-stopped \
               --network audioforges-net \
               --env-file .env \
               -e PORT=8000 \
+              -e INSTANCE_SLOT="$NEW" \
               -v /home/deploy/app/data:/app/data \
-              -p 127.0.0.1:8000:8000 \
+              -p 127.0.0.1:$NEW_PORT:8000 \
               audioforges-api:latest
 
-            # Wait longer + retry health check (model loading is slow)
-            echo "Waiting for new container to become healthy..."
-            for i in 1 2 3 4 5 6; do
+            echo "Waiting for the new container to become healthy..."
+            HEALTHY=false
+            for i in 1 2 3 4 5 6 7 8 9; do
               sleep 10
-              if curl -sf http://localhost:8000/health > /dev/null; then
-                echo "Health check passed - deploy successful."
-
-                # ----------------------------------------------------
-                # TRANSCRIPTION CHECK - non-fatal by design, same
-                # philosophy as midi-worker above. speech_to_text.py
-                # deliberately survives a failed model load so one bad
-                # download degrades ONE endpoint instead of taking the
-                # whole app down. The cost of that choice is that /health
-                # stays green while /speech-to-text returns 503, so the
-                # failure is otherwise invisible until a user hits it.
-                # Surface it in the deploy log instead.
-                # ----------------------------------------------------
-                if docker logs audioforges-api 2>&1 | grep -q "FAILED to load Whisper model"; then
-                  echo "WARNING: Whisper model failed to load - /speech-to-text will return 503."
-                  echo "         Every other tool is unaffected. Relevant logs:"
-                  docker logs audioforges-api 2>&1 | grep -A5 "FAILED to load Whisper model" | tail -20 || true
-                else
-                  docker logs audioforges-api 2>&1 | grep -E "Whisper model loaded successfully|VAD filter|language codes from faster_whisper" | tail -5 || true
-                fi
-
-                docker image prune -f
-                docker builder prune -af
-                echo "Cleaned up old images and build cache."
-                exit 0
+              if curl -sf "http://127.0.0.1:$NEW_PORT/health" > /dev/null; then
+                HEALTHY=true
+                break
               fi
               echo "Health check attempt $i failed, retrying..."
             done
 
-            # Still unhealthy → rollback
-            echo "Health check FAILED after retries. Logs from the failed container:"
-            docker logs audioforges-api --tail 100
+            if [ "$HEALTHY" = false ]; then
+              echo "Health check FAILED. Logs from the new container:"
+              docker logs audioforges-api-next --tail 100 || true
+              docker rm -f audioforges-api-next || true
+              echo "New container removed. Users stayed on slot $ACTIVE the whole time."
+              exit 1
+            fi
+            echo "Health check passed."
 
-            if docker inspect audioforges-api:rollback > /dev/null 2>&1; then
-              echo "Rolling back to previous image..."
-              docker stop audioforges-api || true
-              docker rm audioforges-api || true
-
-              docker run -d \
-                --name audioforges-api \
-                --restart unless-stopped \
-                --network audioforges-net \
-                --env-file .env \
-                -e PORT=8000 \
-                -v /home/deploy/app/data:/app/data \
-                -p 127.0.0.1:8000:8000 \
-                audioforges-api:rollback
-
-              sleep 15
-              if curl -sf http://localhost:8000/health > /dev/null; then
-                echo "Rollback successful - previous version is running again."
-              else
-                echo "ROLLBACK ALSO FAILED - site is likely down. Manual intervention needed."
-              fi
+            # Whisper survives a failed model load by design, so /health
+            # stays green while /speech-to-text returns 503. Surface it here.
+            if docker logs audioforges-api-next 2>&1 | grep -q "FAILED to load Whisper model"; then
+              echo "WARNING: Whisper model failed to load - /speech-to-text will return 503."
+              docker logs audioforges-api-next 2>&1 | grep -A5 "FAILED to load Whisper model" | tail -20 || true
             else
-              echo "No rollback image available - site is likely down. Manual intervention needed."
+              docker logs audioforges-api-next 2>&1 | grep -E "Whisper model loaded successfully|VAD filter|language codes from faster_whisper" | tail -5 || true
             fi
 
-            exit 1
+            if ! sudo -n /usr/local/sbin/af-switch "$NEW"; then
+              docker rm -f audioforges-api-next || true
+              echo "ABORT: nginx switch failed. New container removed, site stays on slot $ACTIVE."
+              exit 1
+            fi
+
+            # The live container is always named audioforges-api, so the
+            # canary, cheatsheet and handoff commands keep working.
+            OLD_ID=$(docker inspect -f '{{.Id}}' audioforges-api 2>/dev/null || true)
+            if [ -n "$OLD_ID" ]; then
+              docker rename audioforges-api audioforges-api-old
+            fi
+            docker rename audioforges-api-next audioforges-api
+
+            if [ -n "$OLD_ID" ]; then
+              DRAIN=/tmp/af-drain-${OLD_ID:0:12}.sh
+              cp deploy/drain_old.sh "$DRAIN"
+              setsid nohup bash "$DRAIN" "$OLD_ID" "$ACTIVE_PORT" >> /home/deploy/app/data/drain.log 2>&1 < /dev/null &
+              echo "Old container draining in the background (data/drain.log)."
+            fi
+
+            docker image prune -f
+            docker builder prune -af
+            echo "Deploy successful - live on slot $NEW."
+            exit 0

@@ -71,6 +71,8 @@ import os
 import time
 import uuid
 
+from jobs import new_routed_id
+
 from config import (
     logger,
     RUNPOD_API_KEY,
@@ -335,7 +337,7 @@ async def transcribe_to_midi(
     # speech_to_text_gpu's reasoning: a transfer token is a handle, not
     # an identity, and an unguessable one stays safe even if a job id
     # leaks into a log or a URL somewhere.
-    token = uuid.uuid4().hex
+    token = new_routed_id()
     suffix = os.path.splitext(input_path)[1] or ".wav"
 
     payload = {

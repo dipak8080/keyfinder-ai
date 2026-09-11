@@ -50,25 +50,28 @@ RUN git clone --single-branch --branch 2.0.0 \
 
 WORKDIR /app
 
-# ---------- WHISPER MODEL (baked at build time) ----------
-# MUST match the WHISPER_MODEL_SIZE / WHISPER_COMPUTE_TYPE the container
-# is RUN with. These were previously hardcoded to 'small'/'int8' here
-# while being env-configurable at runtime - a silent trap: changing
-# WHISPER_MODEL_SIZE in .env left the image holding the wrong weights,
-# so the container downloaded the real model at STARTUP instead. That
-# download routinely exceeds the deploy health-check window, which then
-# looks like a failed deploy and triggers an automatic rollback for what
-# is really just a slow first boot.
+# ---------- WHISPER MODEL ----------
+# Baked only when transcription runs locally. deploy.yml passes
+# BAKE_WHISPER_MODEL=0 when .env has TRANSCRIPTION_BACKEND=gpu, where the
+# local model is never loaded and baking it only cost ~480MB and build
+# time. Flip .env to local and redeploy to get it back.
 #
-# Passed from the deploy workflow, which reads the values straight out of
-# .env so the two can't drift. See .github/workflows/deploy.yml.
+# When baked, it MUST match the WHISPER_MODEL_SIZE / WHISPER_COMPUTE_TYPE
+# the container runs with: a missing model downloads at STARTUP, which
+# blows past the deploy health-check window. deploy.yml reads both from
+# .env so they can't drift.
 ARG WHISPER_MODEL_SIZE=small
 ARG WHISPER_COMPUTE_TYPE=int8
+ARG BAKE_WHISPER_MODEL=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
-    echo "Baking Whisper model '${WHISPER_MODEL_SIZE}' (compute_type=${WHISPER_COMPUTE_TYPE})..." && \
-    python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL_SIZE}', device='cpu', compute_type='${WHISPER_COMPUTE_TYPE}')" && \
+    if [ "$BAKE_WHISPER_MODEL" = "1" ]; then \
+      echo "Baking Whisper model '${WHISPER_MODEL_SIZE}' (compute_type=${WHISPER_COMPUTE_TYPE})..." && \
+      python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL_SIZE}', device='cpu', compute_type='${WHISPER_COMPUTE_TYPE}')"; \
+    else \
+      echo "Skipping Whisper model bake (GPU transcription backend)."; \
+    fi && \
     python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__, '- VAD filter available')"
 
 COPY . .

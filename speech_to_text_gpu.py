@@ -60,6 +60,8 @@ import asyncio
 import os
 import uuid
 
+from jobs import new_routed_id
+
 from config import (
     logger,
     RUNPOD_API_KEY,
@@ -159,7 +161,7 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
     # A fresh handle per job. Registered immediately before submit and
     # removed in the finally below, so the input URL is live for exactly
     # as long as one job runs and not a second longer.
-    token = uuid.uuid4().hex
+    token = new_routed_id()
     suffix = os.path.splitext(input_path)[1] or ".wav"
 
     payload = {

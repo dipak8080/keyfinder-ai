@@ -193,6 +193,24 @@ TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe", "video_transcribe
 MIDI_HQ_JOB_TYPES = ("audio_to_midi_hq",)
 
 
+# Blue-green deploy slot ("a"/"b", set by deploy.yml). Prefixing ids with
+# it lets nginx send a job's follow-up requests to the container that owns
+# the job while the previous slot drains (/etc/nginx/conf.d/audioforges-slots.conf).
+_INSTANCE_SLOT = os.environ.get("INSTANCE_SLOT", "")
+if _INSTANCE_SLOT not in ("a", "b"):
+    _INSTANCE_SLOT = ""
+
+
+def new_routed_id() -> str:
+    """uuid4 hex, prefixed with this container's deploy slot. Use for any
+    id that appears in a URL path and is only known to this process."""
+    return _INSTANCE_SLOT + uuid.uuid4().hex
+
+
+def instance_slot() -> str:
+    return _INSTANCE_SLOT
+
+
 def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) -> str:
     """
     Creates a new job entry and returns its id.
@@ -215,7 +233,7 @@ def create_job(job_type: str = "separation", ttl_seconds: Optional[int] = None) 
             else AUDIO_TOOL_JOB_TTL_SECONDS
         )
 
-    job_id = uuid.uuid4().hex
+    job_id = new_routed_id()
     with _lock:
         _jobs[job_id] = {
             "status": "processing",

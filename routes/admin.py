@@ -267,7 +267,7 @@ from youtube import (
 )
 from cache import clear_cache, set_cache_max_gb, get_cache_stats
 from monitoring import get_status_snapshot
-from jobs import get_job_stats
+from jobs import get_job_stats, count_processing, instance_slot
 from admin_auth import guard_admin_request, verify_admin_key
 from log_stream import get_endpoint_counts, get_tool_counts
 
@@ -1226,6 +1226,15 @@ async def limits():
 @router.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@router.get("/internal/drain-status")
+async def drain_status(request: Request):
+    """Read by deploy/drain_old.sh on the host. Anything that came through
+    nginx carries X-Forwarded-For, so public requests get a 404."""
+    if request.headers.get("x-forwarded-for"):
+        raise HTTPException(status_code=404)
+    return {"processing": count_processing(), "slot": instance_slot()}
 
 
 @router.get("/")
