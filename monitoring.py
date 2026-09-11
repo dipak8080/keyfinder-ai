@@ -13,8 +13,10 @@ multiple replicas, each instance tracks its own failures
 independently (not a combined view) - fine for now, worth revisiting if you
 scale horizontally later.
 """
+import sys
 import time
 import threading
+from typing import Optional
 import requests
 
 from config import (
@@ -74,13 +76,29 @@ def alert_now(message: str):
         logger.warning(f"[monitoring] alert_now failed (non-fatal): {e}")
 
 
+def _client_side_status(exc) -> Optional[int]:
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) and 400 <= code < 500 else None
+
+
 def record_result(endpoint: str, success: bool):
     """
     Call this once per request, right where you already know whether it
     succeeded or failed. Cheap, non-blocking, and wrapped so it can NEVER
     raise or break the real request it's being called from.
+
+    A 4xx on its way out (removed video, too long, age-gated, bad input)
+    is the user's or the video's outcome, not a server failure, so it never
+    counts toward the alert. Read from the in-flight exception, which every
+    caller's `finally` already has, so no route needs changing. 2026-09-11:
+    two removed videos and five over-length requests paged Discord.
     """
     try:
+        if not success:
+            code = _client_side_status(sys.exc_info()[1])
+            if code is not None:
+                logger.debug(f"[monitoring] {endpoint} ended {code} (client side, not counted)")
+                success = True
         now = time.time()
         with _lock:
             _events.setdefault(endpoint, []).append((now, success))
