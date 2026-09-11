@@ -71,7 +71,7 @@ from config import (
 )
 from utils import run_blocking, acquire_slot_or_503, _transcription_semaphore
 from jobs import create_job, mark_transcription_complete, mark_failed, fail_if_unfinished, get_job
-from monitoring import record_result
+from monitoring import record_result, is_client_side
 from audio_common import AudioToolError, validate_duration
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 from youtube import is_valid_youtube_url
@@ -152,6 +152,8 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
 
     file_path, title = downloaded
     succeeded = False
+    client_side = False
+    failure = None
     acquired = False
     started = time.monotonic()
 
@@ -167,13 +169,18 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         except AudioToolError as e:
             mark_failed(job_id, str(e))
             logger.warning(f"[{TOOL}] job={job_id} rejected on duration: {e}")
-            record_result(METRIC, False)
+            client_side = is_client_side(e)
+            failure = str(e)
+            # record_result runs once, in the finally below (this path
+            # returns through it); a second call here double-counted.
             # Charged at submit with the duration unknown, rejected here
             # once it was known - the credit goes straight back. Handled
             # inside this except rather than left to the `finally` below
             # because this path returns early.
             settle_or_refund(job_id, False, reason="too_long_for_transcription")
-            metering.record_job_finished(job_id, status="failed", error="duration_exceeded")
+            metering.record_job_finished(
+                job_id, status="failed", error=failure, client_side=client_side
+            )
             return
 
         # The real input duration, finally available. Without this the
@@ -220,6 +227,8 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
     except AudioToolError as e:
         # Expected, user-actionable: no speech detected, unreadable file,
         # model unavailable. Message is already written for the end user.
+        failure = str(e)
+        client_side = is_client_side(e)
         mark_failed(job_id, str(e))
         logger.warning(f"[{TOOL}] job={job_id} FAILED in {time.monotonic() - started:.1f}s: {e}")
 
@@ -228,15 +237,18 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         # background task there is no HTTP layer to catch this, so it must
         # be handled here or it escapes the task and strands the job.
         detail = e.detail if isinstance(e.detail, str) else "The server was too busy."
+        failure = detail
         mark_failed(job_id, detail)
         logger.warning(f"[{TOOL}] job={job_id} rejected: {detail}")
 
     except asyncio.CancelledError:
+        failure = "cancelled: server restarted while this job was running"
         mark_failed(job_id, "The server restarted while this job was running.")
         logger.warning(f"[{TOOL}] job={job_id} CANCELLED (shutdown)")
         raise
 
     except Exception as e:
+        failure = f"{type(e).__name__}: {e}"[:500]
         mark_failed(job_id, "Transcription failed unexpectedly.")
         logger.error(f"[{TOOL}] job={job_id} FAILED (unexpected): {e}", exc_info=True)
 
@@ -248,7 +260,8 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         # credit back in that instant rather than 90 minutes later.
         settle_or_refund(job_id, succeeded, reason="youtube_transcribe_failed")
         metering.record_job_finished(
-            job_id, status="completed" if succeeded else "failed"
+            job_id, status="completed" if succeeded else "failed",
+            error=None if succeeded else failure, client_side=client_side,
         )
 
         fail_if_unfinished(job_id, "Transcription failed unexpectedly.")
@@ -261,7 +274,7 @@ async def _run_youtube_transcribe(job_id: str, url: str, language, task, mode):
         release_memory_to_os()
         if acquired:
             _transcription_semaphore.release()
-        record_result(METRIC, succeeded)
+        record_result(METRIC, succeeded, client_side=client_side)
 
 
 @router.post(

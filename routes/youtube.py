@@ -1167,7 +1167,12 @@ async def _chain_download(job_id: str, url: str, tool: str, metric: str) -> Opti
     except ChainDownloadError as e:
         mark_failed(job_id, str(e))
         logger.warning(f"[{tool}] job={job_id} download FAILED: {e}")
-        record_result(metric, False)
+        record_result(metric, False, client_side=e.client_side)
+        # First failure write wins, so the caller's later generic close
+        # keeps this classification. A no-op for unmetered tools.
+        metering.record_job_finished(
+            job_id, status="failed", error=str(e), client_side=e.client_side
+        )
         return None
 
     except HTTPException as e:

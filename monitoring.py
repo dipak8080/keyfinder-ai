@@ -76,12 +76,20 @@ def alert_now(message: str):
         logger.warning(f"[monitoring] alert_now failed (non-fatal): {e}")
 
 
-def _client_side_status(exc) -> Optional[int]:
+def is_client_side(exc) -> bool:
+    """One definition of "the user's or the video's outcome, not ours",
+    shared by alerts and job metering. True for exceptions that say so
+    (client_side = True: InputRejected, SeparationRejected, rejected
+    downloads) and for any 4xx HTTPException."""
+    if exc is None:
+        return False
+    if getattr(exc, "client_side", False) is True:
+        return True
     code = getattr(exc, "status_code", None)
-    return code if isinstance(code, int) and 400 <= code < 500 else None
+    return isinstance(code, int) and 400 <= code < 500
 
 
-def record_result(endpoint: str, success: bool):
+def record_result(endpoint: str, success: bool, client_side: bool = False):
     """
     Call this once per request, right where you already know whether it
     succeeded or failed. Cheap, non-blocking, and wrapped so it can NEVER
@@ -92,13 +100,13 @@ def record_result(endpoint: str, success: bool):
     counts toward the alert. Read from the in-flight exception, which every
     caller's `finally` already has, so no route needs changing. 2026-09-11:
     two removed videos and five over-length requests paged Discord.
+    Job runners catch their exceptions before this runs, so they pass
+    client_side explicitly.
     """
     try:
-        if not success:
-            code = _client_side_status(sys.exc_info()[1])
-            if code is not None:
-                logger.debug(f"[monitoring] {endpoint} ended {code} (client side, not counted)")
-                success = True
+        if not success and (client_side or is_client_side(sys.exc_info()[1])):
+            logger.debug(f"[monitoring] {endpoint} ended client side, not counted")
+            success = True
         now = time.time()
         with _lock:
             _events.setdefault(endpoint, []).append((now, success))

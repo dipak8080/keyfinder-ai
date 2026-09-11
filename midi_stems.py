@@ -17,7 +17,7 @@ import numpy as np
 import pretty_midi
 import soundfile as sf
 
-from audio_common import AudioToolError
+from audio_common import AudioToolError, InputRejected
 from separation import run_stem_separation, SeparationError
 from utils import run_blocking, cleanup_file
 from audio_to_midi import convert_to_midi, convert_guitar_to_midi
@@ -163,7 +163,7 @@ def _merge(results: list, output_path: str, bpm: float,
             tracks.append(_track_stats(track, stem))
 
     if not merged.instruments:
-        raise AudioToolError(
+        raise InputRejected(
             "No notes were detected in any instrument. Try a clip with clearer melodic content."
         )
 
@@ -226,7 +226,7 @@ async def transcribe_stems(
                 active.append(stem)
 
         if not active:
-            raise AudioToolError("This track appears to be silent or drums-only.")
+            raise InputRejected("This track appears to be silent or drums-only.")
 
         results = await asyncio.gather(*[
             _run_stem(stem, stem_paths[stem], jid, tmp_dir, min_pitch, max_pitch, min_note_ms)

@@ -47,7 +47,7 @@ from config import (
     TRANSCRIPTION_MODE_BEAM_SIZES,
     DEFAULT_TRANSCRIPTION_MODE,
 )
-from audio_common import AudioToolError
+from audio_common import AudioToolError, InputRejected
 
 
 # ========== SUPPORTED LANGUAGES ==========
@@ -340,7 +340,7 @@ def transcribe(input_path: str, language: str = None, task: str = "transcribe",
                 f"after {time.monotonic() - started:.1f}s "
                 f"(duration={getattr(info, 'duration', 0):.1f}s, vad={_vad_enabled})"
             )
-            raise AudioToolError(
+            raise InputRejected(
                 "No speech was detected in this file. It may be silent, "
                 "music-only, or too quiet to pick up."
             )

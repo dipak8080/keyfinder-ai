@@ -24,7 +24,7 @@ from config import (
     VPS_PUBLIC_BASE_URL,
 )
 import config as _config
-from audio_common import AudioToolError
+from audio_common import AudioToolError, InputRejected
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 from separation import run_stem_separation, SeparationError
@@ -66,6 +66,13 @@ _INTERNAL_ERRORS = {
     "INPUT_FETCH_FAILED",
 }
 
+_INPUT_ERRORS = {"INPUT_TOO_LONG", "EMPTY_INPUT", "NO_NOTES_DETECTED"}
+
+
+def _worker_error(code: str) -> AudioToolError:
+    cls = InputRejected if code in _INPUT_ERRORS else AudioToolError
+    return cls(_WORKER_ERRORS[code])
+
 _GENERIC_ERROR = "Piano transcription failed. Please try again in a moment."
 
 
@@ -97,7 +104,7 @@ def _validate_local_input(input_path: str) -> None:
     if not os.path.exists(input_path):
         raise AudioToolError("The uploaded file could not be found. Please try again.")
     if os.path.getsize(input_path) == 0:
-        raise AudioToolError("That file is empty. Please upload a valid audio file.")
+        raise InputRejected("That file is empty. Please upload a valid audio file.")
 
 
 async def transcribe_to_midi(
@@ -176,7 +183,7 @@ async def transcribe_to_midi(
             code = (e.worker_error or "").strip()
             if code in _WORKER_ERRORS:
                 logger.info(f"[PIANO] Worker rejected the input: {code}")
-                raise AudioToolError(_WORKER_ERRORS[code])
+                raise _worker_error(code)
             logger.error(f"[PIANO] RunPod job failed: {e}")
             raise AudioToolError(_GENERIC_ERROR)
         except Exception as e:  # noqa: BLE001
@@ -199,7 +206,7 @@ async def transcribe_to_midi(
             if message is None:
                 logger.warning(f"[PIANO] Unmapped worker error code: {error}")
                 raise AudioToolError(_GENERIC_ERROR)
-            raise AudioToolError(message)
+            raise _worker_error(error)
 
         # ---------- decode + write MIDI ----------
         midi_b64 = result.get("midi_b64") if isinstance(result, dict) else None

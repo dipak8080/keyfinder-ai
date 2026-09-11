@@ -157,8 +157,16 @@ def record_job_finished(
     runpod_job_id: str | None = None,
     gpu_type: str | None = None,
     error: str | None = None,
+    client_side: bool = False,
 ) -> None:
     """Close the row with the outcome and the worker's reported time.
+
+    failure_side says whose failure it was: 'client' (the input or the
+    video can't be processed) or 'server' (ours). NULL on success. The
+    first failure write wins for both failure_side and error, so an early
+    precise record (separation rejecting a long track, a chained download
+    naming the removed video) is never overwritten by a later generic
+    close of the same job.
 
     Idempotent by way of being a plain UPDATE - calling it twice writes
     the same values twice, which is harmless. COALESCE on every optional
@@ -170,6 +178,7 @@ def record_job_finished(
     if normalised not in TERMINAL:
         normalised = "completed" if normalised == "success" else "failed"
 
+    side = None if normalised == "completed" else ("client" if client_side else "server")
     est_cost = (
         round(gpu_seconds * settings.runpod_usd_per_gpu_second, 6)
         if gpu_seconds else None
@@ -178,7 +187,9 @@ def record_job_finished(
         with connect() as conn, tx(conn):
             conn.execute(
                 """UPDATE gpu_job_metrics
-                   SET status=?, ended_at=?, error=?,
+                   SET status=?, ended_at=?, error=COALESCE(error, ?),
+                       failure_side=CASE WHEN ? IS NULL THEN NULL
+                                         ELSE COALESCE(failure_side, ?) END,
                        gpu_seconds=COALESCE(?, gpu_seconds),
                        queue_seconds=COALESCE(?, queue_seconds),
                        wall_seconds=COALESCE(?, wall_seconds),
@@ -186,7 +197,7 @@ def record_job_finished(
                        gpu_type=COALESCE(?, gpu_type),
                        est_cost_usd=COALESCE(?, est_cost_usd)
                    WHERE job_id=?""",
-                (normalised, now_iso(), error, gpu_seconds, queue_seconds, wall_seconds,
+                (normalised, now_iso(), error, side, side, gpu_seconds, queue_seconds, wall_seconds,
                  runpod_job_id, gpu_type, est_cost, job_id),
             )
     except Exception:  # noqa: BLE001
@@ -239,7 +250,12 @@ def totals(days: int = 30) -> dict:
                       -- Reporting those as zero failures would hide the
                       -- single worst line item in the cost report.
                       SUM(CASE WHEN status IN ('failed','timeout','cancelled')
+                                AND COALESCE(failure_side,'server') = 'server'
                                THEN 1 ELSE 0 END)                   AS failed_jobs,
+                      -- The input's outcome (too long, no notes, removed
+                      -- video): counted, never mixed into failed_jobs.
+                      SUM(CASE WHEN failure_side = 'client'
+                               THEN 1 ELSE 0 END)                   AS rejected_jobs,
                       ROUND(SUM(CASE WHEN status IN ('failed','timeout','cancelled')
                                THEN COALESCE(est_cost_usd,0) ELSE 0 END), 4) AS wasted_usd
                FROM gpu_job_metrics

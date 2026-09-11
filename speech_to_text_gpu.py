@@ -74,7 +74,7 @@ from config import (
     TRANSCRIPTION_MODE_BEAM_SIZES,
     DEFAULT_TRANSCRIPTION_MODE,
 )
-from audio_common import AudioToolError
+from audio_common import AudioToolError, InputRejected
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 
@@ -226,7 +226,7 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
             # Translated back into the SAME message the local backend
             # produces - a user must not be able to tell which backend
             # ran from the wording of an error.
-            raise AudioToolError(
+            raise InputRejected(
                 "No speech was detected in this file. It may be silent, "
                 "music-only, or too quiet to pick up."
             )

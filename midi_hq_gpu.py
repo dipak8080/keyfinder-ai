@@ -82,7 +82,7 @@ from config import (
     MIDI_HQ_TIMEOUT_SECONDS,
     MAX_MIDI_HQ_DURATION_SECONDS,
 )
-from audio_common import AudioToolError, atomic_write_bytes
+from audio_common import AudioToolError, InputRejected, atomic_write_bytes
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 from utils import run_blocking, cleanup_file
@@ -156,6 +156,15 @@ _INTERNAL_ERRORS = {
     "INPUT_FETCH_FAILED",
 }
 
+# The input's problem, not ours. MODEL_NOT_LOADED is in _WORKER_ERRORS for
+# its wording but is a server failure, so it is deliberately absent here.
+_INPUT_ERRORS = {"INPUT_TOO_LONG", "EMPTY_INPUT", "NO_NOTES_DETECTED", "NO_NOTES_AFTER_FILTER"}
+
+
+def _worker_error(code: str) -> AudioToolError:
+    cls = InputRejected if code in _INPUT_ERRORS else AudioToolError
+    return cls(_WORKER_ERRORS[code])
+
 _GENERIC_ERROR = (
     "High-quality MIDI transcription failed. Please try again in a moment."
 )
@@ -205,7 +214,7 @@ def _validate_local_input(input_path: str) -> None:
     if not os.path.exists(input_path):
         raise AudioToolError("The uploaded file could not be found. Please try again.")
     if os.path.getsize(input_path) == 0:
-        raise AudioToolError("That file is empty. Please upload a valid audio file.")
+        raise InputRejected("That file is empty. Please upload a valid audio file.")
 
 
 async def _transcribe_guitar(
@@ -303,7 +312,7 @@ async def transcribe_to_midi(
 
     instrument = (instrument or "auto").lower()
     if instrument not in INSTRUMENTS:
-        raise AudioToolError(f"Unknown instrument '{instrument}'.")
+        raise InputRejected(f"Unknown instrument '{instrument}'.")
 
     if instrument == "guitar":
         return await _transcribe_guitar(
@@ -386,7 +395,7 @@ async def transcribe_to_midi(
         code = (e.worker_error or "").strip()
         if code in _WORKER_ERRORS:
             logger.info(f"[MIDI_HQ] Worker rejected the input: {code}")
-            raise AudioToolError(_WORKER_ERRORS[code])
+            raise _worker_error(code)
         if code in _INTERNAL_ERRORS:
             logger.error(f"[MIDI_HQ] Worker reported an internal failure: {code}")
         logger.error(f"[MIDI_HQ] RunPod job failed: {e}")
@@ -424,7 +433,7 @@ async def transcribe_to_midi(
             # about, and the user got a message that told them nothing.
             logger.warning(f"[MIDI_HQ] Unmapped worker error code: {error}")
             raise AudioToolError(_GENERIC_ERROR)
-        raise AudioToolError(message)
+        raise _worker_error(error)
 
     # ---------- write the MIDI ----------
     midi_b64 = result.get("midi_b64") if isinstance(result, dict) else None

@@ -64,8 +64,27 @@ from cache import get_cached_audio, put_cached_audio
 class ChainDownloadError(Exception):
     """Raised when the download half of a chained /youtube/* tool fails,
     with an already-user-facing message. Caller passes str(e) straight
-    to jobs.mark_failed() - no further translation needed."""
-    pass
+    to jobs.mark_failed() - no further translation needed.
+
+    client_side marks the video's outcome (removed, private, region or
+    age locked, members-only, not live yet, too long) as opposed to ours
+    (bot-check, timeouts, crashes), for alerts and job metering."""
+    def __init__(self, message: str, client_side: bool = False):
+        super().__init__(message)
+        self.client_side = client_side
+
+
+def download_error_is_client_side(error_text: str) -> bool:
+    """The categories classify_download_error() words as the video's own
+    restriction. Bot-checks and CDN errors are ours and never match."""
+    return (
+        is_permanent_error(error_text)
+        or is_geo_restricted_error(error_text)
+        or is_age_restricted_error(error_text)
+        or is_members_only_error(error_text)
+        or is_not_yet_live_error(error_text)
+        or is_music_premium_error(error_text)
+    )
 
 
 def classify_download_error(error_text: str) -> str:
@@ -242,7 +261,7 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     if result["ok"]:
         title = result["title"]
     elif result["kind"] == "too_long":
-        raise ChainDownloadError(result["error"])
+        raise ChainDownloadError(result["error"], client_side=True)
     elif result["kind"] == "timeout":
         raise ChainDownloadError("This download is taking too long. Please try again.")
     elif result["kind"] == "crashed":
@@ -251,7 +270,10 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
             "Something went wrong while downloading this video. Please try again."
         )
     else:
-        raise ChainDownloadError(classify_download_error(result["error"]))
+        raise ChainDownloadError(
+            classify_download_error(result["error"]),
+            client_side=download_error_is_client_side(result["error"]),
+        )
 
     if not os.path.exists(output_file):
         logger.error(f"[YOUTUBE_CHAIN] Job {job_id}: expected output file not found after download: {output_file}")

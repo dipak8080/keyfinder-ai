@@ -158,6 +158,12 @@ class SeparationError(Exception):
     pass
 
 
+class SeparationRejected(SeparationError):
+    """The track itself can't be separated (over the length limit). A
+    rejection, not a server failure; see audio_common.InputRejected."""
+    client_side = True
+
+
 def get_audio_duration_seconds(file_path: str) -> float:
     """
     Uses ffprobe to read a file's duration WITHOUT decoding the audio.
@@ -218,8 +224,8 @@ async def _run_demucs_on_gpu(
             f"Track is {int(duration // 60)} min long, which exceeds the "
             f"{max_duration_seconds // 60} min limit for separation."
         )
-        metering.record_job_finished(job_id, status="failed", error=message)
-        raise SeparationError(message)
+        metering.record_job_finished(job_id, status="failed", error=message, client_side=True)
+        raise SeparationRejected(message)
 
     if not RUNPOD_API_KEY or not RUNPOD_DEMUCS_ENDPOINT_ID:
         message = (

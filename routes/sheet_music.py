@@ -37,7 +37,7 @@ from jobs import (
     get_job,
     count_processing,
 )
-from audio_common import build_output_path, AudioToolError
+from audio_common import build_output_path, AudioToolError, InputRejected
 from utils import cleanup_file
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
@@ -70,7 +70,7 @@ async def _run_sheet_job_user_errors(**kwargs):
     try:
         return await run_sheet_job(**kwargs)
     except EmptyTranscriptionError as e:
-        raise AudioToolError(NO_NOTES_MESSAGE) from e
+        raise InputRejected(NO_NOTES_MESSAGE) from e
 
 
 router = APIRouter()

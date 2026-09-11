@@ -40,6 +40,16 @@ class AudioToolError(Exception):
     pass
 
 
+class InputRejected(AudioToolError):
+    """The input itself can't be processed: too long, empty, unreadable,
+    no notes, no speech. Shown to the user exactly like AudioToolError,
+    but recorded as a rejection, not a failure, so it never pages Discord
+    or inflates failure rates. Only use it when the outcome is certain to
+    be the input's; anything ambiguous stays AudioToolError (a server
+    failure), so a real problem is never hidden."""
+    client_side = True
+
+
 # ========== STARTUP INVARIANT ==========
 # Uploads and outputs MUST live in different directories. If they don't,
 # every tool that preserves the file extension (volume, trim, pitch,
@@ -89,7 +99,7 @@ def validate_input_format(filename: str) -> str:
     """
     ext = get_extension(filename)
     if ext not in ALLOWED_AUDIO_INPUT_FORMATS:
-        raise AudioToolError(
+        raise InputRejected(
             f"Unsupported file type '.{ext}'. Supported formats: "
             f"{', '.join(sorted(ALLOWED_AUDIO_INPUT_FORMATS))}."
         )
@@ -106,7 +116,7 @@ def validate_conversion_pair(source_format: str, target_format: str, conversion_
     """
     allowed_targets = conversion_matrix.get(source_format)
     if not allowed_targets or target_format not in allowed_targets:
-        raise AudioToolError(
+        raise InputRejected(
             f"Conversion from '.{source_format}' to '.{target_format}' is not supported."
         )
 
@@ -144,7 +154,7 @@ def probe_duration_seconds(file_path: str) -> float:
 
     if result.returncode != 0 or not result.stdout.strip():
         logger.warning(f"[AUDIO_TOOLS] ffprobe failed on {file_path}: {result.stderr.strip()}")
-        raise AudioToolError("Could not read this file as valid audio. It may be corrupt or an unsupported format.")
+        raise InputRejected("Could not read this file as valid audio. It may be corrupt or an unsupported format.")
 
     try:
         return float(result.stdout.strip())
@@ -158,7 +168,7 @@ def validate_duration(file_path: str, max_seconds: int = MAX_AUDIO_TOOL_DURATION
     instead of probing twice)."""
     duration = probe_duration_seconds(file_path)
     if duration > max_seconds:
-        raise AudioToolError(
+        raise InputRejected(
             f"Audio is too long ({duration / 60:.1f} min). "
             f"Maximum allowed is {max_seconds / 60:.0f} min."
         )

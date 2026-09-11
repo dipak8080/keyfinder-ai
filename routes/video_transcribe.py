@@ -91,7 +91,7 @@ from jobs import (
     fail_if_unfinished,
     get_job,
 )
-from monitoring import record_result
+from monitoring import record_result, is_client_side
 from audio_common import AudioToolError
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
@@ -216,6 +216,8 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
     """
     audio_path = os.path.join(UPLOAD_DIR, f"{job_id}_extracted.{target_format}")
     succeeded = False
+    client_side = False
+    failure = None
     started = time.monotonic()
     holding = None   # which semaphore, if any, is currently held
 
@@ -277,6 +279,8 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
         # Expected and user-actionable: no speech detected, extraction
         # failed, unreadable container. Message is already written for
         # the end user.
+        failure = str(e)
+        client_side = is_client_side(e)
         mark_failed(job_id, str(e))
         logger.warning(f"[{TOOL}] job={job_id} FAILED in {time.monotonic() - started:.1f}s: {e}")
 
@@ -286,15 +290,18 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
         # must be handled here or it escapes and strands the job at
         # "processing" forever.
         detail = e.detail if isinstance(e.detail, str) else "The server was too busy."
+        failure = detail
         mark_failed(job_id, detail)
         logger.warning(f"[{TOOL}] job={job_id} rejected: {detail}")
 
     except asyncio.CancelledError:
+        failure = "cancelled: server restarted while this job was running"
         mark_failed(job_id, "The server restarted while this job was running.")
         logger.warning(f"[{TOOL}] job={job_id} CANCELLED (shutdown)")
         raise
 
     except Exception as e:
+        failure = f"{type(e).__name__}: {e}"[:500]
         mark_failed(job_id, "Transcription failed unexpectedly.")
         logger.error(f"[{TOOL}] job={job_id} FAILED (unexpected): {e}", exc_info=True)
 
@@ -320,7 +327,8 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
         # real latency but not the GPU-seconds figure that belongs in a
         # cost comparison.
         metering.record_job_finished(
-            job_id, status="completed" if succeeded else "failed"
+            job_id, status="completed" if succeeded else "failed",
+            error=None if succeeded else failure, client_side=client_side,
         )
 
         # Only ever one semaphore is held at a time, and `holding` tracks
@@ -336,7 +344,7 @@ async def _run_video_transcribe(job_id, video_path, original_filename,
             cleanup_file(video_path)
         cleanup_file(audio_path)
         release_memory_to_os()
-        record_result(METRIC, succeeded)
+        record_result(METRIC, succeeded, client_side=client_side)
 
 
 @router.post(

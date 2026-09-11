@@ -235,7 +235,7 @@ from audio_common import (
     build_output_path,
     assert_distinct_paths,
 )
-from monitoring import record_result
+from monitoring import record_result, is_client_side
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
 # Credits. Self-contained and inert while PAYWALL_ENABLED is unset -
@@ -448,6 +448,7 @@ async def _run_tool_job(
             logger.info(f"[{tool}] job={job_id} waited {waited:.1f}s for a free slot")
 
         run_started = time.monotonic()
+        client_side = False
         try:
             result = await work()
             on_success(result)
@@ -469,6 +470,7 @@ async def _run_tool_job(
             # for the person who uploaded the file, so it passes through
             # to them unchanged.
             failure = str(e)
+            client_side = is_client_side(e)
             mark_failed(job_id, str(e))
             logger.warning(
                 f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
@@ -476,6 +478,7 @@ async def _run_tool_job(
 
         except SeparationError as e:
             failure = str(e)
+            client_side = is_client_side(e)
             mark_failed(job_id, str(e))
             logger.warning(
                 f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
@@ -545,13 +548,14 @@ async def _run_tool_job(
                     job_id,
                     status="completed" if succeeded else "failed",
                     error=None if succeeded else (failure or generic_error),
+                    client_side=client_side,
                 )
 
             fail_if_unfinished(job_id, generic_error)
             for path in cleanup_paths:
                 cleanup_file(path)
             release_memory_to_os()
-            record_result(metric, succeeded)
+            record_result(metric, succeeded, client_side=client_side)
             if gpu_billed:
                 # RESERVED, currently unused by any caller (both
                 # separation call sites pass gpu_billed=False - the
