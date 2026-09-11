@@ -170,10 +170,10 @@ BPM_DISAGREEMENT_CONFIDENCE_PENALTY = 0.80
 # limits explicitly via partial(); this makes /analyze match, which
 # matters more than the number itself.
 #
-# 10 per 5 minutes is still generous for the real workflow (drop a
-# track, read its key, drop the next) while ending the case where one IP
-# can hold most of the analysis pool indefinitely.
-ANALYZE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ANALYZE_RATE_LIMIT_MAX_REQUESTS", "10"))
+# 30 per 5 minutes (was 10) so a 20-file batch from the key finder's
+# batch mode fits. The batch queue sends one file at a time, so one IP
+# still holds at most one MAX_CONCURRENT_ANALYSIS slot.
+ANALYZE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("ANALYZE_RATE_LIMIT_MAX_REQUESTS", "30"))
 ANALYZE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
 # ---------- CONCURRENCY / LOAD-SHEDDING CONFIG ----------
