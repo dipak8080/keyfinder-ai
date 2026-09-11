@@ -45,7 +45,10 @@ it is structural, not a bug:
   when yt-dlp itself emits a "cookies are no longer valid" warning while
   running a download. That requires the account to actually be USED.
 
-  Slots 2 and 3 are standby failover, not rotation - download_with_fallback
+  (Since 2026-09-11 downloads rotate across healthy accounts, see
+  youtube.plan_account_order, so every slot now gets used. The history
+  below explains why the expiry read exists.)
+  Slots 2 and 3 were standby failover, not rotation - download_with_fallback
   only advances to the next account on account-identity errors
   (age-gate, members-only, format-unavailable). On a bot-check or
   IP-block it stops rotating and escalates to proxy, because a different

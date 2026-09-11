@@ -264,6 +264,9 @@ from youtube import (
     get_cookie_accounts,
     split_breaker_status,
     reset_split_breaker,
+    anon_status,
+    client_health_status,
+    PROXY_MAX_DURATION_SECONDS,
 )
 from cache import clear_cache, set_cache_max_gb, get_cache_stats
 from monitoring import get_status_snapshot
@@ -797,6 +800,9 @@ async def admin_status(request: Request, key: str = Query(...)):
     # downloads. That last one is why this block exists - a silent revert
     # is otherwise indistinguishable from "the savings stopped".
     snapshot["split_tunnel"] = split_breaker_status()
+    snapshot["anon"] = anon_status()
+    snapshot["clients"] = client_health_status()
+    snapshot["proxy"]["max_duration_seconds"] = PROXY_MAX_DURATION_SECONDS
     snapshot["cookies"] = {
         "accounts_available": len(get_cookie_accounts()),
         # Per-account detail, including WHICH phase each account last

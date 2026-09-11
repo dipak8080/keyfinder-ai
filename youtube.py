@@ -57,6 +57,24 @@ class VideoTooLongError(Exception):
             f"{limit_seconds // 60} min limit."
         )
 
+
+class ProxyTooLongError(VideoTooLongError):
+    """Only the paid path is capped: its audio is IP-bound to the proxy exit,
+    so a long track costs as much as ten songs (2026-09-11 CSV: two 30 MB
+    tracks were 27% of the day)."""
+    def __init__(self, duration_seconds: int, limit_seconds: int):
+        self.duration_seconds = duration_seconds
+        self.limit_seconds = limit_seconds
+        Exception.__init__(
+            self,
+            f"This video is {duration_seconds // 60} min long. Right now only videos "
+            f"up to {limit_seconds // 60} min can be downloaded. Try a shorter one, "
+            f"or try this one again later."
+        )
+
+
+PROXY_MAX_DURATION_SECONDS = int(os.environ.get("YT_PROXY_MAX_DURATION_SECONDS", "900"))
+
 # ============================================================
 # PLAYER CLIENT SELECTION (ADDED 2026-08-12)
 #
@@ -309,6 +327,119 @@ def reset_split_breaker():
     logger.info("[SPLIT] Health breaker manually reset.")
 
 
+# NO-COOKIE SKIP (2026-09-11). While the VPS IP is bot-checked for
+# no-cookie requests (canary: direct=BOTCHECKED all day), every download
+# wasted ~3 s and one more bot-check signal on it. After a bot-check the
+# attempt is skipped for ANON_SKIP_SECONDS; the first download after that
+# probes it again, so the free path comes back by itself.
+ANON_SKIP_SECONDS = int(os.environ.get("YT_ANON_SKIP_SECONDS", "600"))
+_anon_lock = threading.Lock()
+_anon_skip_until = 0.0
+
+
+def record_anon_result(botchecked: bool):
+    _record_event("anon_result", botchecked=botchecked)
+    global _anon_skip_until
+    with _anon_lock:
+        _anon_skip_until = time.time() + ANON_SKIP_SECONDS if botchecked else 0.0
+
+
+def anon_skipped() -> bool:
+    with _anon_lock:
+        return time.time() < _anon_skip_until
+
+
+def anon_status() -> dict:
+    with _anon_lock:
+        left = max(0, int(_anon_skip_until - time.time()))
+    return {
+        "state": "skipped (VPS IP bot-checked)" if left else "trying",
+        "seconds_until_probe": left,
+    }
+
+
+# CLIENT AUTO-REPAIR (2026-09-11). A rung with only client-fixable failures
+# (format unavailable, media 403, JS challenge, embed-only unavailable) and
+# zero successes over the window moves to the end of its ladder for a while,
+# then gets its normal place back. Bot-checks are never counted: they are
+# IP/session problems, not client problems. The worker freezes the parent's
+# plan for the whole request so rungs never reshuffle mid-walk.
+CLIENT_DEMOTE_FAILURES = 10
+CLIENT_HEALTH_WINDOW_SECONDS = 30 * 60
+CLIENT_DEMOTE_SECONDS = 30 * 60
+CLIENT_ALERT_COOLDOWN_SECONDS = 3 * 60 * 60
+_client_lock = threading.Lock()
+_client_events: dict = {}          # key -> [(ts, ok)]
+_client_demoted_until: dict = {}   # key -> ts
+_client_alert_last: dict = {}      # key -> ts
+_client_demoted_frozen = None      # worker-side snapshot
+
+
+def _client_key(has_cookies: bool, clients) -> str:
+    return ("ck:" if has_cookies else "anon:") + "+".join(clients)
+
+
+def record_client_result(key: str, ok: bool):
+    _record_event("client_result", key=key, ok=ok)
+    if _record_events_enabled:
+        return
+    now = time.time()
+    message = None
+    with _client_lock:
+        events = _client_events.setdefault(key, [])
+        events.append((now, ok))
+        cutoff = now - CLIENT_HEALTH_WINDOW_SECONDS
+        while events and events[0][0] < cutoff:
+            events.pop(0)
+        del events[:-100]
+        if ok:
+            if _client_demoted_until.pop(key, None):
+                logger.info(f"[CLIENT] {key} succeeded again - back in its normal ladder position.")
+        else:
+            fails = sum(1 for _, o in events if not o)
+            wins = len(events) - fails
+            if wins == 0 and fails >= CLIENT_DEMOTE_FAILURES and _client_demoted_until.get(key, 0) < now:
+                _client_demoted_until[key] = now + CLIENT_DEMOTE_SECONDS
+                events.clear()
+                if now - _client_alert_last.get(key, 0) > CLIENT_ALERT_COOLDOWN_SECONDS:
+                    _client_alert_last[key] = now
+                    message = (
+                        f"[CLIENT] {key} failed {fails} times in a row with no success in "
+                        f"{CLIENT_HEALTH_WINDOW_SECONDS // 60} min. Moved to the end of its "
+                        f"ladder for {CLIENT_DEMOTE_SECONDS // 60} min; downloads keep going on "
+                        f"the other clients. YouTube likely changed this client: check for a "
+                        f"newer yt-dlp release."
+                    )
+    if message:
+        logger.warning(message)
+        alert_now(message)
+
+
+def _active_client_demotions() -> set:
+    if _client_demoted_frozen is not None:
+        return _client_demoted_frozen
+    now = time.time()
+    with _client_lock:
+        return {k for k, t in _client_demoted_until.items() if t > now}
+
+
+def client_health_status() -> dict:
+    now = time.time()
+    out = {}
+    with _client_lock:
+        for key, events in _client_events.items():
+            recent = [o for ts, o in events if ts >= now - CLIENT_HEALTH_WINDOW_SECONDS]
+            out[key] = {
+                "successes": sum(recent),
+                "failures": len(recent) - sum(recent),
+                "demoted_for_seconds": max(0, int(_client_demoted_until.get(key, 0) - now)),
+            }
+        for key, until in _client_demoted_until.items():
+            if key not in out and until > now:
+                out[key] = {"successes": 0, "failures": 0, "demoted_for_seconds": int(until - now)}
+    return out
+
+
 # CLIENT LADDER (added 2026-08-18).
 #
 # WHY NARROW SETS, ONE AT A TIME: yt-dlp queries EVERY client in a
@@ -365,8 +496,13 @@ _COOKIELESS_CLIENTS = frozenset({'tv_simply', 'visionos', 'android_vr', 'android
 
 def _client_ladder(has_cookies: bool, proxy: bool = False):
     if not has_cookies:
-        return CLIENT_LADDER_NO_COOKIES
-    return CLIENT_LADDER_PROXY_WITH_COOKIES if proxy else CLIENT_LADDER_WITH_COOKIES
+        base = CLIENT_LADDER_NO_COOKIES
+    else:
+        base = CLIENT_LADDER_PROXY_WITH_COOKIES if proxy else CLIENT_LADDER_WITH_COOKIES
+    demoted = _active_client_demotions()
+    if not demoted:
+        return base
+    return tuple(sorted(base, key=lambda r: _client_key(has_cookies, r) in demoted))
 
 
 def _ladder_len(has_cookies: bool, proxy: bool = False) -> int:
@@ -1365,6 +1501,59 @@ def reset_proxy_botcheck_breaker():
 _account_health_lock = threading.Lock()
 _account_health: dict = {}
 
+# ACCOUNT SPREAD (2026-09-11). Downloads rotate across healthy accounts so
+# no single session carries all the volume. Health = bot-checks vs successes
+# over the last window; an account under the floor is tried last, not
+# disabled (see the 2026-08-08 mass-disable incident). It gets a fresh
+# chance once its bad results age out of the window, or on a new upload.
+# The parent plans the order per download; the worker only follows it.
+ACCOUNT_HEALTH_WINDOW_SECONDS = int(os.environ.get("YT_ACCOUNT_HEALTH_WINDOW", str(2 * 60 * 60)))
+ACCOUNT_HEALTH_MIN_SAMPLES = 5
+ACCOUNT_DEMOTE_BELOW = 50.0
+_account_recent: dict = {}   # path -> [(ts, ok)], account-shaped outcomes only
+_account_rr = 0
+_account_order: list = []
+
+
+def _push_recent(path: str, ok: bool, now: float):
+    events = _account_recent.setdefault(path, [])
+    events.append((now, ok))
+    cutoff = now - ACCOUNT_HEALTH_WINDOW_SECONDS
+    while events and events[0][0] < cutoff:
+        events.pop(0)
+    del events[:-50]
+
+
+def _recent_rate(path: str, now: float) -> Optional[float]:
+    cutoff = now - ACCOUNT_HEALTH_WINDOW_SECONDS
+    oks = [ok for ts, ok in _account_recent.get(path, ()) if ts >= cutoff]
+    if len(oks) < ACCOUNT_HEALTH_MIN_SAMPLES:
+        return None
+    return sum(oks) / len(oks) * 100
+
+
+def _configured_account_paths() -> list:
+    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
+    return [p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH) if p]
+
+
+def plan_account_order() -> list:
+    """Parent-side, once per download: healthy accounts round-robin, weak
+    ones after them, best first."""
+    global _account_rr
+    _materialize_extra_cookie_accounts()
+    paths = [p for p in _configured_account_paths() if os.path.exists(p)]
+    now = time.time()
+    with _account_health_lock:
+        rates = {p: _recent_rate(p, now) for p in paths}
+        healthy = [p for p in paths if rates[p] is None or rates[p] >= ACCOUNT_DEMOTE_BELOW]
+        weak = sorted((p for p in paths if p not in healthy), key=lambda p: rates[p], reverse=True)
+        if healthy:
+            k = _account_rr % len(healthy)
+            healthy = healthy[k:] + healthy[:k]
+        _account_rr += 1
+    return healthy + weak
+
 
 def _health_entry(path: str) -> dict:
     return _account_health.setdefault(path, {
@@ -1403,6 +1592,7 @@ def record_account_result(
         if ok:
             entry["successes"] += 1
             entry["last_success_at"] = now
+            _push_recent(path, True, now)
         else:
             entry["failures"] += 1
             entry["last_failure_at"] = now
@@ -1418,6 +1608,8 @@ def record_account_result(
             else:
                 kind = "other"
             entry["last_failure_kind"] = kind
+            if kind == "bot_check":
+                _push_recent(path, False, now)
 
 
 def get_account_health() -> list:
@@ -1461,6 +1653,13 @@ def get_account_health() -> list:
                 "last_failure_phase": entry.get("last_failure_phase"),
                 "last_failure_kind": entry.get("last_failure_kind"),
                 "last_used_via": entry.get("last_used_via"),
+                "recent_success_rate": (
+                    round(recent, 1) if (recent := _recent_rate(path, now)) is not None else None
+                ),
+                "rotation": (
+                    "demoted" if recent is not None and recent < ACCOUNT_DEMOTE_BELOW
+                    else "active"
+                ),
             })
     return out
 
@@ -1815,6 +2014,9 @@ def get_cookie_accounts() -> list:
     now = time.time()
     with _cookie_accounts_lock:
         available = [p for p in candidate_paths if _cookie_account_disabled_until.get(p, 0) < now]
+    if _account_order:
+        rank = {p: i for i, p in enumerate(_account_order)}
+        available.sort(key=lambda p: rank.get(p, len(rank)))
     return available
 
 
@@ -1834,6 +2036,7 @@ def reset_account_state(path: str):
     alert window belonged to the old bytes."""
     with _account_health_lock:
         _account_health.pop(path, None)
+        _account_recent.pop(path, None)
     with _cookie_accounts_lock:
         _cookie_account_disabled_until.pop(path, None)
     with _cookie_alert_lock:
@@ -1967,9 +2170,14 @@ def extract_info_with_retry(
             _apply_player_clients(dict(media_opts), has_cookies, rung, proxy)
             if media_opts is not None else None
         )
+        key = _client_key(has_cookies, rung_opts['extractor_args']['youtube']['player_client'])
         try:
-            return _extract_with_backoff(rung_opts, url, rung_media)
+            result = _extract_with_backoff(rung_opts, url, rung_media)
+            record_client_result(key, True)
+            return result
         except _TryNextClientSet as signal:
+            if not _is_embed_only_unavailable(rung_opts, str(signal.original)):
+                record_client_result(key, False)
             if rung + 1 >= limit:
                 raise signal.original
             logger.warning(
@@ -2015,6 +2223,13 @@ def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] =
                         f"MAX_VIDEO_DURATION_SECONDS={MAX_VIDEO_DURATION_SECONDS}s for URL: {url}"
                     )
                     raise VideoTooLongError(duration, MAX_VIDEO_DURATION_SECONDS)
+                if (ydl_opts.get("proxy") and PROXY_MAX_DURATION_SECONDS
+                        and duration and duration > PROXY_MAX_DURATION_SECONDS):
+                    logger.warning(
+                        f"[PROXY] Rejecting {duration}s video on the paid path "
+                        f"(cap {PROXY_MAX_DURATION_SECONDS}s) before any audio is fetched: {url}"
+                    )
+                    raise ProxyTooLongError(duration, PROXY_MAX_DURATION_SECONDS)
 
                 if media_opts is None:
                     info = ydl.process_ie_result(info, download=True)
@@ -2418,6 +2633,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 return result
 
             except Exception as proxy_error:
+                if isinstance(proxy_error, VideoTooLongError):
+                    raise
                 proxy_error_text = str(proxy_error)
 
                 # Checked BEFORE any recording: a handshake that never
@@ -2495,7 +2712,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     # when every account was disabled, which put a cookie account on
     # attempt 1 whenever any account was healthy - exactly backwards from
     # what testing showed actually works for public videos.
-    accounts = [None] + get_cookie_accounts()
+    cookie_accounts = get_cookie_accounts()
+    if cookie_accounts and anon_skipped():
+        logger.info("[ANON] VPS IP bot-checked recently - skipping the no-cookie attempt.")
+        accounts = list(cookie_accounts)
+    else:
+        accounts = [None] + cookie_accounts
 
     last_error = None
     for account_path in accounts:
@@ -2512,6 +2734,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             result = extract_info_with_retry(opts, url)
             if account_path:
                 logger.info(f"[COOKIES] Download succeeded using account: {account_path}")
+            else:
+                record_anon_result(False)
             record_account_result(account_path, True, "direct")
             record_path_attempt("direct", True)
             return result
@@ -2520,6 +2744,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             error_text = str(e)
             record_account_result(account_path, False, "direct", error_text)
             record_path_attempt("direct", False)
+            if account_path is None and is_bot_check_error(error_text):
+                record_anon_result(True)
 
             if isinstance(e, VideoTooLongError) or is_permanent_error(error_text):
                 # No cookie swap, no proxy, no retry fixes a video that's
@@ -2802,6 +3028,10 @@ def apply_events(events: list):
                 record_path_attempt(ev.get("via", "direct"), ev.get("ok", False))
             elif kind == "split_media":
                 record_split_media_result(ev.get("ok", False))
+            elif kind == "anon_result":
+                record_anon_result(bool(ev.get("botchecked")))
+            elif kind == "client_result" and ev.get("key"):
+                record_client_result(ev["key"], bool(ev.get("ok")))
             elif kind == "cookie_warning":
                 _set_active_account(ev.get("path"))
                 _maybe_alert_cookie_expiry(
@@ -2833,13 +3063,16 @@ def export_breaker_state() -> dict:
         "proxy_botcheck_until": botcheck_until,
         "split_disabled_until": split_until,
         "cookie_disabled": disabled,
+        "account_order": plan_account_order(),
+        "anon_skip_until": _anon_skip_until,
+        "client_demoted": sorted(_active_client_demotions()),
     }
 
 
 def import_breaker_state(state: dict):
     """Worker-side: adopt the parent's breakers before doing any work."""
     global _proxy_disabled_until, _direct_degraded_until, _proxy_botcheck_until
-    global _split_disabled_until
+    global _split_disabled_until, _account_order, _anon_skip_until, _client_demoted_frozen
     if not state:
         return
     try:
@@ -2857,5 +3090,9 @@ def import_breaker_state(state: dict):
         with _cookie_accounts_lock:
             _cookie_account_disabled_until.clear()
             _cookie_account_disabled_until.update(state.get("cookie_disabled") or {})
+        _account_order = list(state.get("account_order") or [])
+        with _anon_lock:
+            _anon_skip_until = float(state.get("anon_skip_until") or 0.0)
+        _client_demoted_frozen = set(state.get("client_demoted") or [])
     except Exception as e:
         logger.warning(f"[BREAKER] Failed to import parent breaker state: {e}")
