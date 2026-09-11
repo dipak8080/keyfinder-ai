@@ -120,7 +120,7 @@ from jobs import create_job, mark_failed, mark_tool_complete, mark_stems_complet
 from audio_common import AudioToolError, build_output_path, get_audio_mime_type
 from video_to_audio import extract_audio, validate_video_input_format
 from audio_joiner import join_audio
-from silence_splitter import split_on_silence
+from silence_splitter import split_on_silence, SPLIT_MODES
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
 from ._shared import (
@@ -479,10 +479,16 @@ async def silence_split_route(
     threshold_db: float = Form(-30.0),
     min_duration_seconds: float = Form(0.5),
     min_segment_seconds: float = Form(SILENCE_SPLIT_MIN_SEGMENT_SECONDS),
+    mode: str = Form("music"),
 ):
     """Poll GET /silence-split/status/{job_id} - the response lists the
-    available segment names once complete."""
+    available segment names once complete. mode=speech uses VAD and
+    ignores threshold_db."""
     set_job_context(tool="SILENCE_SPLIT", tier="standard")
+
+    mode = mode.strip().lower()
+    if mode not in SPLIT_MODES:
+        raise HTTPException(400, f"mode must be one of: {', '.join(SPLIT_MODES)}.")
 
     _validated_input_format(file.filename)
 
@@ -530,7 +536,7 @@ async def silence_split_route(
         semaphore=_audio_tools_semaphore,
         work=lambda: run_blocking(
             split_on_silence, input_path, job_id, target_format,
-            threshold_db, min_duration_seconds, min_segment_seconds,
+            threshold_db, min_duration_seconds, min_segment_seconds, mode,
         ),
         on_success=lambda segments: mark_stems_complete(job_id, original_filename, segments),
         generic_error="Splitting failed unexpectedly.",
@@ -540,7 +546,7 @@ async def silence_split_route(
 
     _log_queued(
         "SILENCE_SPLIT", job_id, original_filename, size,
-        f"threshold={threshold_db}dB min_dur={min_duration_seconds}s min_seg={min_segment_seconds}s",
+        f"mode={mode} threshold={threshold_db}dB min_dur={min_duration_seconds}s min_seg={min_segment_seconds}s",
     )
     return JSONResponse({"job_id": job_id, "status": "processing"})
 

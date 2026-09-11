@@ -73,6 +73,9 @@ from config import (
     SILENCE_SPLIT_AUTO_MERGE,
 )
 from audio_common import AudioToolError, validate_duration, as_audio_only_ffmpeg
+from speech_vad import speech_spans, gaps_between
+
+SPLIT_MODES = ("music", "speech")
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*([\d.]+)")
 _SILENCE_END_RE = re.compile(r"silence_end:\s*([\d.]+)")
@@ -211,6 +214,7 @@ def split_on_silence(
     threshold_db: float,
     min_duration_seconds: float,
     min_segment_seconds: float = SILENCE_SPLIT_MIN_SEGMENT_SECONDS,
+    mode: str = "music",
 ) -> Dict[str, str]:
     """
     Detects silence in input_path and cuts it into one file per
@@ -230,15 +234,35 @@ def split_on_silence(
     if target_format not in _ENCODE_ARGS:
         raise AudioToolError(f"'{target_format}' isn't a supported output format.")
 
+    mode = (mode or "music").strip().lower()
+    if mode not in SPLIT_MODES:
+        raise AudioToolError(f"mode must be one of: {', '.join(SPLIT_MODES)}.")
+    speech = mode == "speech"
+
     total_duration = validate_duration(input_path)
 
-    silences = _detect_silences(input_path, threshold_db, min_duration_seconds)
+    if speech:
+        # VAD gaps take the place of silencedetect's spans; everything below is shared
+        silences = gaps_between(speech_spans(input_path, min_duration_seconds), total_duration)
+    else:
+        silences = _detect_silences(input_path, threshold_db, min_duration_seconds)
     segments = _segments_from_silences(total_duration, silences, min_segment_seconds)
 
     if not segments:
+        if speech:
+            raise AudioToolError(
+                "No speech was detected in this file. For music or other "
+                "non-speech audio, use Music mode."
+            )
         raise AudioToolError(
             "No usable segments were found - the file may be entirely silent, "
             "or too short relative to the silence settings used."
+        )
+
+    if len(segments) == 1 and speech:
+        raise AudioToolError(
+            "The speech in this file has no pause long enough to split on. "
+            "Try a shorter minimum pause."
         )
 
     if len(segments) == 1:
@@ -257,7 +281,7 @@ def split_on_silence(
         logger.warning(
             f"[SILENCE_SPLIT] Job {job_id}: {raw_count} raw segments exceeded the "
             f"{SILENCE_SPLIT_MAX_SEGMENTS} limit; merged across shortest gaps down to "
-            f"{len(segments)} (threshold={threshold_db}dB min_dur={min_duration_seconds}s "
+            f"{len(segments)} (mode={mode} threshold={threshold_db}dB min_dur={min_duration_seconds}s "
             f"min_seg={min_segment_seconds}s)"
         )
 
@@ -270,7 +294,8 @@ def split_on_silence(
 
     logger.info(
         f"[SILENCE_SPLIT] Job {job_id}: {len(segments)} segments detected "
-        f"from {len(silences)} silence spans ({total_duration:.1f}s total)"
+        f"from {len(silences)} {'non-speech' if speech else 'silence'} spans "
+        f"({total_duration:.1f}s total, mode={mode})"
     )
 
     output_paths = {}

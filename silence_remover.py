@@ -1,14 +1,14 @@
 """
-silence_remover.py - Strip silent gaps throughout the audio (not just
-leading/trailing) via ffmpeg's silenceremove filter.
+silence_remover.py - Strip gaps throughout the audio, not just
+leading/trailing.
 
-Useful for podcast/voice-memo editing where dead air needs trimming
-out. Two params expose the actual tuning knobs users would want:
-threshold_db (how quiet counts as "silence") and min_duration_seconds
-(how long a gap has to be before it's cut).
+Two modes:
+  music  - ffmpeg silenceremove on a dB threshold (the original tool).
+  speech - Silero VAD (speech_vad.py). Keeps only speech regions, so
+           music beds, applause and room tone are cut and breaths
+           inside a sentence are kept. threshold_db is ignored.
 
-Output format matches input format (chain with /convert for format
-changes).
+Output format matches input format.
 """
 from config import (
     logger,
@@ -18,22 +18,18 @@ from config import (
     SILENCE_MIN_DURATION_SECONDS,
     SILENCE_MAX_DURATION_SECONDS,
 )
-from audio_common import AudioToolError, run_subprocess
+from audio_common import AudioToolError, run_subprocess, probe_duration_seconds
+from speech_vad import speech_spans, merge_to_limit
+
+SILENCE_MODES = ("music", "speech")
+
+# Keeps the aselect expression well under Linux's 128 KB single-argument limit.
+_MAX_KEPT_SPANS = 2000
 
 
-def remove_silence(input_path: str, output_path: str, threshold_db: float, min_duration_seconds: float) -> None:
-    """
-    Removes silent gaps of at least min_duration_seconds, where
-    "silence" is anything at or below threshold_db, throughout
-    input_path, writing the result to output_path (same format as
-    input).
-
-    stop_periods=-1 means EVERY qualifying silent gap is removed
-    (not just leading/trailing) - start_periods=1 handles a silent
-    lead-in, stop_periods=-1 handles all interior + trailing gaps.
-
-    Raises AudioToolError on out-of-range params or ffmpeg failure.
-    """
+def _validate(threshold_db: float, min_duration_seconds: float, mode: str) -> None:
+    if mode not in SILENCE_MODES:
+        raise AudioToolError(f"mode must be one of: {', '.join(SILENCE_MODES)}.")
     if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
         raise AudioToolError(
             f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}."
@@ -43,23 +39,55 @@ def remove_silence(input_path: str, output_path: str, threshold_db: float, min_d
             f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} and {SILENCE_MAX_DURATION_SECONDS}."
         )
 
+
+def _remove_by_threshold(input_path: str, output_path: str, threshold_db: float, min_duration_seconds: float) -> None:
     silence_filter = (
         f"silenceremove="
         f"start_periods=1:start_silence={min_duration_seconds}:start_threshold={threshold_db}dB:"
         f"stop_periods=-1:stop_silence={min_duration_seconds}:stop_threshold={threshold_db}dB:"
         f"detection=peak"
     )
+    run_subprocess([FFMPEG_PATH, "-y", "-i", input_path, "-af", silence_filter, output_path])
 
-    cmd = [
-        FFMPEG_PATH, "-y",
-        "-i", input_path,
-        "-af", silence_filter,
-        output_path,
-    ]
 
-    run_subprocess(cmd)
+def _remove_non_speech(input_path: str, output_path: str, min_duration_seconds: float) -> int:
+    spans = speech_spans(input_path, min_duration_seconds)
+    if not spans:
+        raise AudioToolError(
+            "No speech was detected in this file. For music or other non-speech audio, use Music mode."
+        )
 
+    spans = merge_to_limit(spans, _MAX_KEPT_SPANS)
+    select = "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in spans)
+
+    # asetnsamples makes ~5 ms frames so aselect cuts close to the VAD boundaries
+    audio_filter = f"asetnsamples=n=256,aselect='{select}',asetpts=N/SR/TB"
+    run_subprocess([FFMPEG_PATH, "-y", "-i", input_path, "-af", audio_filter, output_path])
+    return len(spans)
+
+
+def remove_silence(
+    input_path: str,
+    output_path: str,
+    threshold_db: float,
+    min_duration_seconds: float,
+    mode: str = "music",
+) -> None:
+    mode = (mode or "music").strip().lower()
+    _validate(threshold_db, min_duration_seconds, mode)
+
+    if mode == "speech":
+        kept = _remove_non_speech(input_path, output_path, min_duration_seconds)
+        before = probe_duration_seconds(input_path)
+        after = probe_duration_seconds(output_path)
+        logger.info(
+            f"[SILENCE_REMOVE] {input_path} (speech, min_gap={min_duration_seconds}s, "
+            f"{kept} spans, {before:.1f}s -> {after:.1f}s) -> {output_path}"
+        )
+        return
+
+    _remove_by_threshold(input_path, output_path, threshold_db, min_duration_seconds)
     logger.info(
-        f"[SILENCE_REMOVE] {input_path} (threshold={threshold_db}dB, "
+        f"[SILENCE_REMOVE] {input_path} (music, threshold={threshold_db}dB, "
         f"min_duration={min_duration_seconds}s) -> {output_path}"
     )

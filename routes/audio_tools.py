@@ -162,7 +162,7 @@ from reverse_audio import reverse_audio
 from noise_remover import remove_noise
 from voice_cleaner import clean_voice
 from echo_remover import remove_echo
-from silence_remover import remove_silence
+from silence_remover import remove_silence, SILENCE_MODES
 from audio_loudnorm import normalize_loudness, resolve_target_lufs
 from audio_effects import apply_fade, convert_channels, resample_audio, make_ringtone
 from log_stream import set_job_context, remember_job_tags
@@ -694,8 +694,13 @@ async def silence_remove_route(
     file: UploadFile = File(...),
     threshold_db: float = Form(-30.0),
     min_duration_seconds: float = Form(0.5),
+    mode: str = Form("music"),
 ):
-    """Strips silent gaps throughout the recording."""
+    """Strips silent gaps throughout the recording. mode=speech uses VAD
+    and ignores threshold_db."""
+    mode = mode.strip().lower()
+    if mode not in SILENCE_MODES:
+        raise HTTPException(400, f"mode must be one of: {', '.join(SILENCE_MODES)}.")
     if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
         raise HTTPException(
             400,
@@ -714,9 +719,9 @@ async def silence_remove_route(
         tool="SILENCE_REMOVE",
         metric="/silence-remove",
         build_work=lambda inp, out: (
-            lambda: run_blocking(remove_silence, inp, out, threshold_db, min_duration_seconds)
+            lambda: run_blocking(remove_silence, inp, out, threshold_db, min_duration_seconds, mode)
         ),
-        log_detail=f"threshold={threshold_db}dB min_dur={min_duration_seconds}s",
+        log_detail=f"mode={mode} threshold={threshold_db}dB min_dur={min_duration_seconds}s",
         generic_error="Silence removal failed unexpectedly.",
     )
 
