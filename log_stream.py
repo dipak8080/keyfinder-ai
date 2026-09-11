@@ -1163,7 +1163,9 @@ class RequestLoggerMiddleware(BaseHTTPMiddleware):
         # never have existed. Broadened to all of /admin - operator
         # tooling isn't a product "tool" and was never meant to appear in
         # a dashboard that's specifically ABOUT that traffic.
-        if not request.url.path.startswith("/admin"):
+        # /internal/drain-status is polled every 15s by deploy/drain_old.sh
+        # during a blue-green drain - deploy tooling, not traffic.
+        if not request.url.path.startswith(("/admin", "/internal/drain-status")):
             try:
                 _enqueue(
                     _HTTP,
