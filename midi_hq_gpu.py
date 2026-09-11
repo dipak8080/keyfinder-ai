@@ -88,6 +88,7 @@ from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 from utils import run_blocking, cleanup_file
 from audio_to_midi import convert_guitar_to_midi
 from separation import run_stem_separation, SeparationError
+from monitoring import is_client_side
 
 # --------------------------------------------------------------------------
 # INSTRUMENT ROUTING (2026-09-01)
@@ -237,6 +238,8 @@ async def _transcribe_guitar(
             try:
                 stem_paths = await run_stem_separation(input_path, job_id, model=ISOLATION_MODEL)
             except SeparationError as e:
+                if is_client_side(e):
+                    raise InputRejected(str(e))
                 logger.error(f"[MIDI_HQ] guitar isolation failed for job {job_id}: {e}")
                 raise AudioToolError(
                     "Could not isolate the guitar from this mix. Try again, or upload a solo guitar recording."

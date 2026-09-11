@@ -41,7 +41,8 @@ from audio_common import build_output_path, AudioToolError, InputRejected
 from utils import cleanup_file
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
-from sheet import run_sheet_job, SheetParams, EmptyTranscriptionError
+from sheet import run_sheet_job, SheetParams, EmptyTranscriptionError, SheetError
+from monitoring import is_client_side
 
 from credits import paywall, metering
 from credits.identity import Identity
@@ -71,6 +72,10 @@ async def _run_sheet_job_user_errors(**kwargs):
         return await run_sheet_job(**kwargs)
     except EmptyTranscriptionError as e:
         raise InputRejected(NO_NOTES_MESSAGE) from e
+    except SheetError as e:
+        if is_client_side(e.__cause__):
+            raise InputRejected(str(e.__cause__)) from e
+        raise
 
 
 router = APIRouter()

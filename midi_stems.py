@@ -19,6 +19,7 @@ import soundfile as sf
 
 from audio_common import AudioToolError, InputRejected
 from separation import run_stem_separation, SeparationError
+from monitoring import is_client_side
 from utils import run_blocking, cleanup_file
 from audio_to_midi import convert_to_midi, convert_guitar_to_midi
 
@@ -206,6 +207,8 @@ async def transcribe_stems(
         try:
             stem_paths = await run_stem_separation(input_path, jid, model=SEPARATION_MODEL)
         except SeparationError as e:
+            if is_client_side(e):
+                raise InputRejected(str(e))
             logger.error(f"[MIDI_STEMS] separation failed for job {jid}: {e}")
             raise AudioToolError("Could not split this track into instruments. Try again or upload a shorter clip.")
         sep_seconds = time.monotonic() - sep_started

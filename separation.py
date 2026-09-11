@@ -159,9 +159,21 @@ class SeparationError(Exception):
 
 
 class SeparationRejected(SeparationError):
-    """The track itself can't be separated (over the length limit). A
-    rejection, not a server failure; see audio_common.InputRejected."""
+    """The track itself can't be separated (over the length limit, or the
+    worker found it silent or too short). A rejection, not a server
+    failure; see audio_common.InputRejected."""
     client_side = True
+
+
+# gpu-worker/handler.py words degenerate input (silent, too short, NaN
+# samples: Demucs' pad1d assertion) this way. 2026-09-11: 5 s of silence
+# reached users as "RunPod job ... ended with status=FAILED" and was
+# counted as a server failure.
+_DEGENERATE_INPUT_MARKER = "appears to be too short or contains no usable audio"
+DEGENERATE_INPUT_MESSAGE = (
+    "This audio couldn't be processed. It appears to be silent, too short, "
+    "or has no usable audio. Please try a different file."
+)
 
 
 def get_audio_duration_seconds(file_path: str) -> float:
@@ -261,6 +273,7 @@ async def _run_demucs_on_gpu(
             )
         except RunPodJobError as e:
             error_text = str(e)
+            rejected = _DEGENERATE_INPUT_MARKER in error_text.lower()
 
             # A failed job still burned GPU seconds - often MORE than a
             # successful one, because a timeout runs to the wall before
@@ -269,8 +282,13 @@ async def _run_demucs_on_gpu(
             metering.record_job_finished(
                 job_id,
                 status="timeout" if "timeout" in error_text.lower() else "failed",
-                error=error_text[:500],
+                error=DEGENERATE_INPUT_MESSAGE if rejected else error_text[:500],
+                client_side=rejected,
             )
+
+            if rejected:
+                logger.warning(f"[SEPARATION] Job {job_id}: worker rejected the input as silent or too short")
+                raise SeparationRejected(DEGENERATE_INPUT_MESSAGE)
 
             if _is_insufficient_balance_error(error_text):
                 # This is the ACTUAL ceiling on GPU spend - RunPod's own

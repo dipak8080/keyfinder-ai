@@ -28,6 +28,7 @@ from audio_common import AudioToolError, InputRejected
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 from separation import run_stem_separation, SeparationError
+from monitoring import is_client_side
 from utils import cleanup_file
 
 # New env vars, read defensively so this module imports cleanly before
@@ -141,6 +142,8 @@ async def transcribe_to_midi(
             try:
                 stem_paths = await run_stem_separation(input_path, jid, model=ISOLATION_MODEL)
             except SeparationError as e:
+                if is_client_side(e):
+                    raise InputRejected(str(e))
                 logger.error(f"[PIANO] isolation failed for job {jid}: {e}")
                 raise AudioToolError(
                     "Could not isolate the piano from this mix. Try again, or "
