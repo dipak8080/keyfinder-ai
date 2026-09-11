@@ -1,6 +1,9 @@
 # Official Python slim image - lightweight and fast
 FROM python:3.11-slim
 
+# Changes weekly, so the first deploy of each week rebuilds every layer fresh
+ARG CACHE_WEEK=none
+
 # System packages:
 # - ffmpeg / rubberband-cli: audio tools
 # - git: pip install yt-dlp from git + clone bgutil pot provider

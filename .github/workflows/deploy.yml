@@ -32,10 +32,13 @@ jobs:
             git fetch origin
             git reset --hard origin/main
 
-            # Free space BEFORE building (prevents "no space left on device")
+            # Free space BEFORE building, but keep the build cache so a
+            # code-only push skips the pip layer. Cache unused for 7 days goes.
             echo "Cleaning Docker before build..."
-            docker system prune -af --volumes || true
-            docker builder prune -af || true
+            docker container prune -f || true
+            docker image prune -f || true
+            docker volume prune -f || true
+            docker builder prune -af --filter "until=168h" || true
 
             # Internal network for audioforges-api <-> midi-worker traffic.
             # Idempotent: docker network create fails non-zero if it already
@@ -177,6 +180,7 @@ jobs:
 
             # Built while the live container keeps serving.
             docker build \
+              --build-arg CACHE_WEEK="$(date +%G-%V)" \
               --build-arg WHISPER_MODEL_SIZE="$WHISPER_MODEL_SIZE" \
               --build-arg WHISPER_COMPUTE_TYPE="$WHISPER_COMPUTE_TYPE" \
               --build-arg BAKE_WHISPER_MODEL="$BAKE_WHISPER_MODEL" \
@@ -264,7 +268,7 @@ jobs:
               echo "Old container draining in the background (data/drain.log)."
             fi
 
-            docker image prune -f
-            docker builder prune -af
+            docker image prune -f || true
+            docker builder prune -af --filter "until=168h" || true
             echo "Deploy successful - live on slot $NEW."
             exit 0
