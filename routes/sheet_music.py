@@ -37,11 +37,11 @@ from jobs import (
     get_job,
     count_processing,
 )
-from audio_common import build_output_path
+from audio_common import build_output_path, AudioToolError
 from utils import cleanup_file
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
-from sheet import run_sheet_job, SheetParams
+from sheet import run_sheet_job, SheetParams, EmptyTranscriptionError
 
 from credits import paywall, metering
 from credits.identity import Identity
@@ -54,6 +54,24 @@ from ._shared import (
     _log_queued,
     _run_tool_job,
 )
+
+
+NO_NOTES_MESSAGE = (
+    "Not enough clear notes were found to write sheet music. "
+    "Try a longer recording with a clear melody."
+)
+
+
+async def _run_sheet_job_user_errors(**kwargs):
+    """run_sheet_job, with "no usable notes" turned into a normal user-facing
+    failure. It is an input problem (silence, a few seconds of audio, noise),
+    not a bug, so it must not surface as "failed unexpectedly" with an ERROR
+    and traceback (2026-09-11: a 7.5 s clip yielded 2 notes)."""
+    try:
+        return await run_sheet_job(**kwargs)
+    except EmptyTranscriptionError as e:
+        raise AudioToolError(NO_NOTES_MESSAGE) from e
+
 
 router = APIRouter()
 
@@ -279,7 +297,7 @@ async def audio_to_sheet_route(
                 metric=METRIC,
                 job_id=job_id,
                 semaphore=_sheet_semaphore,
-                work=lambda: run_sheet_job(
+                work=lambda: _run_sheet_job_user_errors(
                     job_id=job_id,
                     input_path=input_path,
                     pdf_path=pdf_path,
