@@ -54,9 +54,11 @@ email-validator>=2.0
 # curl-cffi, which is what actually provides impersonation. The result
 # was a comment promising a capability that was never installed.
 #
-# Impersonation is still NOT enabled here - see the block at the bottom
-# of this file for the reasoning and the one-line change that turns it on.
-yt-dlp[default,curl-cffi]==2026.07.04
+# Impersonation is enabled via the [curl-cffi] extra - see the block at
+# the bottom of this file.
+# 2026.08.19 fixes TikTok "Unexpected response from webpage request"
+# (yt-dlp #17403/#17452), raised by the TikTok challenge solver.
+yt-dlp[default,curl-cffi]==2026.8.19
 bgutil-ytdlp-pot-provider==1.3.1
 
 # ---------- SEPARATION (Demucs) ----------
@@ -159,4 +161,4 @@ pretty_midi>=0.2.10
 # extraction is the thing to verify, not just TikTok. Verify targets are
 # actually available with:
 #     docker exec audioforges-api yt-dlp --list-impersonate-targets
-# Rollback is this one line back to yt-dlp[default]==2026.07.04.
+# Rollback: yt-dlp[default,curl-cffi]==2026.07.04 (TikTok is broken on it).
