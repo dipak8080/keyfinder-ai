@@ -324,17 +324,30 @@ def reset_split_breaker():
 # Root cause of the 403: YouTube's SABR-only experiment (yt-dlp #12482)
 # strips URLs from android formats for affected sessions. Nightly yt-dlp
 # 2026.08.17 hits it too, so this is client selection, not a version fix.
+#
+# 2026-09-11 sweep (yt-dlp 2026.8.19, bgutil 2.0.0, through the proxy):
+# tv_simply, visionos and web_embedded downloaded every test video; web
+# and web_safari returned no formats; tv and tv_downgraded hit the
+# reload error, with and without cookies. On a non-embeddable video
+# (MeJVWBSsPAY) web_embedded said "Video unavailable" while tv_simply
+# and visionos downloaded it. So the cookie ladder falls back to
+# cookieless clients, which run without the cookiefile (see
+# _COOKIELESS_CLIENTS).
 CLIENT_LADDER_NO_COOKIES = (
     ['tv_simply'],
     ['web_embedded'],
+    ['visionos'],
     ['android_vr', 'android'],
-    ['web'],
 )
 CLIENT_LADDER_WITH_COOKIES = (
     ['web_embedded'],
-    ['tv'],
-    ['web', 'web_safari'],
+    ['tv_simply'],
+    ['visionos'],
 )
+
+# Clients yt-dlp skips when a cookiefile is attached. A rung made only of
+# these runs without the cookiefile instead of silently running nothing.
+_COOKIELESS_CLIENTS = frozenset({'tv_simply', 'visionos', 'android_vr', 'android'})
 
 
 def _client_ladder(has_cookies: bool):
@@ -366,12 +379,29 @@ def _apply_player_clients(opts: dict, has_cookies: bool, rung: int = 0) -> dict:
     attached.
     """
     ladder = _client_ladder(has_cookies)
+    clients = list(ladder[min(rung, len(ladder) - 1)])
     extractor_args = dict(opts.get('extractor_args') or {})
     youtube_args = dict(extractor_args.get('youtube') or {})
-    youtube_args['player_client'] = list(ladder[min(rung, len(ladder) - 1)])
+    youtube_args['player_client'] = clients
     extractor_args['youtube'] = youtube_args
     opts['extractor_args'] = extractor_args
+    if has_cookies and all(c in _COOKIELESS_CLIENTS for c in clients):
+        opts.pop('cookiefile', None)
     return opts
+
+
+def _is_embed_only_unavailable(ydl_opts: dict, error_text: str) -> bool:
+    """"Video unavailable" from web_embedded alone is usually embedding
+    disabled by the owner, not a removed video (2026-09-11, MeJVWBSsPAY).
+    Another client decides; if it also says unavailable, that one is
+    treated as permanent as usual."""
+    clients = ((ydl_opts.get('extractor_args') or {}).get('youtube') or {}).get('player_client') or []
+    if list(clients) != ['web_embedded']:
+        return False
+    normalized = _normalize_error_text(error_text)
+    if "video unavailable" not in normalized:
+        return False
+    return not any(m in normalized for m in PERMANENT_ERROR_MARKERS if m != "video unavailable")
 
 
 # Errors where retrying can NEVER help - the video itself is the blocker,
@@ -1978,6 +2008,14 @@ def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] =
         except Exception as e:
             last_exception = e
             error_text = str(e)
+
+            if _is_embed_only_unavailable(ydl_opts, error_text):
+                logger.warning(
+                    f"Attempt {attempt}: 'Video unavailable' from web_embedded "
+                    f"only - likely embedding disabled, trying the next client "
+                    f"set: {error_text}"
+                )
+                raise _TryNextClientSet(e)
 
             if is_permanent_error(error_text):
                 # No point burning 2 more attempts (and 2 more rounds of
