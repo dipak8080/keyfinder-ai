@@ -1477,6 +1477,15 @@ MAX_CONCURRENT_MIDI = int(os.environ.get("MAX_CONCURRENT_MIDI", "2"))
 # concurrency, the same ratio the separation pool uses.
 MAX_QUEUED_MIDI = int(os.environ.get("MAX_QUEUED_MIDI", "8"))
 
+# ---------- CANCEL ----------
+# /jobs/{id}/cancel is unauthenticated by design - the job id is the
+# authorisation, the same as /status and /download on every tool. It is
+# cheap, but it takes jobs.py's global lock, which every status poll on
+# the server also needs. Generous enough that a user with several tabs
+# never notices, tight enough that a script cannot sit on that lock.
+CANCEL_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("CANCEL_RATE_LIMIT_MAX_REQUESTS", "30"))
+CANCEL_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("CANCEL_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
 MIDI_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_RATE_LIMIT_MAX_REQUESTS", "5"))
 MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 

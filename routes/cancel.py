@@ -27,17 +27,31 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Path
+from functools import partial
+
+from fastapi import APIRouter, Depends, HTTPException, Path
 
 import job_tasks
+from config import (
+    CANCEL_RATE_LIMIT_MAX_REQUESTS,
+    CANCEL_RATE_LIMIT_WINDOW_SECONDS,
+)
 from jobs import get_job
+from rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-@router.post("/jobs/{job_id}/cancel")
+@router.post(
+    "/jobs/{job_id}/cancel",
+    dependencies=[Depends(partial(
+        check_rate_limit,
+        max_requests=CANCEL_RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=CANCEL_RATE_LIMIT_WINDOW_SECONDS,
+    ))],
+)
 async def cancel_job_route(job_id: str = Path(..., max_length=64)) -> dict:
     """Stop an in-flight job and return its credit.
 
