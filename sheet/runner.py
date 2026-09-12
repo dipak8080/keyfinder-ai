@@ -20,6 +20,21 @@ from typing import Awaitable, Callable
 
 from .core import GridInfo, SheetParams, SheetResult, midi_to_sheet
 
+# Ceiling on the notation + engrave stage. Verovio and cairosvg on a
+# long dense score are unbounded CPU, and there are only
+# MAX_CONCURRENT_SHEET_MUSIC slots - so one pathological input could
+# hold a slot indefinitely while every other sheet job queued behind
+# it. Every other heavy path in this codebase has a timeout; this one
+# did not.
+#
+# HONEST LIMIT: asyncio.to_thread cannot be cancelled, so the worker
+# thread keeps running after this fires. What the timeout buys is a
+# real error for the user, a refunded credit, and a released slot,
+# rather than a job that hangs until the client gives up.
+SHEET_ENGRAVE_TIMEOUT_SECONDS = int(
+    os.environ.get("SHEET_ENGRAVE_TIMEOUT_SECONDS", "300")
+)
+
 log = logging.getLogger("sheet.runner")
 
 __all__ = ["run_sheet_job", "SheetJobError"]
@@ -262,7 +277,16 @@ async def run_sheet_job(
         # 3) notation + engrave (blocking CPU -> thread). midi_to_sheet raises
         #    typed errors (EmptyTranscriptionError, InvalidGridError, Engrave*)
         #    which propagate unchanged for the route to map.
-        result: SheetResult = await asyncio.to_thread(midi_to_sheet, effective_midi, resolved)
+        try:
+            result: SheetResult = await asyncio.wait_for(
+                asyncio.to_thread(midi_to_sheet, effective_midi, resolved),
+                timeout=SHEET_ENGRAVE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise SheetJobError(
+                "Engraving this score took too long. Try a shorter clip, or a "
+                "simpler instrument setting."
+            )
 
         # 4) write artifacts
         written = _write_outputs(result, pdf_path=pdf_path, svg_path=svg_path, xml_path=xml_path)
