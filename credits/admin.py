@@ -108,6 +108,7 @@ async def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
         "jobs_refunded": refunded,
         "webhooks_unprocessed": stuck_webhooks,
         "usage": metering.totals(days),
+        "gate": gate_funnel(days),
         "db": healthcheck(),
     }
 
@@ -327,6 +328,110 @@ async def job_filter_options() -> dict:
             "SELECT DISTINCT charge_type FROM gpu_job_metrics WHERE charge_type IS NOT NULL ORDER BY charge_type"
         )]
     return {"tools": tools, "statuses": statuses, "charge_types": charge_types}
+
+
+# ---------------------------------------------------------------------------
+# 2b. Who hit the wall? (migration 005)
+# ---------------------------------------------------------------------------
+
+def gate_funnel(days: int = 30) -> dict:
+    """People stopped by the paywall, and what happened next.
+
+    COUNTED BY SUBJECT, NOT BY EVENT. /credits/preview fires on every
+    file drop, so raw rows overstate people by a wide margin. The
+    headline numbers here are COUNT(DISTINCT subject_id); `events` is
+    kept alongside only so the ratio between them is visible.
+
+    conversion_pct is blocked-subjects to buyers, and it is a CEILING,
+    not a measurement: `orders` has no subject_id, so a buyer cannot be
+    matched back to the subject that was blocked. Someone who bought
+    without ever being stopped still counts in the numerator. Read it as
+    "no better than this", and read the trend rather than the absolute.
+    """
+    window = f"-{days} days"
+    with connect() as conn:
+        totals = conn.execute(
+            """SELECT event,
+                      COUNT(*)                   AS events,
+                      COUNT(DISTINCT subject_id) AS subjects,
+                      COUNT(DISTINCT ip_hash)    AS ips
+               FROM gate_events
+               WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               GROUP BY event""",
+            (window,),
+        ).fetchall()
+
+        by_tool = conn.execute(
+            """SELECT tool, event,
+                      COUNT(*)                   AS events,
+                      COUNT(DISTINCT subject_id) AS subjects
+               FROM gate_events
+               WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               GROUP BY tool, event
+               ORDER BY subjects DESC""",
+            (window,),
+        ).fetchall()
+
+        blocked_subjects = conn.execute(
+            """SELECT COUNT(DISTINCT subject_id) AS n FROM gate_events
+               WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+            (window,),
+        ).fetchone()["n"]
+
+        # Signed-in people who were blocked are the highest-intent group
+        # in the table: they already have an account and still could not
+        # run the job.
+        blocked_with_account = conn.execute(
+            """SELECT COUNT(DISTINCT account_id) AS n FROM gate_events
+               WHERE account_id IS NOT NULL
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+            (window,),
+        ).fetchone()["n"]
+
+        buyers = conn.execute(
+            """SELECT COUNT(DISTINCT email) AS n FROM orders
+               WHERE status='paid' AND test_mode=0
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+            (window,),
+        ).fetchone()["n"]
+
+    out = {
+        "days": days,
+        "by_event": {r["event"]: dict(r) for r in totals},
+        "by_tool": [dict(r) for r in by_tool],
+        "blocked_subjects": blocked_subjects,
+        "blocked_accounts": blocked_with_account,
+        "buyers_in_window": buyers,
+    }
+    if blocked_subjects:
+        out["conversion_pct_ceiling"] = round(100.0 * buyers / blocked_subjects, 2)
+    return out
+
+
+@router.get("/gate", dependencies=ADMIN)
+async def gate(days: int = Query(default=30, ge=1, le=365)) -> dict:
+    """The funnel: gate seen -> gate hit on submit -> bought."""
+    return gate_funnel(days)
+
+
+@router.get("/gate/daily", dependencies=ADMIN)
+async def gate_daily(
+    days: int = Query(default=30, ge=1, le=365),
+    tool: str | None = Query(default=None, max_length=64),
+) -> dict:
+    """Day by day, off the gate_daily view."""
+    clauses = ["day >= strftime('%Y-%m-%d','now',?)"]
+    params: list = [f"-{days} days"]
+    if tool:
+        clauses.append("tool = ?")
+        params.append(tool)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM gate_daily WHERE {' AND '.join(clauses)}"
+            " ORDER BY day DESC, tool, event",
+            tuple(params),
+        ).fetchall()
+    return {"daily": [dict(r) for r in rows], "days": days, "tool": tool}
 
 
 # ---------------------------------------------------------------------------
