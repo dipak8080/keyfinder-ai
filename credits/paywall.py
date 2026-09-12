@@ -6,10 +6,20 @@ answer that counts is computed here, inside the actual job-creation request.
 
 It is also the only place that sees a refusal, so the gate_events writes
 live here too - see migration 005.
+
+THREADING (2026-09-12). guard() runs inside async route handlers, and
+every call it makes lands in SQLite. WAL keeps readers out of a writer's
+way but writers still serialise, and connect() sets busy_timeout=30000 -
+so a contended charge could park the whole event loop, not just its own
+request. Every DB call below now goes through asyncio.to_thread. The
+sync helpers are unchanged and still safe to call directly from sync
+code (preview() does, and credits/routes.py calls that from a sync
+handler, which FastAPI already runs in its threadpool).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from contextlib import asynccontextmanager
@@ -81,6 +91,9 @@ def record_gate_event(identity: Identity, *, event: str, tool: str,
     A failure here must not turn a correct 402 into a 500, and must not
     stop a preview returning. That is the only reason the whole body sits
     inside try/except.
+
+    Blocking. Sync callers may call it directly; async callers go
+    through _record_gate_event_async below.
     """
     from .db import connect, now_iso, period_key, tx
 
@@ -104,6 +117,13 @@ def record_gate_event(identity: Identity, *, event: str, tool: str,
                 )
     except Exception:
         log.warning("gate event not recorded (%s/%s)", event, tool, exc_info=True)
+
+
+async def _record_gate_event_async(identity: Identity, **kwargs) -> None:
+    try:
+        await asyncio.to_thread(record_gate_event, identity, **kwargs)
+    except Exception:
+        log.warning("gate event not recorded", exc_info=True)
 
 
 def preview(identity: Identity, tool: str, input_seconds: float | None) -> dict:
@@ -153,22 +173,38 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
     Raises 402 before the body runs if the caller can't pay. Any exception
     inside the block refunds the hold before propagating — a RunPod submit
     failure never costs a credit.
+
+    The charge is idempotent per job_id, which protects against the same
+    job being charged twice. It does NOT protect against a client that
+    times out and retries, since that retry arrives with a fresh job_id -
+    see idempotency.py for the layer that closes that.
     """
     decision = decide(tool, input_seconds)
     try:
-        charge = ledger_mod.charge_for_job(identity, job_id=job_id, tool=tool,
-                                          credits_needed=max(decision.credits, 1),
-                                          free_ops_needed=max(decision.free_ops, 1),
-                                          billable=decision.billable)
+        charge = await asyncio.to_thread(
+            ledger_mod.charge_for_job, identity,
+            job_id=job_id, tool=tool,
+            credits_needed=max(decision.credits, 1),
+            free_ops_needed=max(decision.free_ops, 1),
+            billable=decision.billable,
+        )
     except InsufficientCredits as exc:
-        record_gate_event(identity, event="submit_402", tool=tool,
-                          credits_needed=exc.needed, balance=exc.balance,
-                          free_remaining=exc.free_remaining,
-                          input_seconds=input_seconds)
+        await _record_gate_event_async(
+            identity, event="submit_402", tool=tool,
+            credits_needed=exc.needed, balance=exc.balance,
+            free_remaining=exc.free_remaining,
+            input_seconds=input_seconds,
+        )
         raise insufficient_credits_response(exc) from exc
 
     try:
         yield charge
-    except Exception:
-        ledger_mod.refund_job(job_id, reason="enqueue_failed")
+    except BaseException:
+        # BaseException, not Exception: a task cancelled mid-enqueue must
+        # return the credit too, and CancelledError does not inherit from
+        # Exception on 3.8+.
+        try:
+            await asyncio.to_thread(ledger_mod.refund_job, job_id, reason="enqueue_failed")
+        except Exception:
+            log.error("refund failed for job %s", job_id, exc_info=True)
         raise

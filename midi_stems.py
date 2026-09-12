@@ -38,15 +38,32 @@ STEM_PLAN = {
     "other":  ("yourmt3",    80, "Other",  24, 108, False),
 }
 
+# Frames per read in _stem_dbfs. A whole 10-minute stereo stem read at
+# float32 is ~210MB resident, five of those on a 6GB box that is also
+# running Demucs is an OOM waiting to happen, and we only need one RMS
+# number. Streaming caps it at a couple of MB per block.
+_DBFS_BLOCK_FRAMES = 1 << 18
+
 
 def _stem_dbfs(path: str) -> float:
+    """RMS in dBFS, streamed rather than loaded whole. Blocking: call via
+    run_blocking."""
+    total = 0.0
+    count = 0
     try:
-        data, _ = sf.read(path, dtype="float32", always_2d=True)
+        for block in sf.blocks(
+            path, blocksize=_DBFS_BLOCK_FRAMES, dtype="float32", always_2d=True
+        ):
+            if block.size == 0:
+                continue
+            wide = block.astype(np.float64, copy=False)
+            total += float(np.sum(wide * wide))
+            count += wide.size
     except Exception:
         return -120.0
-    if data.size == 0:
+    if count == 0:
         return -120.0
-    rms = float(np.sqrt(np.mean(np.square(data))))
+    rms = (total / count) ** 0.5
     return 20.0 * np.log10(rms) if rms > 0 else -120.0
 
 
@@ -122,6 +139,8 @@ async def _run_stem(stem: str, path: str, job_id: str, tmp_dir: str,
 
 def _merge(results: list, output_path: str, bpm: float,
            min_pitch, max_pitch, min_note_ms) -> dict:
+    """Blocking: parses up to five MIDI files and writes one. Call via
+    run_blocking."""
     merged = pretty_midi.PrettyMIDI(initial_tempo=bpm)
     min_dur = (min_note_ms or 0) / 1000.0
     tracks = []
@@ -148,8 +167,12 @@ def _merge(results: list, output_path: str, bpm: float,
         if not notes:
             continue
         if stem == "other" and len(src.instruments) > 1:
+            # Identity set rather than `n in notes`: pretty_midi.Note has no
+            # __eq__, so the list form was an O(n^2) identity scan and the
+            # "other" stem is the densest one we produce.
+            kept_ids = {id(n) for n in notes}
             for inst in src.instruments:
-                keep = [n for n in inst.notes if n in notes]
+                keep = [n for n in inst.notes if id(n) in kept_ids]
                 if not keep:
                     continue
                 track = pretty_midi.Instrument(program=inst.program, is_drum=False,
@@ -201,6 +224,7 @@ async def transcribe_stems(
     jid = job_id or uuid.uuid4().hex
     tmp_dir = tempfile.mkdtemp(prefix="midistems_")
     stem_paths: dict = {}
+    bpm_task = None
 
     try:
         sep_started = time.monotonic()
@@ -213,15 +237,25 @@ async def transcribe_stems(
             raise AudioToolError("Could not split this track into instruments. Try again or upload a shorter clip.")
         sep_seconds = time.monotonic() - sep_started
 
-        bpm_task = run_blocking(_detect_bpm, input_path)
+        # A real task, not a bare coroutine. As a coroutine this did not
+        # start until it was awaited below, so the BPM detection ran AFTER
+        # every stem instead of alongside them.
+        bpm_task = asyncio.create_task(run_blocking(_detect_bpm, input_path))
 
-        active, skipped = [], []
+        present, skipped = [], []
         for stem in STEM_PLAN:
             path = stem_paths.get(stem)
-            if not path or not os.path.exists(path):
+            if path and os.path.exists(path):
+                present.append(stem)
+            else:
                 skipped.append(stem)
-                continue
-            level = _stem_dbfs(path)
+
+        levels = await asyncio.gather(*[
+            run_blocking(_stem_dbfs, stem_paths[stem]) for stem in present
+        ])
+
+        active = []
+        for stem, level in zip(present, levels):
             if level < SILENCE_DBFS:
                 skipped.append(stem)
                 logger.info(f"[MIDI_STEMS] skipping {stem} ({level:.1f} dBFS)")
@@ -237,11 +271,20 @@ async def transcribe_stems(
         ])
         bpm = await bpm_task
 
-        stats = _merge(results, output_path, bpm or DEFAULT_BPM, min_pitch, max_pitch, min_note_ms)
+        stats = await run_blocking(
+            _merge, results, output_path, bpm or DEFAULT_BPM,
+            min_pitch, max_pitch, min_note_ms,
+        )
         stats["engine"] = "stems"
         stats["bpm"] = bpm
         stats["stems_used"] = [s for s, p, _ in results if p]
-        stats["stems_skipped"] = skipped + [s for s, p, _ in results if not p]
+        # SKIPPED AND FAILED ARE NOT THE SAME THING. These used to be one
+        # list, so the frontend told a paying user "no piano part was found
+        # in this track" when what actually happened was that the piano
+        # engine crashed. Skipped means silent or absent; failed means an
+        # engine we charged for did not deliver.
+        stats["stems_skipped"] = skipped
+        stats["stems_failed"] = [s for s, p, _ in results if not p]
         stats["notes_dropped_by_filter"] = 0
         stats["_gpu"] = {
             "fetch_seconds": 0.0,
@@ -253,11 +296,17 @@ async def transcribe_stems(
         logger.info(
             f"[MIDI_STEMS] job {jid} complete: {stats['note_count']} notes across "
             f"{stats['track_count']} tracks, bpm={bpm}, used={stats['stems_used']}, "
-            f"skipped={stats['stems_skipped']}, {stats['_gpu']['total_seconds']}s"
+            f"skipped={stats['stems_skipped']}, failed={stats['stems_failed']}, "
+            f"{stats['_gpu']['total_seconds']}s"
         )
         return stats
 
     finally:
+        # Anything that raises before `await bpm_task` leaves it running with
+        # nobody to collect it, which asyncio reports as a never-retrieved
+        # exception on an unrelated job.
+        if bpm_task is not None and not bpm_task.done():
+            bpm_task.cancel()
         for p in stem_paths.values():
             cleanup_file(p)
         try:

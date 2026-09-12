@@ -242,6 +242,7 @@ from log_stream import set_job_context, remember_job_tags, tag_from_job
 # settle_or_refund() is a no-op for any job with no charge row, which is
 # every job on every unmetered tool.
 from credits.ledger import settle_or_refund
+import job_tasks
 
 
 # ============================================================
@@ -438,6 +439,14 @@ async def _run_tool_job(
     succeeded = False
     failure: Optional[str] = None
 
+    # Makes this job addressable for cancellation.
+    # spawn_background_task holds a strong reference, but in an
+    # anonymous set, so nothing could find the task belonging to a
+    # given job. Everything downstream of a cancel already works:
+    # run_worker_job stops the RunPod meter, and the finally below
+    # refunds. See job_tasks.py.
+    job_tasks.register(job_id, asyncio.current_task())
+
     async with semaphore:
         waited = time.monotonic() - started
         if waited > 1.0:
@@ -485,12 +494,24 @@ async def _run_tool_job(
             )
 
         except asyncio.CancelledError:
-            # Shutdown. Mark it so a client polling across a redeploy
-            # gets a real answer instead of an eternal "processing", then
-            # re-raise so the task actually stops.
-            failure = "cancelled: server restarted while this job was running"
-            mark_failed(job_id, "The server restarted while this job was running.")
-            logger.warning(f"[{tool}] job={job_id} CANCELLED (shutdown)")
+            # Two different events arrive here and they need different
+            # copy. A user pressing Cancel is not a redeploy, and
+            # telling someone the server restarted when they stopped
+            # the job themselves reads as a fault we are hiding.
+            #
+            # Either way this marks the job so a client polling across
+            # it gets a real answer instead of an eternal "processing",
+            # then re-raises so the task actually stops - and the
+            # re-raise lands in the finally below, which is what
+            # returns the credit in the same instant.
+            if job_tasks.was_user_cancelled(job_id):
+                failure = "cancelled by user"
+                mark_failed(job_id, "You stopped this job before it finished.")
+                logger.info(f"[{tool}] job={job_id} CANCELLED (user)")
+            else:
+                failure = "cancelled: server restarted while this job was running"
+                mark_failed(job_id, "The server restarted while this job was running.")
+                logger.warning(f"[{tool}] job={job_id} CANCELLED (shutdown)")
             raise
 
         except Exception as e:
@@ -556,6 +577,7 @@ async def _run_tool_job(
                 cleanup_file(path)
             release_memory_to_os()
             record_result(metric, succeeded, client_side=client_side)
+            job_tasks.unregister(job_id)
             if gpu_billed:
                 # RESERVED, currently unused by any caller (both
                 # separation call sites pass gpu_billed=False - the

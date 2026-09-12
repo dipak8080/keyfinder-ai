@@ -72,6 +72,7 @@ from utils import ensure_cookies_file
 from routes import router
 from jobs import cleanup_expired_jobs, get_job_stats
 from log_stream import RequestLoggerMiddleware, router as logs_router, attach_system_log_capture
+from idempotency import IdempotencyMiddleware
 from cookie_upload import router as cookie_upload_router
 from gpu_internal_routes import router as gpu_internal_router
 
@@ -306,6 +307,7 @@ app = FastAPI(
 )
 
 # Logs every HTTP request (timestamp, method, path, status, duration, IP) to SQLite
+app.add_middleware(IdempotencyMiddleware)
 app.add_middleware(RequestLoggerMiddleware)
 
 app.add_middleware(

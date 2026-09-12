@@ -9,6 +9,14 @@ None of these can charge anything. Charging happens exactly once, inside
 the job-creation request, via paywall.guard() - see credits/paywall.py.
 That separation is the point: an endpoint the browser can call freely
 must never be able to move the ledger.
+
+SYNC HANDLERS, DELIBERATELY (2026-09-12). Every one of these does
+blocking SQLite work and awaits nothing. Declared as coroutines, that
+work ran on the event loop, where a contended write under a 30-second
+busy_timeout could stall every other request on the server. Declared as
+plain functions, FastAPI runs them in its own threadpool and the loop
+stays free. Nothing else changes: same signatures, same dependencies,
+same responses.
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ class ClaimRequest(BaseModel):
 
 
 @router.get("/me")
-async def me(
+def me(
     response: Response,
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
@@ -62,7 +70,7 @@ async def me(
 
 
 @router.post("/preview")
-async def preview(
+def preview(
     body: PreviewRequest,
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
@@ -78,7 +86,7 @@ async def preview(
 
 
 @router.post("/claim")
-async def claim(
+def claim(
     body: ClaimRequest,
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:

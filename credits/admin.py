@@ -67,7 +67,7 @@ ADMIN = [Depends(require_admin)]
 # ---------------------------------------------------------------------------
 
 @router.get("/overview", dependencies=ADMIN)
-async def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
+def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
     """The one screen. Paywall state, outstanding liability, unit economics.
 
     credits_outstanding is a LIABILITY, not a score: it's credits people
@@ -118,7 +118,7 @@ async def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/costs", dependencies=ADMIN)
-async def costs(
+def costs(
     days: int = Query(default=30, ge=1, le=365),
     tool: str | None = Query(default=None, max_length=64),
     date_from: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
@@ -165,7 +165,7 @@ async def costs(
 
 
 @router.get("/jobs", dependencies=ADMIN)
-async def recent_jobs(
+def recent_jobs(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     tool: str | None = Query(default=None, max_length=64),
@@ -303,7 +303,7 @@ async def recent_jobs(
 
 
 @router.get("/jobs/filters", dependencies=ADMIN)
-async def job_filter_options() -> dict:
+def job_filter_options() -> dict:
     """What values the filters above can actually take, read from the data.
 
     Exists so the admin UI's dropdowns are populated from what is really
@@ -409,13 +409,13 @@ def gate_funnel(days: int = 30) -> dict:
 
 
 @router.get("/gate", dependencies=ADMIN)
-async def gate(days: int = Query(default=30, ge=1, le=365)) -> dict:
+def gate(days: int = Query(default=30, ge=1, le=365)) -> dict:
     """The funnel: gate seen -> gate hit on submit -> bought."""
     return gate_funnel(days)
 
 
 @router.get("/gate/daily", dependencies=ADMIN)
-async def gate_daily(
+def gate_daily(
     days: int = Query(default=30, ge=1, le=365),
     tool: str | None = Query(default=None, max_length=64),
 ) -> dict:
@@ -439,7 +439,7 @@ async def gate_daily(
 # ---------------------------------------------------------------------------
 
 @router.get("/users/lookup", dependencies=ADMIN)
-async def lookup_user(email: str = Query(..., max_length=254)) -> dict:
+def lookup_user(email: str = Query(..., max_length=254)) -> dict:
     """Everything about one customer, by the email they paid with.
 
     Built for one specific support message. Returns found=false rather
@@ -523,7 +523,7 @@ async def lookup_user(email: str = Query(..., max_length=254)) -> dict:
 
 
 @router.get("/webhooks", dependencies=ADMIN)
-async def recent_webhooks(
+def recent_webhooks(
     limit: int = Query(default=50, ge=1, le=200),
     unprocessed_only: bool = False,
 ) -> dict:
@@ -559,7 +559,7 @@ class AdjustRequest(BaseModel):
 
 
 @router.post("/adjust", dependencies=ADMIN)
-async def adjust(body: AdjustRequest) -> dict:
+def adjust(body: AdjustRequest) -> dict:
     """Grant or remove credits by hand, with a mandatory reason.
 
     Creates the account if the email is unknown - that is the common
@@ -601,7 +601,7 @@ async def adjust(body: AdjustRequest) -> dict:
 
 
 @router.post("/sweep", dependencies=ADMIN)
-async def sweep() -> dict:
+def sweep() -> dict:
     """Force the orphaned-hold sweep instead of waiting 15 minutes.
 
     Useful right after a deploy: a restart kills in-flight jobs, and this
@@ -611,7 +611,7 @@ async def sweep() -> dict:
 
 
 @router.post("/reload-config", dependencies=ADMIN)
-async def reload_config() -> dict:
+def reload_config() -> dict:
     """Re-read env WITHOUT a restart.
 
     Honest caveat: this only helps if the environment of the RUNNING

@@ -168,6 +168,7 @@ from .sheet_music import router as _sheet_music_router
 from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
+from .cancel import router as _cancel_router
 from . import youtube_transcribe
 from . import video_transcribe
 
@@ -188,5 +189,6 @@ router.include_router(_sheet_music_router)
 router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)
+router.include_router(_cancel_router)
 router.include_router(youtube_transcribe.router)
 router.include_router(video_transcribe.router)
