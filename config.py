@@ -807,6 +807,23 @@ AUDIO_TOOL_MAX_DURATION_SECONDS = {
     "pitch": 900,   # 15 min - comfortably inside pitch's 600s timeout
     "tempo": 900,   # 15 min - same
     "audio_to_sheet": 900,   # 15 min - matches MAX_SHEET_MUSIC_DURATION_SECONDS
+
+    # MEMORY, not time. areverse cannot stream - ffmpeg buffers the
+    # ENTIRE decoded input before emitting the first sample. An hour of
+    # stereo 48kHz in planar float is ~1.4 GB resident, and with
+    # MAX_CONCURRENT_AUDIO_TOOLS=4 against a ~5.7 GiB container shared
+    # with Demucs, four hour-long reverses is an OOM rather than a slow
+    # request. 10 min caps one run near 240 MB.
+    "reverse": 600,
+
+    # The timeout case the comment above describes. arnndn (voice-clean)
+    # runs near 10-20x realtime behind a resample and dynaudnorm; afftdn
+    # (noise-remove, echo-remove) is similar. An hour plausibly exceeds
+    # their 300s subprocess timeout on a shared 4-vCPU box - accepted,
+    # given one of four slots, killed five minutes later.
+    "noise_remove": 1200,   # 20 min
+    "voice_clean": 1200,
+    "echo_remove": 1200,
 }
 
 # ---------- AUDIO TOOLS: FORMAT VALIDATION ----------
