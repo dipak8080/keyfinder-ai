@@ -2055,6 +2055,41 @@ async def stream_system_logs(request: Request, key: str = Query(...)):
 # 3. LOG CLEANUP
 # ============================================================
 
+def prune_logs_older_than(days: int) -> int:
+    """Deletes log rows older than `days`. Returns how many went.
+
+    Blocking - call it through run_in_executor, the same way
+    cleanup_expired_jobs() is called. Never raises: a failed prune must
+    not kill the loop that schedules it, and the caller logs.
+
+    No VACUUM. The freed pages go on SQLite's freelist and the next
+    inserts reuse them, so the file stops growing instead of shrinking -
+    which is the point. VACUUM needs an exclusive lock and a full
+    rewrite of the one file the writer thread appends to continuously.
+    """
+    cutoff = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    ).isoformat()
+    removed = 0
+    try:
+        with get_db() as conn:
+            for table in ("request_logs", "system_logs"):
+                n = conn.execute(
+                    f"SELECT COUNT(*) AS c FROM {table} WHERE timestamp < ?", (cutoff,)
+                ).fetchone()["c"]
+                if n:
+                    conn.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+                    removed += n
+            conn.commit()
+        if removed:
+            _invalidate_counts()
+    except Exception:
+        log_stream_logger = logging.getLogger(__name__)
+        log_stream_logger.error("[LOGS] Retention prune failed", exc_info=True)
+        return 0
+    return removed
+
+
 @router.delete("/admin/logs")
 def delete_logs(request: Request, key: str = Query(...), older_than_days: int = Query(None)):
     _check_admin(request, key)

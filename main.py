@@ -71,7 +71,12 @@ from config import (
 from utils import ensure_cookies_file
 from routes import router
 from jobs import cleanup_expired_jobs, get_job_stats
-from log_stream import RequestLoggerMiddleware, router as logs_router, attach_system_log_capture
+from log_stream import (
+    RequestLoggerMiddleware,
+    router as logs_router,
+    attach_system_log_capture,
+    prune_logs_older_than,
+)
 from idempotency import IdempotencyMiddleware
 from cookie_upload import router as cookie_upload_router
 from gpu_internal_routes import router as gpu_internal_router
@@ -96,6 +101,13 @@ from credits.admin import router as credits_admin_router
 # the expired jobs earned.
 JOB_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("JOB_CLEANUP_INTERVAL_SECONDS", "60"))
 
+# Log retention. logs.db had no automatic pruning at all - only a manual
+# DELETE /admin/logs - and grows about 27 MB a day at current traffic.
+# Disk is not the concern; the nightly R2 backup is, since logs.db rides
+# along in it and is retained in ~13 copies.
+LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "14"))
+LOG_PRUNE_INTERVAL_SECONDS = int(os.environ.get("LOG_PRUNE_INTERVAL_SECONDS", "21600"))
+
 # How often orphaned credit holds are swept. Much less frequent than the
 # job sweep because it is a rescue path, not a routine one: every normal
 # outcome (success, failure, cancellation) settles or refunds its own
@@ -106,7 +118,35 @@ JOB_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("JOB_CLEANUP_INTERVAL_SECONDS"
 CREDIT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("CREDIT_SWEEP_INTERVAL_SECONDS", "900"))
 
 
-async def _job_cleanup_loop():
+async def _log_prune_loop():
+    """Periodic retention sweep for logs.db.
+
+    Same structure and the same reasons as _job_cleanup_loop below: off
+    the request path, on a fixed schedule, and dispatched to a worker
+    thread so the DELETE never blocks the event loop.
+
+    Runs every 6 hours rather than every minute - retention is a slow
+    boundary and each pass is a table scan on an indexed column, so
+    there is nothing to gain from checking more often.
+    """
+    while True:
+        try:
+            await asyncio.sleep(LOG_PRUNE_INTERVAL_SECONDS)
+            removed = await asyncio.get_running_loop().run_in_executor(
+                None, prune_logs_older_than, LOG_RETENTION_DAYS
+            )
+            if removed:
+                logger.info(
+                    f"[LOGS] Retention sweep removed {removed} row(s) "
+                    f"older than {LOG_RETENTION_DAYS} days"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[LOGS] Retention sweep failed: {e}", exc_info=True)
+
+
+async def _job_cleanup_loop():
     """
     Periodic TTL sweep for the job table.
 
@@ -244,11 +284,16 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
     credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
+    log_prune_task = asyncio.create_task(_log_prune_loop())
     logger.info(
         f"[JOBS] Background cleanup running every {JOB_CLEANUP_INTERVAL_SECONDS}s"
     )
     logger.info(
         f"[CREDITS] Hold sweep running every {CREDIT_SWEEP_INTERVAL_SECONDS}s"
+    )
+    logger.info(
+        f"[LOGS] Retention sweep running every {LOG_PRUNE_INTERVAL_SECONDS}s, "
+        f"keeping {LOG_RETENTION_DAYS} days"
     )
 
     yield
@@ -257,7 +302,8 @@ async def lifespan(app: FastAPI):
     # a deletion in progress isn't torn down mid-write.
     cleanup_task.cancel()
     credit_sweep_task.cancel()
-    for task in (cleanup_task, credit_sweep_task):
+    log_prune_task.cancel()
+    for task in (cleanup_task, credit_sweep_task, log_prune_task):
         try:
             await task
         except asyncio.CancelledError:
