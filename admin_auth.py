@@ -42,6 +42,7 @@ pattern as rate_limit.py's own limiter. Fine for a single-VPS
 deployment; the whole point is stopping automated abuse within a single
 process's lifetime, not distributed coordination.
 """
+import hmac
 import time
 import threading
 from typing import Optional
@@ -164,7 +165,17 @@ def verify_admin_key(key: str, client_ip: str):
     the client_ip it returned - so lockout state and rate-limit state
     are always keyed by the same IP resolution.
     """
-    if key == ADMIN_STATUS_KEY:
+    # compare_digest, NOT ==. Python's string equality short-circuits on
+    # the first differing byte, so the time it takes leaks how many
+    # leading characters matched. gpu_internal_routes._check_secret and
+    # routes/youtube._verify_download_token both already use this, with
+    # the same reasoning written out - and this is the one secret that
+    # opens every admin route.
+    #
+    # The lockout below is what actually stops a brute force; this closes
+    # the side-channel that a patient attacker under the rate limit could
+    # otherwise use to avoid guessing blind.
+    if hmac.compare_digest(key or "", ADMIN_STATUS_KEY or ""):
         return  # correct - nothing to record, request proceeds normally
 
     now = time.time()
