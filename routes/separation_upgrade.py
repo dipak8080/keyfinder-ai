@@ -365,6 +365,10 @@ async def _queue_upgrade(
                 # reclaimed by that job's TTL sweep, not by this task.
                 cleanup_paths=[],
                 success_detail=success_detail, gpu_billed=False,
+                # Closes the gpu_job_metrics row opened below. Same reasoning
+                # as routes/separation.py: without it an upgrade that is
+                # cancelled or interrupted never records an outcome.
+                metered_tool=rule_key,
             ))
     except Exception:
         _release_claim()

@@ -292,6 +292,14 @@ async def _queue_separation(
             # gpu_seconds instead - see this function's gpu_billed docstring
             # for why counting both would double-bill the budget.
             gpu_billed=False,
+            # Closes the gpu_job_metrics row this route opened at submit.
+            # separation.py closes it on success and on RunPodJobError, but
+            # nothing else - so a cancelled or restarted job sat at
+            # status='created' forever and diluted cost-per-job. Only used
+            # as a flag; the runner writes job_id and status, and
+            # record_job_finished COALESCEs, so separation.py's more
+            # precise values survive this later write.
+            metered_tool=rule_key or metric_label.lstrip("/"),
         ))
 
     billing = None

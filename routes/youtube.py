@@ -1353,6 +1353,11 @@ async def _run_youtube_separation(
         # False: see separation.py's _queue_separation equivalent comment
         # - the real billed figure is recorded inside separation.py.
         gpu_billed=False,
+        # Closes the gpu_job_metrics row the chain route opened at submit.
+        # Two of the fifteen rows stuck at status='created' on 12 Sep were
+        # youtube/separate-hq jobs that ended any way other than success or
+        # a RunPodJobError.
+        metered_tool=metric.lstrip("/"),
     )
 
 
