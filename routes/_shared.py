@@ -506,6 +506,17 @@ async def _run_tool_job(
             # returns the credit in the same instant.
             if job_tasks.was_user_cancelled(job_id):
                 failure = "cancelled by user"
+                # CLIENT SIDE. A cancel is the user's decision, not an
+                # outage. Left at the default it counted as a server
+                # failure, so five cancels paged Discord and every one
+                # landed in gpu_job_metrics as failure_side='server' -
+                # exactly the mixing of "cannot be processed" with "we
+                # broke" that the rejected/failed split exists to stop.
+                #
+                # The shutdown branch below is deliberately NOT marked:
+                # a redeploy killing a job mid-run IS ours, it should
+                # count, and it should page if it keeps happening.
+                client_side = True
                 mark_failed(job_id, "You stopped this job before it finished.")
                 logger.info(f"[{tool}] job={job_id} CANCELLED (user)")
             else:
