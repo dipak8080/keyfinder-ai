@@ -118,35 +118,35 @@ LOG_PRUNE_INTERVAL_SECONDS = int(os.environ.get("LOG_PRUNE_INTERVAL_SECONDS", "2
 CREDIT_SWEEP_INTERVAL_SECONDS = int(os.environ.get("CREDIT_SWEEP_INTERVAL_SECONDS", "900"))
 
 
-async def _log_prune_loop():
-    """Periodic retention sweep for logs.db.
-
-    Same structure and the same reasons as _job_cleanup_loop below: off
-    the request path, on a fixed schedule, and dispatched to a worker
-    thread so the DELETE never blocks the event loop.
-
-    Runs every 6 hours rather than every minute - retention is a slow
-    boundary and each pass is a table scan on an indexed column, so
-    there is nothing to gain from checking more often.
-    """
-    while True:
-        try:
-            await asyncio.sleep(LOG_PRUNE_INTERVAL_SECONDS)
-            removed = await asyncio.get_running_loop().run_in_executor(
-                None, prune_logs_older_than, LOG_RETENTION_DAYS
-            )
-            if removed:
-                logger.info(
-                    f"[LOGS] Retention sweep removed {removed} row(s) "
-                    f"older than {LOG_RETENTION_DAYS} days"
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error(f"[LOGS] Retention sweep failed: {e}", exc_info=True)
-
-
-async def _job_cleanup_loop():
+async def _log_prune_loop():
+    """Periodic retention sweep for logs.db.
+
+    Same structure and the same reasons as _job_cleanup_loop below: off
+    the request path, on a fixed schedule, and dispatched to a worker
+    thread so the DELETE never blocks the event loop.
+
+    Runs every 6 hours rather than every minute - retention is a slow
+    boundary and each pass is a table scan on an indexed column, so
+    there is nothing to gain from checking more often.
+    """
+    while True:
+        try:
+            await asyncio.sleep(LOG_PRUNE_INTERVAL_SECONDS)
+            removed = await asyncio.get_running_loop().run_in_executor(
+                None, prune_logs_older_than, LOG_RETENTION_DAYS
+            )
+            if removed:
+                logger.info(
+                    f"[LOGS] Retention sweep removed {removed} row(s) "
+                    f"older than {LOG_RETENTION_DAYS} days"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[LOGS] Retention sweep failed: {e}", exc_info=True)
+
+
+async def _job_cleanup_loop():
     """
     Periodic TTL sweep for the job table.
 
