@@ -115,8 +115,15 @@ for c in "${DIRECT_CLIENTS[@]}"; do
   direct="${direct}${c}=${r},"
   case $r in OK) d_ok=$((d_ok+1)) ;; BOT) d_bot=$((d_bot+1)) ;; *) d_fail="$d_fail $c" ;; esac
 done
-if [ "$d_bot" -eq "${#DIRECT_CLIENTS[@]}" ]; then
+# 2026-09-12: while the VPS IP is challenged, which clients answer BOT and
+# which answer FAIL shuffles run to run, and each shuffle looked like a new
+# state and alerted. Nothing actionable changed: no client works, for the
+# same reason. Zero working clients collapses to one state, whatever the
+# mix; a genuine client break (some clients still working) still names the
+# failing ones, which is the case worth waking up for.
+if [ "$d_ok" -eq 0 ]; then
   direct_state="direct=BOTCHECKED"
+  d_fail=""
 else
   direct_state="direct:${direct%,}"
 fi
@@ -200,7 +207,7 @@ elif [ "$p_fail" -gt 0 ]; then
 elif [ -n "$d_fail" ]; then
   msg="[CANARY] Free-path client change ($current). Failing:${d_fail}. See CLIENT_LADDER_NO_COOKIES in youtube.py. Error output: tail -60 $FAILLOG"
 elif [ "$direct_state" = "direct=BOTCHECKED" ]; then
-  msg="[CANARY] No-cookie path is bot-checked on the VPS IP. Downloads run on cookies for free; the proxy is only a fallback. No action needed ($current)."
+  msg="[CANARY] No-cookie path is unusable from the VPS IP (bot-checked, or the clients fail on it). Downloads run on cookies for free; the proxy is only a fallback. No action needed ($current)."
 else
   msg="[CANARY] Healthy ($current)."
 fi
