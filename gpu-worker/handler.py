@@ -209,11 +209,19 @@ GPU_SHARED_SECRET = os.environ.get("GPU_SHARED_SECRET", "")
 # max_duration_seconds / Demucs execution timeout.
 _TRANSFER_TIMEOUT_SECONDS = 120
 
-# Upload retry policy. See _upload_result's docstring for why the OUTPUT
-# side is retried and the input side is not: a failed upload discards GPU
-# work that has already been billed for.
+# Transfer retry policy, both directions.
+#
+# The input side was deliberately NOT retried until 2026-09-12, on the
+# reasoning that a failed fetch costs only a cold start. True for the
+# bill, wrong for the user: 2026-09-12 04:17, an 11.5 MB mp3 stopped at
+# 3.0 MB ("IncompleteRead") and the separation was lost. Resubmitting
+# then pays for a SECOND cold start and a full separation, so not
+# retrying is the more expensive branch. A retry here is free: no GPU
+# work has run yet, and it reuses the worker already running.
 _UPLOAD_MAX_ATTEMPTS = 3
 _UPLOAD_BACKOFF_SECONDS = 2.0
+_DOWNLOAD_MAX_ATTEMPTS = 3
+_DOWNLOAD_BACKOFF_SECONDS = 2.0
 
 
 def _safe_extension(filename: str, fallback: str = "wav") -> str:
@@ -241,18 +249,78 @@ def _get_duration_seconds(file_path: str) -> float:
 
 def _download_input(job_id: str, dest_path: str) -> None:
     """
-    GETs the input audio from the VPS. Raises on any failure - the
-    caller (handler()) wraps this in a try/except and turns it into a
-    clean {"error": ...} return, same as every other failure path here.
+    GETs the input audio from the VPS, retried on transport failures.
+    Raises on any failure - the caller (handler()) wraps this in a
+    try/except and turns it into a clean {"error": ...} return, same as
+    every other failure path here.
+
+    A SHORT BODY IS A FAILURE, not a file. The VPS serves this with
+    FileResponse, so Content-Length is always present and a truncated
+    transfer is detectable. Without this check a partial mp3 reaches
+    Demucs, which fails later with something unrelated-looking (or,
+    worse, separates the first 3 MB and returns a silently truncated
+    result the user pays for). 4xx is not retried - a bad secret or an
+    expired job reproduces identically.
     """
     url = f"{VPS_BASE_URL}/internal/gpu/input/{job_id}"
     headers = {"Authorization": f"Bearer {GPU_SHARED_SECRET}"}
-    with requests.get(url, headers=headers, timeout=_TRANSFER_TIMEOUT_SECONDS, stream=True) as res:
-        if res.status_code != 200:
-            raise RuntimeError(f"Failed to fetch input audio (HTTP {res.status_code}): {res.text[:300]}")
-        with open(dest_path, "wb") as f:
-            for chunk in res.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
+    last_error = "unknown error"
+
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            with requests.get(
+                url, headers=headers, timeout=_TRANSFER_TIMEOUT_SECONDS, stream=True
+            ) as res:
+                if 400 <= res.status_code < 500:
+                    raise RuntimeError(
+                        f"Failed to fetch input audio (HTTP {res.status_code}): {res.text[:300]}"
+                    )
+                if res.status_code != 200:
+                    last_error = f"HTTP {res.status_code}: {res.text[:200]}"
+                    raise _RetryTransfer(last_error)
+
+                expected = res.headers.get("Content-Length")
+                written = 0
+                with open(dest_path, "wb") as f:
+                    for chunk in res.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        written += len(chunk)
+
+            if expected is not None and written != int(expected):
+                last_error = f"truncated transfer: got {written} of {expected} bytes"
+                raise _RetryTransfer(last_error)
+            if written == 0:
+                last_error = "empty response body"
+                raise _RetryTransfer(last_error)
+            if attempt > 1:
+                print(f"[TRANSFER] Input fetch succeeded on attempt {attempt}", flush=True)
+            return
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_error = str(e) or type(e).__name__
+
+        # Any partial file is removed before retrying: the next attempt
+        # opens "wb" anyway, but leaving it would make an abandoned final
+        # attempt look like a readable input to anything downstream.
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+
+        if attempt < _DOWNLOAD_MAX_ATTEMPTS:
+            print(
+                f"[TRANSFER] Input fetch attempt {attempt}/{_DOWNLOAD_MAX_ATTEMPTS} "
+                f"failed, retrying: {last_error[:200]}",
+                flush=True,
+            )
+            time.sleep(_DOWNLOAD_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"Failed to fetch input audio after {_DOWNLOAD_MAX_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def _upload_result(job_id: str, name: str, file_path: str) -> None:
@@ -308,6 +376,12 @@ def _upload_result(job_id: str, name: str, file_path: str) -> None:
     raise RuntimeError(
         f"Failed to upload result '{name}' after {_UPLOAD_MAX_ATTEMPTS} attempts: {last_error}"
     )
+
+
+class _RetryTransfer(Exception):
+    """Internal: a transport-level failure worth another attempt. Never
+    escapes _download_input - it is caught by the same handler as any
+    other transport exception there."""
 
 
 MIN_DURATION_SECONDS = 3.0
