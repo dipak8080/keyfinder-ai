@@ -192,6 +192,12 @@ TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe", "video_transcribe
 # worker, different queue.
 MIDI_HQ_JOB_TYPES = ("audio_to_midi_hq",)
 
+# The free sidecar pool, kept separate from MIDI_HQ_JOB_TYPES above for
+# the reason that comment gives: different semaphore, different worker,
+# different queue. Counting them together would let a busy midi-worker
+# reject a paid job that never touches it.
+MIDI_JOB_TYPES = ("audio_to_midi",)
+
 
 # Blue-green deploy slot ("a"/"b", set by deploy.yml). Prefixing ids with
 # it lets nginx send a job's follow-up requests to the container that owns

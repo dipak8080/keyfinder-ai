@@ -33,7 +33,12 @@ from jobs import get_job
 from audio_common import get_audio_mime_type
 from audio_to_midi import convert_to_midi
 
-from ._shared import _submit_audio_tool, _tool_status, _resolve_tool_output_path
+from ._shared import (
+    _submit_audio_tool,
+    _tool_status,
+    _resolve_tool_output_path,
+    _reject_if_midi_queue_full,
+)
 
 router = APIRouter()
 
@@ -73,6 +78,12 @@ async def audio_to_midi_route(
     if (minimum_frequency is not None and maximum_frequency is not None
             and minimum_frequency >= maximum_frequency):
         raise HTTPException(400, "minimum_frequency must be less than maximum_frequency.")
+
+    # Capacity before anything is written to disk, so a refused
+    # submission leaves no job row and no uploaded bytes. This pool has
+    # its own semaphore, so it is not covered by the shared
+    # audio-tools guard inside _submit_audio_tool.
+    _reject_if_midi_queue_full()
 
     return await _submit_audio_tool(
         file,

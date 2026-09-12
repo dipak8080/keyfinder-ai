@@ -200,6 +200,7 @@ from config import (
     MAX_QUEUED_TRANSCRIPTIONS,
     MAX_QUEUED_AUDIO_TOOLS,
     MAX_QUEUED_MIDI_HQ,
+    MAX_QUEUED_MIDI,
     AUDIO_TOOL_JOB_TYPES,
     # The per-tool duration caps. MAX_AUDIO_TOOL_DURATION_SECONDS is
     # deliberately NOT imported alongside it: validate_duration()'s
@@ -225,6 +226,7 @@ from jobs import (
     SEPARATION_JOB_TYPES,
     TRANSCRIPTION_JOB_TYPES,
     MIDI_HQ_JOB_TYPES,
+    MIDI_JOB_TYPES,
 )
 from separation import SeparationError
 from audio_common import (
@@ -890,6 +892,45 @@ def _reject_if_midi_hq_queue_full():
             503,
             "The high-quality MIDI queue is full right now. These jobs take "
             "under a minute each - please try again shortly.",
+        )
+
+
+def _reject_if_midi_queue_full():
+    """
+    The bounded queue for the FREE /audio-to-midi.
+
+    The fifth guard in this file, and the one that fell between two
+    correct decisions. _reject_if_midi_hq_queue_full deliberately does
+    not count this pool, and _submit_audio_tool deliberately skips the
+    shared audio-tools guard for any caller bringing its own semaphore -
+    which today is only /audio-to-midi. Both are right: these are
+    separate pools and must not share a counter. Neither implies the
+    free pool needs no ceiling of its own, and it had none.
+
+    Everything the HQ guard's docstring says applies here verbatim, with
+    MAX_CONCURRENT_MIDI in place of MAX_CONCURRENT_MIDI_HQ: the
+    semaphore is acquired inside the background task, so submissions
+    past it were never refused - they queued in memory with no limit,
+    each holding an uploaded file on disk and a job row, while the person
+    watching the spinner had no way to know they were tenth in line.
+
+    THE RATE LIMITER DOES NOT COVER THIS. 5 per 5 minutes is per-IP;
+    this is a whole-server capacity bound. Ten visitors each inside
+    their allowance is ten queued jobs and zero rate-limit violations.
+
+    503, not 429: the server is at capacity and the caller did nothing
+    wrong.
+    """
+    depth = count_processing(MIDI_JOB_TYPES)
+    if depth >= MAX_QUEUED_MIDI:
+        logger.warning(
+            f"[AUDIO_TO_MIDI] Rejected submission - queue full "
+            f"({depth}/{MAX_QUEUED_MIDI} jobs in flight)"
+        )
+        raise HTTPException(
+            503,
+            "The MIDI queue is full right now. These jobs are usually quick - "
+            "please try again in a moment.",
         )
 
 

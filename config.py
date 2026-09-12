@@ -1469,6 +1469,14 @@ MIN_MIDI_DURATION_SECONDS = float(os.environ.get("MIN_MIDI_DURATION_SECONDS", "1
 # HTTP connections.
 MAX_CONCURRENT_MIDI = int(os.environ.get("MAX_CONCURRENT_MIDI", "2"))
 
+# The bounded queue for /audio-to-midi, mirroring MAX_QUEUED_SEPARATIONS
+# and MAX_QUEUED_MIDI_HQ. MAX_CONCURRENT_MIDI above caps how many run at
+# once, but that semaphore is acquired inside the background task - so
+# without a ceiling here, submissions past it queue in memory unbounded,
+# each holding an uploaded file on disk and a job row. Four times the
+# concurrency, the same ratio the separation pool uses.
+MAX_QUEUED_MIDI = int(os.environ.get("MAX_QUEUED_MIDI", "8"))
+
 MIDI_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MIDI_RATE_LIMIT_MAX_REQUESTS", "5"))
 MIDI_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MIDI_RATE_LIMIT_WINDOW_SECONDS", "300"))  # 5 min
 
