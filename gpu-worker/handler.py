@@ -296,7 +296,7 @@ def _download_input(job_id: str, dest_path: str) -> None:
                 print(f"[TRANSFER] Input fetch succeeded on attempt {attempt}", flush=True)
             return
 
-        except RuntimeError:
+        except (RuntimeError, requests.HTTPError):
             raise
         except Exception as e:
             last_error = str(e) or type(e).__name__

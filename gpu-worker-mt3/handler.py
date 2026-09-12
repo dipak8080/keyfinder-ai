@@ -165,6 +165,88 @@ except Exception as exc:  # noqa: BLE001
 # Input fetch
 # ---------------------------------------------------------------------------
 
+_FETCH_MAX_ATTEMPTS = 3
+_FETCH_BACKOFF_SECONDS = 2.0
+
+
+class _RetryFetch(Exception):
+    """Internal: a transport-level failure worth another attempt. Never
+    escapes the fetch helper below."""
+
+
+def _discard_partial(path: str) -> None:
+    """A half-written input must never be left where the model can read
+    it: the next attempt opens "wb" anyway, but an abandoned final
+    attempt would otherwise leave a fragment on disk."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _fetch_with_retry(url: str, headers: dict, dest_path: str, timeout) -> int:
+    """Streams the VPS input to disk, retried on transport failures.
+
+    RETRIED, and a short body is a failure (2026-09-12). An 11.5 MB input
+    stopped at 3.0 MB on the demucs worker ("IncompleteRead") and the job
+    was lost; resubmitting pays a second cold start and a second full GPU
+    run, so not retrying is the more expensive branch. No GPU work has
+    happened yet here, so a retry is free. The VPS serves this with
+    FileResponse, so Content-Length is always present and a truncated
+    transfer is detectable - without the check a partial file reaches the
+    model and fails as something unrelated-looking, or worse succeeds on
+    the fragment. 4xx is never retried: a bad secret or an expired token
+    reproduces identically.
+    """
+    last_error = "unknown error"
+
+    for attempt in range(1, _FETCH_MAX_ATTEMPTS + 1):
+        written = 0
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+                if 400 <= r.status_code < 500:
+                    r.raise_for_status()
+                if r.status_code != 200:
+                    last_error = f"HTTP {r.status_code}"
+                    raise _RetryFetch(last_error)
+
+                expected = r.headers.get("Content-Length")
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+
+            if written == 0:
+                last_error = "the VPS served an empty input file"
+                raise _RetryFetch(last_error)
+            if expected is not None and written != int(expected):
+                last_error = f"truncated transfer: got {written} of {expected} bytes"
+                raise _RetryFetch(last_error)
+            if attempt > 1:
+                print(f"[TRANSFER] Input fetch succeeded on attempt {attempt}", flush=True)
+            return written
+
+        except requests.HTTPError:
+            raise
+        except Exception as e:
+            last_error = str(e) or type(e).__name__
+
+        _discard_partial(dest_path)
+        if attempt < _FETCH_MAX_ATTEMPTS:
+            print(
+                f"[TRANSFER] Input fetch attempt {attempt}/{_FETCH_MAX_ATTEMPTS} "
+                f"failed, retrying: {last_error[:200]}",
+                flush=True,
+            )
+            time.sleep(_FETCH_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"Failed to fetch input audio after {_FETCH_MAX_ATTEMPTS} attempts: {last_error}"
+    )
+
+
 def _fetch_input(vps_base_url: str, token: str, secret: str, dest_path: str) -> int:
     """Pull the audio the VPS registered against this one-time token.
 
@@ -189,16 +271,7 @@ def _fetch_input(vps_base_url: str, token: str, secret: str, dest_path: str) -> 
     # and the only place the truth exists is a header name neither side
     # prints.
     headers = {"Authorization": f"Bearer {secret}"}
-
-    written = 0
-    with requests.get(url, headers=headers, stream=True, timeout=_HTTP_TIMEOUT) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    written += len(chunk)
-    return written
+    return _fetch_with_retry(url, headers, dest_path, _HTTP_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
