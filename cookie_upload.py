@@ -8,7 +8,7 @@ uploaded via a simple web form - no SSH, no nano, no base64 encoding needed.
 Mount points (added to main.py):
   GET  /admin/upload-cookies              -> simple HTML upload form
   POST /admin/upload-cookies              -> handles the actual file upload
-  GET  /admin/cookies/status              -> JSON status of all 3 cookie slots
+  GET  /admin/cookies/status              -> JSON status of every cookie slot
 
 Requires ?key=<ADMIN_STATUS_KEY> same as your other admin endpoints.
 
@@ -126,12 +126,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 import cookie_health
 from youtube import reset_account_state
-from config import (
-    logger,
-    YT_COOKIES_PATH_DEFAULT,
-    COOKIE_ACCOUNT_2_PATH,
-    COOKIE_ACCOUNT_3_PATH,
-)
+from config import logger, cookie_slot_paths
 from admin_auth import guard_admin_request, verify_admin_key
 
 ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
@@ -140,11 +135,8 @@ ADMIN_KEY = os.environ.get("ADMIN_STATUS_KEY", "")
 # imported from config.py rather than reconstructed here, so there's no
 # risk of a path mismatch between where this uploads to and where
 # get_cookie_accounts() looks.
-_SLOT_PATHS = {
-    1: os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT),
-    2: COOKIE_ACCOUNT_2_PATH,
-    3: COOKIE_ACCOUNT_3_PATH,
-}
+_SLOT_PATHS = cookie_slot_paths()
+SLOT_NUMBERS = sorted(_SLOT_PATHS)
 
 for _path in _SLOT_PATHS.values():
     os.makedirs(os.path.dirname(_path), exist_ok=True)
@@ -412,10 +404,15 @@ def _write_cookie_file_atomic(path: str, content: bytes) -> None:
 async def upload_cookies(
     request: Request,
     key: str = Query(...),
-    slot: int = Query(..., ge=1, le=3, description="Which cookie slot: 1, 2, or 3"),
+    slot: int = Query(..., ge=1, description="Which cookie slot (1 = primary)"),
     file: UploadFile = File(...),
 ):
     _check_admin(request, key)
+    if slot not in _SLOT_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown cookie slot {slot}. Configured slots: {SLOT_NUMBERS}.",
+        )
     path = _cookie_path(slot)
     content = await _read_upload_capped(file)
 
@@ -472,13 +469,13 @@ async def upload_cookies(
 def cookies_status(request: Request, key: str = Query(...)):
     _check_admin(request, key)
 
-    # Read the health sidecar ONCE for all three slots rather than once
+    # Read the health sidecar ONCE for all slots rather than once
     # per slot - the dashboard polls this endpoint, so a per-slot read
     # would triple the file I/O for no benefit.
     health = cookie_health.snapshot()
 
     result = {}
-    for slot in (1, 2, 3):
+    for slot in SLOT_NUMBERS:
         path = _cookie_path(slot)
         if os.path.exists(path):
             stat = os.stat(path)
@@ -549,9 +546,7 @@ def upload_form(request: Request, key: str = Query(...)):
     <form id="uploadForm">
       <label>Cookie slot</label>
       <select id="slot" name="slot">
-        <option value="1">Slot 1 (cookies.txt)</option>
-        <option value="2">Slot 2 (cookies_2.txt)</option>
-        <option value="3">Slot 3 (cookies_3.txt)</option>
+        __SLOT_OPTIONS__
       </select>
 
       <label>cookies.txt file (exported from browser extension)</label>
@@ -635,5 +630,10 @@ loadStatus();
 </body>
 </html>
     """
+    options = "\n        ".join(
+        f'<option value="{n}">Slot {n} ({os.path.basename(_SLOT_PATHS[n])})</option>'
+        for n in SLOT_NUMBERS
+    )
+    html = html.replace("__SLOT_OPTIONS__", options)
     html = html.replace("PLACEHOLDER_ADMIN_KEY", ADMIN_KEY)
     return HTMLResponse(content=html)

@@ -66,12 +66,13 @@ check() {
   out=$(timeout 120 docker exec -e C="$c" -e PX="$px" -e CK="$ck" -e V="$v" \
       -e POT="$POT" -e T="$tag" audioforges-api sh -c '
     P=""; [ "$PX" = 1 ] && P="--proxy $YT_PROXY_URL"
-    case "$CK" in
-      1) F="$YT_COOKIES_PATH" ;;
-      2) F="${COOKIE_ACCOUNT_2_PATH:-/app/data/cookies_2.txt}" ;;
-      3) F="${COOKIE_ACCOUNT_3_PATH:-/app/data/cookies_3.txt}" ;;
-      *) F="" ;;
-    esac
+    if [ "$CK" = 0 ]; then F=""
+    elif [ "$CK" = 1 ]; then F="$YT_COOKIES_PATH"
+    else
+      # Slot N: honour COOKIE_ACCOUNT_N_PATH, else sit next to slot 1.
+      eval "F=\${COOKIE_ACCOUNT_${CK}_PATH:-}"
+      [ -n "$F" ] || F="$(dirname "$YT_COOKIES_PATH")/cookies_$CK.txt"
+    fi
     K=""
     if [ -n "$F" ]; then
       [ -s "$F" ] || { echo CANARY_NOFILE; exit 3; }
@@ -151,7 +152,19 @@ if [ -f "$FAILLOG" ] && [ "$(wc -l < "$FAILLOG" 2>/dev/null || echo 0)" -gt 2000
 fi
 
 if [ ! -s "$ACCOUNTS_STATE" ] || [ -z "$(find "$ACCOUNTS_STATE" -mmin -"$ACCOUNTS_EVERY_MIN" 2>/dev/null)" ]; then
-  acc="Primary=$(check web_embedded 0 1) Backup1=$(check web_embedded 0 2) Backup2=$(check web_embedded 0 3)"
+  # Every configured slot, skipping empty ones: a slot exists only once
+  # its file is uploaded, so unused slots never report MISSING.
+  SLOTS=$(docker exec audioforges-api sh -c \
+    'python3 -c "from config import cookie_slot_paths; print(\" \".join(str(n) for n in sorted(cookie_slot_paths())))"' 2>/dev/null)
+  [ -n "$SLOTS" ] || SLOTS="1 2 3"
+  acc=""
+  for n in $SLOTS; do
+    r=$(check web_embedded 0 "$n")
+    [ "$r" = MISSING ] && continue
+    label="Primary"; [ "$n" != 1 ] && label="Backup$((n - 1))"
+    acc="$acc$label=$r "
+  done
+  acc=${acc% }
   acc_prev=$(cat "$ACCOUNTS_STATE" 2>/dev/null || echo "")
   echo "$acc" > "$ACCOUNTS_STATE"
   if [ "$acc" != "$acc_prev" ]; then

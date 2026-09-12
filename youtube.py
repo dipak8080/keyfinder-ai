@@ -35,10 +35,8 @@ from config import (
     COOKIE_EXPIRY_ALERT_WINDOW_SECONDS,
     COOKIE_ALERT_COOLDOWN_SECONDS,
     YT_COOKIES_PATH_DEFAULT,
-    COOKIE_ACCOUNT_2_B64_ENV,
-    COOKIE_ACCOUNT_3_B64_ENV,
-    COOKIE_ACCOUNT_2_PATH,
-    COOKIE_ACCOUNT_3_PATH,
+    COOKIE_ACCOUNT_B64_ENVS,
+    cookie_slot_paths,
     COOKIE_ACCOUNT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
@@ -1533,8 +1531,7 @@ def _recent_rate(path: str, now: float) -> Optional[float]:
 
 
 def _configured_account_paths() -> list:
-    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
-    return [p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH) if p]
+    return [p for p in cookie_slot_paths().values() if p]
 
 
 def plan_account_order() -> list:
@@ -1620,8 +1617,7 @@ def get_account_health() -> list:
     """
     now = time.time()
     _materialize_extra_cookie_accounts()
-    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
-    candidates = [p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH) if p]
+    candidates = _configured_account_paths()
 
     out = []
     with _cookie_accounts_lock:
@@ -1894,19 +1890,17 @@ def _maybe_alert_cookie_expiry(message: str):
             "surrounding [COOKIES]/[PROXY] log lines before re-exporting anything."
         )
     else:
-        primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
-        if account_path == COOKIE_ACCOUNT_2_PATH:
-            slot_hint = "Backup 1 (slot 2)"
-        elif account_path == COOKIE_ACCOUNT_3_PATH:
-            slot_hint = "Backup 2 (slot 3)"
-        elif account_path == primary_path:
+        slot = next((n for n, p in cookie_slot_paths().items() if p == account_path), None)
+        if slot == 1:
             slot_hint = "Primary (slot 1)"
+        elif slot:
+            slot_hint = f"Backup {slot - 1} (slot {slot})"
         else:
-            # A path that isn't one of the three configured slots. Worth
+            # A path that isn't one of the configured slots. Worth
             # saying plainly rather than guessing a slot number - it means
             # config drift, and a wrong slot number sends you to overwrite
             # a healthy account.
-            slot_hint = f"the slot backed by '{account_path}' (not one of the 3 configured paths)"
+            slot_hint = f"the slot backed by '{account_path}' (not one of the configured paths)"
         fix_text = (
             f"Fix: re-export cookies.txt from a logged-in browser session and "
             f"upload it to {slot_hint} on the admin cookies page - no base64, "
@@ -1982,10 +1976,11 @@ def _materialize_extra_cookie_accounts():
     with _cookie_accounts_lock:
         if _cookie_accounts_materialized:
             return
-        for env_name, path in (
-            (COOKIE_ACCOUNT_2_B64_ENV, COOKIE_ACCOUNT_2_PATH),
-            (COOKIE_ACCOUNT_3_B64_ENV, COOKIE_ACCOUNT_3_PATH),
-        ):
+        slots = cookie_slot_paths()
+        for slot, env_name in COOKIE_ACCOUNT_B64_ENVS.items():
+            path = slots.get(slot)
+            if not path:
+                continue
             b64_value = os.environ.get(env_name)
             if b64_value and not os.path.exists(path):
                 try:
@@ -2006,11 +2001,7 @@ def get_cookie_accounts() -> list:
     cookies configured" and proceed cookie-less rather than erroring.
     """
     _materialize_extra_cookie_accounts()
-    primary_path = os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT)
-    candidate_paths = [
-        p for p in (primary_path, COOKIE_ACCOUNT_2_PATH, COOKIE_ACCOUNT_3_PATH)
-        if p and os.path.exists(p)
-    ]
+    candidate_paths = [p for p in _configured_account_paths() if os.path.exists(p)]
     now = time.time()
     with _cookie_accounts_lock:
         available = [p for p in candidate_paths if _cookie_account_disabled_until.get(p, 0) < now]

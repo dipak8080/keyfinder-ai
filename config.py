@@ -206,10 +206,35 @@ COOKIE_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ALERT_COOLDOWN_SECOND
 # persistent volume path like /app/data/cookies_2.txt on a VPS, so cookies
 # uploaded via /admin/upload-cookies survive container rebuilds/redeploys
 # instead of living only inside the ephemeral container filesystem.
-COOKIE_ACCOUNT_2_B64_ENV = "YT_COOKIES_B64_2"
-COOKIE_ACCOUNT_3_B64_ENV = "YT_COOKIES_B64_3"
-COOKIE_ACCOUNT_2_PATH = os.environ.get("COOKIE_ACCOUNT_2_PATH", "/app/cookies_2.txt")
-COOKIE_ACCOUNT_3_PATH = os.environ.get("COOKIE_ACCOUNT_3_PATH", "/app/cookies_3.txt")
+# 2026-09-12: 3 -> 6 slots. Not for throughput (each account ran ~56
+# downloads/h against YouTube's ~2000/h ceiling) but for headroom: losing
+# one of three accounts costs a third of capacity, one of six barely
+# shows. Slots are derived from a count, so raising COOKIE_ACCOUNT_SLOTS
+# is the only change a future increase needs. Empty slots are skipped
+# everywhere - a slot only exists once its file is uploaded.
+COOKIE_ACCOUNT_SLOTS = int(os.environ.get("COOKIE_ACCOUNT_SLOTS", "6"))
+
+# Slot 1 is YT_COOKIES_PATH. Slots 2..N default next to it, so a VPS that
+# points slot 1 at /app/data/ gets the rest there too without listing
+# every path in .env.
+_COOKIE_DIR = os.path.dirname(YT_COOKIES_PATH_DEFAULT) or "/app"
+
+COOKIE_ACCOUNT_PATHS = {
+    n: os.environ.get(f"COOKIE_ACCOUNT_{n}_PATH", os.path.join(_COOKIE_DIR, f"cookies_{n}.txt"))
+    for n in range(2, COOKIE_ACCOUNT_SLOTS + 1)
+}
+COOKIE_ACCOUNT_B64_ENVS = {n: f"YT_COOKIES_B64_{n}" for n in range(2, COOKIE_ACCOUNT_SLOTS + 1)}
+
+# Kept so existing imports and any .env overrides keep working unchanged.
+COOKIE_ACCOUNT_2_B64_ENV = COOKIE_ACCOUNT_B64_ENVS[2]
+COOKIE_ACCOUNT_3_B64_ENV = COOKIE_ACCOUNT_B64_ENVS[3]
+COOKIE_ACCOUNT_2_PATH = COOKIE_ACCOUNT_PATHS[2]
+COOKIE_ACCOUNT_3_PATH = COOKIE_ACCOUNT_PATHS[3]
+
+
+def cookie_slot_paths() -> dict:
+    """{slot number -> path} for every configured slot, primary first."""
+    return {1: os.environ.get("YT_COOKIES_PATH", YT_COOKIES_PATH_DEFAULT), **COOKIE_ACCOUNT_PATHS}
 
 COOKIE_ACCOUNT_COOLDOWN_SECONDS = int(os.environ.get("COOKIE_ACCOUNT_COOLDOWN_SECONDS", str(15 * 60)))  # 15 min
 
