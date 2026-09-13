@@ -352,6 +352,26 @@ app = FastAPI(
     openapi_url=None,
 )
 
+# Hands back separation rate-limit slots when the route answers with an
+# error. Deliberately keyed on the RESPONSE rather than called at each
+# failure branch: the branches that reject a submission (queue full,
+# tool disabled, bad file, validation) are spread across two route
+# modules and _shared.py, and a new one added later would silently stop
+# refunding. A 429 is excluded because that request never recorded
+# anything - check_rate_limits rolls back before rejecting.
+@app.middleware("http")
+async def refund_unused_separation_slots(request, call_next):
+    response = await call_next(request)
+    if response.status_code >= 400 and response.status_code != 429:
+        try:
+            from separation_limits import refund_unused_slots
+
+            refund_unused_slots(request)
+        except Exception:  # noqa: BLE001
+            logger.warning("[SEPARATION LIMIT] refund hook failed", exc_info=True)
+    return response
+
+
 # Logs every HTTP request (timestamp, method, path, status, duration, IP) to SQLite
 app.add_middleware(IdempotencyMiddleware)
 app.add_middleware(RequestLoggerMiddleware)

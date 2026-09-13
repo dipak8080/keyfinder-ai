@@ -56,7 +56,7 @@ from config import (
     SEPARATION_SHARED_DAILY_MAX_REQUESTS,
     SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
 )
-from rate_limit import check_rate_limit
+from rate_limit import check_rate_limits, refund_rate_limit_hits
 
 SHARED_BUCKET = "separation-standard"
 
@@ -99,31 +99,32 @@ def current_limits() -> dict:
 def shared_separation_limit(request: Request) -> None:
     """FastAPI dependency for /separate, /stems, /youtube/separate, /youtube/stems.
 
-    HOURLY IS CHECKED FIRST, and the order is load-bearing. Each window
-    records a hit when it passes, so whichever runs first spends a slot
-    even if the second then rejects. Checking the tighter window first
-    means the only leak is an hourly slot burned by someone the daily
-    limit has already stopped for the rest of the day - invisible, since
-    it expires in an hour and they are blocked regardless. The reverse
-    order leaks a daily slot to someone who was merely going too fast for
-    a minute, which they would feel tomorrow.
+    Both windows are checked before either records, in one transaction,
+    so a caller stopped by one does not spend a slot in the other.
+
+    The receipt is stashed on request.state for refund_unused_slots(),
+    which the middleware calls when the route answers with an error.
     """
     limits = current_limits()
+    receipt = check_rate_limits(
+        request,
+        windows=[
+            (f"{SHARED_BUCKET}:hour", limits["hourly_max"], limits["hourly_window"]),
+            (f"{SHARED_BUCKET}:day", limits["daily_max"], limits["daily_window"]),
+        ],
+    )
+    request.state.separation_rate_receipt = receipt
 
-    check_rate_limit(
-        request,
-        max_requests=limits["hourly_max"],
-        window_seconds=limits["hourly_window"],
-        bucket_key=f"{SHARED_BUCKET}:hour",
-        persistent=True,
-    )
-    check_rate_limit(
-        request,
-        max_requests=limits["daily_max"],
-        window_seconds=limits["daily_window"],
-        bucket_key=f"{SHARED_BUCKET}:day",
-        persistent=True,
-    )
+
+def refund_unused_slots(request: Request) -> None:
+    """Give back this request's slots. Idempotent - clears the receipt."""
+    receipt = getattr(request.state, "separation_rate_receipt", None)
+    if not receipt:
+        return
+    request.state.separation_rate_receipt = None
+    refund_rate_limit_hits(receipt)
+    logger.info("[SEPARATION LIMIT] refunded %d slot(s) for %s",
+                len(receipt), request.url.path)
 
 
 shared_separation_limit.__name__ = "shared_separation_limit"

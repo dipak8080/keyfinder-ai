@@ -249,6 +249,144 @@ def _reject(ip, path, key_override, timestamps, effective_max, effective_window,
     )
 
 
+def check_rate_limits(
+    request: Request,
+    windows,
+    key_override: str = None,
+    tier: str = None,
+):
+    """Check SEVERAL windows atomically, then record in all of them.
+
+    windows is a sequence of (bucket_key, max_requests, window_seconds).
+
+    WHY THIS EXISTS. Calling check_rate_limit twice records a hit on the
+    first window even when the second then rejects, so a caller stopped
+    by a daily cap still burned an hourly slot, and vice versa. There is
+    no ordering that avoids it - only checking everything before
+    recording anything does.
+
+    One connection, one BEGIN IMMEDIATE: prune and count every bucket,
+    reject on the first window over its limit with nothing written, and
+    insert for all of them only if all pass. Taking the write lock up
+    front is also what serializes this across threads AND uvicorn
+    workers, the same reason _persistent_check_and_record takes it.
+
+    Returns a RECEIPT - the (bucket, ts) rows written - so a caller whose
+    request later fails for an unrelated reason can hand back the slots
+    it never used. See refund_rate_limit_hits.
+    """
+    global _last_sweep
+
+    if not RATE_LIMIT_ENABLED:
+        return []
+
+    ip = _get_client_ip(request)
+    subject = key_override if key_override is not None else ip
+    now = time.time()
+    route = request.url.path
+
+    specs = [(f"{subject}|{bucket}", bucket, int(limit), float(window))
+             for bucket, limit, window in windows]
+
+    try:
+        if now - _last_sweep > 3600:
+            _last_sweep = now
+            _sweep_persistent(now)
+
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                failure = None
+                for full_key, bucket, limit, window in specs:
+                    conn.execute("DELETE FROM rate_hits WHERE bucket = ? AND ts < ?",
+                                 (full_key, now - window))
+                    rows = conn.execute(
+                        "SELECT ts FROM rate_hits WHERE bucket = ? ORDER BY ts", (full_key,)
+                    ).fetchall()
+                    timestamps = [float(r[0]) for r in rows]
+                    if len(timestamps) >= limit:
+                        failure = (bucket, timestamps, limit, window)
+                        break
+
+                if failure is not None:
+                    conn.execute("ROLLBACK")
+                else:
+                    for full_key, _bucket, _limit, _window in specs:
+                        conn.execute("INSERT INTO rate_hits (bucket, ts) VALUES (?, ?)",
+                                     (full_key, now))
+                    conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+        if failure is not None:
+            bucket, timestamps, limit, window = failure
+            _reject(ip, bucket, key_override, timestamps, limit, int(window),
+                    now, tier, route=route)
+
+        return [(full_key, now) for full_key, _b, _l, _w in specs]
+
+    except HTTPException:
+        raise
+    except Exception:
+        # Same posture as the single-window path: a DB problem must not
+        # take the site down, and must not silently hand out unlimited
+        # free GPU either. Fall back to the in-memory windows and say so.
+        logger.error(
+            f"[RATE LIMIT] persistent multi-window unavailable for {route}, "
+            f"falling back to in-memory", exc_info=True,
+        )
+        with _lock:
+            for full_key, bucket, limit, window in specs:
+                key = (full_key, bucket)
+                timestamps = [t for t in _requests.get(key, []) if t >= now - window]
+                if len(timestamps) >= limit:
+                    _reject(ip, bucket, key_override, timestamps, limit,
+                            int(window), now, tier, route=route)
+                _requests[key] = timestamps
+            for full_key, bucket, _limit, _window in specs:
+                _requests[(full_key, bucket)].append(now)
+        return []
+
+
+def refund_rate_limit_hits(receipt) -> None:
+    """Hand back slots recorded for a request that never used them.
+
+    A rate limit protects a RESOURCE. A submission rejected afterwards
+    for a full queue, a disabled tool or a bad file consumed no GPU, no
+    queue slot and no worker time, so charging it against an allowance
+    protects nothing - it just locks someone out. Under a daily cap that
+    matters: a broken uploader could otherwise spend a whole day's
+    allowance on requests that never ran.
+
+    Deletes the exact rows by (bucket, ts), so a concurrent request that
+    recorded its own hit at a different timestamp is untouched. Best
+    effort by design: failing to refund must never turn into a 500 on a
+    response that has already been decided.
+    """
+    if not receipt:
+        return
+    try:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for bucket, ts in receipt:
+                    conn.execute("DELETE FROM rate_hits WHERE bucket = ? AND ts = ?",
+                                 (bucket, ts))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("[RATE LIMIT] could not refund %d hit(s)", len(receipt), exc_info=True)
+
+
 def check_rate_limit(
     request: Request,
     max_requests: int = None,
