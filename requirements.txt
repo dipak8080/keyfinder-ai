@@ -159,3 +159,9 @@ pretty_midi>=0.2.10
 # actually available with:
 #     docker exec audioforges-api yt-dlp --list-impersonate-targets
 # Rollback: yt-dlp[default,curl-cffi]==2026.07.04 (TikTok is broken on it).
+# ---------- REDIS (job state + rate limiting) ----------
+# Shared state across the a/b deploy slots, replacing the per-process dicts
+# in jobs.py and rate_limit.py. Runs as a container on audioforges-net;
+# see redis_store.py. Pinned like everything else here because the deploy
+# workflow prunes the build cache before every build.
+redis==6.4.0
