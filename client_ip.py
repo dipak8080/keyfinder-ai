@@ -87,4 +87,16 @@ def normalise_for_bucketing(ip: str) -> str:
         return ip.strip()
     if addr.version != 6:
         return str(addr)
+    # ::ffff:a.b.c.d is version 6 to ipaddress, and masking it to /64
+    # yields "::" - every IPv4 caller in one bucket. Not reachable while
+    # the container binds 0.0.0.0 and Cloudflare writes dotted-quad, but
+    # a dual-stack bind or an nginx listen [::] would produce it, and the
+    # failure is site-wide rather than per-route: one 10/hour separation
+    # bucket, one /convert bucket and one admin-request bucket for the
+    # whole internet, which restart-api.sh's /admin/status curl also
+    # depends on. Unwrap to the address it actually carries. Same for
+    # 6to4, which embeds an IPv4 /32.
+    mapped = addr.ipv4_mapped or getattr(addr, "sixtofour", None)
+    if mapped is not None:
+        return str(mapped)
     return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)

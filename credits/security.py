@@ -61,7 +61,17 @@ def hash_ip(ip: str | None) -> str:
     try:
         addr = ipaddress.ip_address(ip.strip())
         if addr.version == 6:
-            normalised = str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)
+            # ::ffff:a.b.c.d is version 6 here, and /64 on it yields "::",
+            # which would give the entire internet ONE free-ops-per-IP
+            # allowance. Unwrap the embedded address instead. See
+            # client_ip.normalise_for_bucketing, which carries the same
+            # guard for the same reason - fixing only one of the two
+            # leaves the other exposed.
+            mapped = addr.ipv4_mapped or getattr(addr, "sixtofour", None)
+            if mapped is not None:
+                normalised = str(mapped)
+            else:
+                normalised = str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)
         else:
             normalised = str(addr)
     except ValueError:
