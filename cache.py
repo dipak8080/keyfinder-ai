@@ -403,21 +403,38 @@ def _evict_if_over_limit() -> None:
 
             evicted_count = 0
             evicted_bytes = 0
+            # Rows whose file could not be deleted. Skipped rather than
+            # dropped: deleting the row would orphan the bytes with
+            # nothing left pointing at them, so nothing would ever retry
+            # the delete and the cap would drift above the limit while
+            # get_cache_stats() still reported the cache as healthy.
+            # Held in a skip list so the loop moves on instead of
+            # retrying the same undeletable row forever.
+            stuck = []
 
             while total > CACHE_MAX_BYTES:
-                oldest = conn.execute(
+                placeholders = ",".join("?" * len(stuck)) if stuck else None
+                query = (
                     "SELECT video_id, format, file_path, size_bytes FROM cache_entries "
-                    "ORDER BY last_accessed_at ASC LIMIT 1"
-                ).fetchone()
+                    + (f"WHERE video_id || '_' || format NOT IN ({placeholders}) " if stuck else "")
+                    + "ORDER BY last_accessed_at ASC LIMIT 1"
+                )
+                oldest = conn.execute(query, stuck).fetchone()
 
                 if oldest is None:
                     break
 
+                removed = True
                 try:
                     if os.path.exists(oldest["file_path"]):
                         os.remove(oldest["file_path"])
                 except OSError as e:
+                    removed = False
                     logger.warning(f"[CACHE] Failed to remove evicted file {oldest['file_path']}: {e}")
+
+                if not removed:
+                    stuck.append(f"{oldest['video_id']}_{oldest['format']}")
+                    continue
 
                 conn.execute(
                     "DELETE FROM cache_entries WHERE video_id = ? AND format = ?",
@@ -428,6 +445,18 @@ def _evict_if_over_limit() -> None:
                 total -= oldest["size_bytes"]
                 evicted_count += 1
                 evicted_bytes += oldest["size_bytes"]
+
+            if stuck and total > CACHE_MAX_BYTES:
+                logger.error(
+                    f"[CACHE] {len(stuck)} entries could not be deleted from disk and were "
+                    f"left registered. The cache is {(total - CACHE_MAX_BYTES) / (1024*1024):.1f} MB "
+                    f"over its cap and cannot shrink further - check permissions on CACHE_DIR."
+                )
+            elif stuck:
+                logger.warning(
+                    f"[CACHE] {len(stuck)} entries could not be deleted from disk and were "
+                    f"left registered rather than orphaned; the cap was met using other entries."
+                )
 
             logger.info(
                 f"[CACHE] Evicted {evicted_count} least-recently-used entries "
