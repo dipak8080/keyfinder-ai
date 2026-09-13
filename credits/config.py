@@ -1,7 +1,14 @@
 """Settings for the credits package.
 
-Deliberately does NOT import the backend's existing config.py — this package
-reads its own env vars so it can be added without touching anything else.
+Reads its own env vars rather than the backend's config.py, so the package
+can be added without touching anything else.
+
+THAT ISOLATION IS NO LONGER ABSOLUTE, and the docstring used to claim it
+was. credits/limits.py reaches the host config.py transitively through
+separation_limits, to report the shared standard-separation allowance on
+GET /credits/me. The import is lazy and inside a function, so there is no
+cycle and no import-time cost, but the package can no longer be described
+as free of host imports.
 
 Defaults are the "off" state: PAYWALL_ENABLED unset means nothing is charged
 and nothing is blocked, on every tool.

@@ -56,6 +56,14 @@ if ! switch_slot "$NEW"; then
   exit 1
 fi
 
+# Same fact deploy.yml writes after its own switch. Any path that moves
+# nginx must move this too, or the gate in credits/admin.py inverts: the
+# live container refuses config writes and points the operator at the
+# container that is draining.
+printf '%s\n' "$NEW" > /home/deploy/app/data/.active_slot.tmp \
+  && mv /home/deploy/app/data/.active_slot.tmp /home/deploy/app/data/.active_slot \
+  || echo "WARNING: could not record active slot - admin writes may be refused on slot $NEW."
+
 OLD_ID=$(docker inspect -f '{{.Id}}' audioforges-api 2>/dev/null || true)
 if [ -n "$OLD_ID" ]; then
   docker rename audioforges-api audioforges-api-old

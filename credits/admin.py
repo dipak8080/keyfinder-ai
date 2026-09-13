@@ -53,6 +53,7 @@ router = APIRouter(prefix="/admin/credits", tags=["admin"])
 # Written by deploy.yml the moment af-switch succeeds. Lives on the shared
 # data volume so every container, live or draining, reads the same answer.
 ACTIVE_SLOT_FILE = os.environ.get("ACTIVE_SLOT_FILE", "/app/data/.active_slot")
+_KNOWN_SLOTS = frozenset({"a", "b"})
 
 
 def require_admin(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
@@ -66,6 +67,28 @@ def require_admin(x_admin_token: str | None = Header(default=None, alias="X-Admi
 
 
 ADMIN = [Depends(require_admin)]
+
+
+def slot_info() -> dict:
+    """Which container answered, and which one is live.
+
+    Attached to every admin READ. Reads are deliberately not gated - see
+    require_active_slot - but that leaves the operator able to read one
+    container and write to another with nothing in either response saying
+    so. A draining container reports source: "env" values from the
+    PREVIOUS image's environment, which is confidently wrong rather than
+    merely stale.
+    """
+    mine = os.environ.get("INSTANCE_SLOT", "").strip() or None
+    try:
+        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8").strip() or None
+    except Exception:  # noqa: BLE001
+        active = None
+    return {
+        "answered_by": mine,
+        "active": active,
+        "is_active": None if not mine or active not in _KNOWN_SLOTS else mine == active,
+    }
 
 
 def require_active_slot() -> None:
@@ -97,7 +120,15 @@ def require_active_slot() -> None:
         active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8").strip()
     except Exception:  # noqa: BLE001
         return
-    if not active or active == mine:
+    # Only a value naming a real slot is trusted enough to refuse on.
+    # Anything else - a stray edit, a partial write, a letter from some
+    # future layout - means "cannot tell", and a confused file must not
+    # be able to 409 every container at once with no API path back: the
+    # recovery would itself be a write.
+    if active not in _KNOWN_SLOTS:
+        log.warning("active slot file holds %r, ignoring", active)
+        return
+    if active == mine:
         return
     log.warning("refused admin write on draining slot %s (active is %s)", mine, active)
     raise HTTPException(
@@ -164,6 +195,7 @@ def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
         "usage": metering.totals(days),
         "gate": gate_funnel(days),
         "db": healthcheck(),
+        "slot": slot_info(),
     }
 
 
@@ -654,7 +686,12 @@ def adjust(body: AdjustRequest) -> dict:
     return {"ok": True, "applied": applied, "email": email, "balance": balance}
 
 
-@router.post("/sweep", dependencies=ADMIN)
+# GATED because sweep_stale_holds() writes to the shared credits.db and an
+# older build could settle holds belonging to jobs still running in the
+# live container. Worth being clear-eyed: main.py runs the same sweep on a
+# timer inside EVERY container, so this is an operator-error guard, not a
+# concurrency guard. The draining container is not read-only.
+@router.post("/sweep", dependencies=ADMIN_WRITE)
 def sweep() -> dict:
     """Force the orphaned-hold sweep instead of waiting 15 minutes.
 
@@ -703,6 +740,7 @@ def list_settings() -> dict:
     return {
         "settings": settings_store.describe(),
         "locked": sorted(settings_store.LOCKED_KEYS),
+        "slot": slot_info(),
     }
 
 

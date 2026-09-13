@@ -261,7 +261,9 @@ jobs:
             # Both containers mount this volume, so one file answers for
             # both. Written after af-switch, so a failed switch leaves the
             # previous slot authoritative.
-            echo "$NEW" > /home/deploy/app/data/.active_slot
+            printf '%s\n' "$NEW" > /home/deploy/app/data/.active_slot.tmp \
+              && mv /home/deploy/app/data/.active_slot.tmp /home/deploy/app/data/.active_slot \
+              || echo "WARNING: could not record active slot - admin writes may be refused on slot $NEW."
 
             # The live container is always named audioforges-api, so the
             # canary, cheatsheet and handoff commands keep working.

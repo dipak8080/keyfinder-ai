@@ -519,3 +519,4 @@ def check_rate_limit(
                         route=request.url.path)
             timestamps.append(now)
             _requests[key] = timestamps
+            _key_windows[key] = effective_window

@@ -232,7 +232,11 @@ def load_overrides() -> dict[str, str]:
     now = time.monotonic()
     with _cache_lock:
         if _cache["value"] is not None and now - _cache["at"] < _CACHE_TTL_SECONDS:
-            return _cache["value"]
+            # A COPY. Every caller used to get a freshly built dict; with
+            # the cache they would otherwise share one object, and a
+            # future caller that mutates its result would corrupt the
+            # cache for every other request in that second.
+            return dict(_cache["value"])
 
     if not Path(_db_path()).exists():
         value = {}
@@ -250,7 +254,7 @@ def load_overrides() -> dict[str, str]:
     with _cache_lock:
         _cache["at"] = now
         _cache["value"] = value
-    return value
+    return dict(value)
 
 
 def resolve(name: str) -> str | None:
