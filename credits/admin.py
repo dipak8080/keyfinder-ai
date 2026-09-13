@@ -798,6 +798,11 @@ def update_settings(body: SettingsUpdate) -> dict:
         "free_monthly_ops": settings.free_monthly_ops,
         "free_monthly_ops_per_ip": settings.free_monthly_ops_per_ip,
         "metered_routes": [r.tool for r in settings.tool_rules.values() if r.enabled],
+        # What is now ENFORCED, not just what was stored. _limit() clamps at
+        # read time, so a row and the value in force can differ - which is
+        # the case the clamp exists to surface, and the worst moment to make
+        # the caller issue a second request to find out.
+        "enforced": {"separation": _enforced_separation_limits()},
     }
 
 
@@ -809,7 +814,11 @@ def clear_setting(key: str) -> dict:
     except ValueError as exc:
         raise HTTPException(400, detail={"error": "invalid_settings", "message": str(exc)})
     reload_settings()
-    return {"ok": True, "cleared": key}
+    return {
+        "ok": True,
+        "cleared": key,
+        "enforced": {"separation": _enforced_separation_limits()},
+    }
 
 
 @router.get("/settings/audit", dependencies=ADMIN)

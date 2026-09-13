@@ -435,11 +435,19 @@ def describe() -> list[dict]:
             "source": source,
             "env_value": env_value,
             "overridden": key in overrides,
+            # Bounds travel with the row so a client can validate before
+            # sending. The alternative is a second copy of these numbers in
+            # TypeScript, and a hand-maintained mirror of a backend list is
+            # exactly the drift this work has been removing. None where the
+            # key has no bound, which is most of them.
+            "min": meta.get("min"),
+            "max": meta.get("max"),
         })
     for key, value in sorted(overrides.items()):
         if key not in KNOWN_KEYS:
             out.append({
                 "key": key, "group": "other", "type": "str", "value": value,
                 "source": "db", "env_value": None, "overridden": True,
+                "min": None, "max": None,
             })
     return out
