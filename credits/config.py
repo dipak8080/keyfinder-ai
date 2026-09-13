@@ -658,6 +658,20 @@ def build_settings() -> Settings:
                 f"FREE_MONTHLY_OPS."
             )
 
+    # ABSOLUTE, not relative. The check below compares these two to each
+    # other, which catches the per-IP side going to zero and cannot catch
+    # the per-user side - lowering the anchor satisfies a relative test.
+    # _check_type only guards writes through set_many, so this is what
+    # catches an env var or a row written by an older build.
+    if settings.free_monthly_ops < 1 or settings.free_monthly_ops_per_ip < 1:
+        raise RuntimeError(
+            f"Free tier would be switched off: FREE_MONTHLY_OPS="
+            f"{settings.free_monthly_ops}, FREE_MONTHLY_OPS_PER_IP="
+            f"{settings.free_monthly_ops_per_ip}. ledger.free_remaining() "
+            f"clamps at zero, so either value below 1 means no free ops on any "
+            f"metered tool. Both must be >= 1."
+        )
+
     # ---- THE SECOND INVARIANT ------------------------------------------
     # ledger.free_remaining() returns
     #     min(free_monthly_ops - owner_used, free_monthly_ops_per_ip - ip_used)

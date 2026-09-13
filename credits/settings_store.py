@@ -89,8 +89,13 @@ LOCKED_KEYS = frozenset({
 # what the panel shows by default.
 KNOWN_KEYS: dict[str, dict] = {
     "PAYWALL_ENABLED": {"type": "bool", "group": "paywall"},
-    "FREE_MONTHLY_OPS": {"type": "int", "group": "free tier"},
-    "FREE_MONTHLY_OPS_PER_IP": {"type": "int", "group": "free tier"},
+    # min 1 on both. Every other guard on these is RELATIVE - the free
+    # allowance invariant compares them to each other - so lowering the
+    # anchor was unguarded: FREE_MONTHLY_OPS=0 passed validation and
+    # switched the free tier off on all 8 metered tools, which is the
+    # one thing this work promised not to do.
+    "FREE_MONTHLY_OPS": {"type": "int", "group": "free tier", "min": 1},
+    "FREE_MONTHLY_OPS_PER_IP": {"type": "int", "group": "free tier", "min": 1},
     "CREDIT_HOLD_TIMEOUT_MINUTES": {"type": "int", "group": "paywall"},
     "RUNPOD_USD_PER_GPU_SECOND": {"type": "float", "group": "metering"},
     "MAGIC_LINK_TTL_MINUTES": {"type": "int", "group": "auth"},
@@ -113,10 +118,14 @@ KNOWN_KEYS: dict[str, dict] = {
     # "abc" or "-1" was accepted, written and audited, then silently
     # discarded at request time in favour of the code default. A setting
     # that reports success and does nothing is worse than one that fails.
-    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1},
-    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 1},
-    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1},
-    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 1},
+    # BOUNDED BOTH WAYS. min catches the value that silently does nothing;
+    # max catches the one that costs money - a slipped zero on 30, or a
+    # window of 1 second, removes the daily cap entirely while passing
+    # every other check and taking effect within a second.
+    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1, "max": 200},
+    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 60, "max": 86400},
+    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1, "max": 500},
+    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 3600, "max": 604800},
 }
 
 _TOOLS = (
@@ -173,6 +182,9 @@ def _check_type(key: str, value: str) -> None:
         minimum = meta.get("min")
         if minimum is not None and number < minimum:
             raise ValueError(f"{key} must be >= {minimum}, got {number}")
+        maximum = meta.get("max")
+        if maximum is not None and number > maximum:
+            raise ValueError(f"{key} must be <= {maximum}, got {number}")
 
 
 def _is_secretish(key: str) -> bool:

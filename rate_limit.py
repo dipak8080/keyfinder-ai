@@ -461,16 +461,23 @@ def check_rate_limit(
 
     now = time.time()
 
+    # Above the branch split: both fallback paths write to _requests
+    # without passing through the in-memory branch, so a sweep scheduled
+    # only there never runs during a DB outage - which is precisely when
+    # the metered and separation routes are filling those dicts. This is
+    # the leak 2b35a07 closed, re-entering through the door the fallback
+    # opened.
+    with _lock:
+        if now - _last_mem_sweep > _MEM_SWEEP_INTERVAL_SECONDS:
+            _last_mem_sweep = now
+            _sweep_memory(now)
+
     # tier still implies persistence, but persistence no longer implies
     # tier: a route can have a restart-proof window while keeping the
     # plain-string 429 detail its frontend already parses.
     if tier is None and not persistent:
         key = (subject, path)
         with _lock:
-            if now - _last_mem_sweep > _MEM_SWEEP_INTERVAL_SECONDS:
-                _last_mem_sweep = now
-                _sweep_memory(now)
-
             timestamps = _requests.get(key, [])
             cutoff = now - effective_window
             timestamps = [t for t in timestamps if t >= cutoff]

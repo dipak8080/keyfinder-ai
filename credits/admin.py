@@ -81,7 +81,7 @@ def slot_info() -> dict:
     """
     mine = os.environ.get("INSTANCE_SLOT", "").strip() or None
     try:
-        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8").strip() or None
+        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8")[:16].strip() or None
     except Exception:  # noqa: BLE001
         active = None
     return {
@@ -117,7 +117,7 @@ def require_active_slot() -> None:
     if not mine:
         return
     try:
-        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8").strip()
+        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8")[:16].strip()
     except Exception:  # noqa: BLE001
         return
     # Only a value naming a real slot is trusted enough to refuse on.
