@@ -640,9 +640,11 @@ class SettingsUpdate(BaseModel):
 def list_settings() -> dict:
     """Every tunable key with its effective value and where it came from.
 
-    Secrets are absent by construction: settings_store.LOCKED_KEYS is
-    filtered out of both reads and writes, so this endpoint cannot leak
-    the signing key or the admin token.
+    env_value is reported only for keys in settings_store.KNOWN_KEYS.
+    That allowlist, not LOCKED_KEYS, is what keeps this endpoint from
+    being a read primitive for the container's environment: writes accept
+    any key, so a blocklist alone could be walked around by writing a junk
+    override row for a credential and reading its env_value back.
     """
     return {
         "settings": settings_store.describe(),

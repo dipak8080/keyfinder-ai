@@ -103,6 +103,28 @@ for _tool in _TOOLS:
             "type": _type, "group": f"tool: {_tool}",
         }
 
+# LOCKED_KEYS is a blocklist, and a blocklist cannot defend an open key
+# space: set_many() accepts any key, and describe() used to report
+# os.getenv() for whatever it found in the settings table. Writing a junk
+# row for RUNPOD_API_KEY was therefore enough to read the real one back.
+#
+# Two guards now, because either alone leaves a gap. This one stops such a
+# row being created for anything that merely LOOKS like a credential;
+# describe() separately refuses to report env_value for any key outside
+# KNOWN_KEYS, which is an allowlist and closes the case this misses.
+_SECRETISH_FRAGMENTS = (
+    "SECRET", "TOKEN", "PASSWORD", "PASSWD", "API_KEY", "APIKEY",
+    "CREDENTIAL", "PRIVATE", "SALT", "_KEY", "COOKIE", "WEBHOOK",
+)
+
+
+def _is_secretish(key: str) -> bool:
+    if key in KNOWN_KEYS:
+        return False
+    upper = key.upper()
+    return any(fragment in upper for fragment in _SECRETISH_FRAGMENTS)
+
+
 _staged: threading.local = threading.local()
 
 
@@ -198,6 +220,8 @@ def set_many(values: dict[str, str], *, actor: str = "admin", note: str = "") ->
     for key in values:
         if key in LOCKED_KEYS:
             raise ValueError(f"{key} cannot be set at runtime")
+        if _is_secretish(key):
+            raise ValueError(f"{key} looks like a credential and cannot be set at runtime")
         if not key or len(key) > 128:
             raise ValueError("setting key must be 1-128 chars")
 
@@ -260,7 +284,13 @@ def audit(limit: int = 100, key: str | None = None) -> list[dict]:
 
 
 def describe() -> list[dict]:
-    """Every known key with its effective value and where that value came from."""
+    """Every known key with its effective value and where that value came from.
+
+    env_value is reported ONLY for keys in KNOWN_KEYS. Anything else gets
+    None, whether or not it happens to name a real environment variable -
+    that allowlist is what stops this endpoint being a read primitive for
+    the container's whole environment.
+    """
     overrides = load_overrides()
     out = []
     for key, meta in sorted(KNOWN_KEYS.items(), key=lambda kv: (kv[1]["group"], kv[0])):
@@ -284,6 +314,6 @@ def describe() -> list[dict]:
         if key not in KNOWN_KEYS:
             out.append({
                 "key": key, "group": "other", "type": "str", "value": value,
-                "source": "db", "env_value": os.getenv(key), "overridden": True,
+                "source": "db", "env_value": None, "overridden": True,
             })
     return out
