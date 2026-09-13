@@ -856,6 +856,28 @@ async def admin_status(request: Request, key: str = Query(...)):
     return snapshot
 
 
+def _shared_separation_limits() -> dict:
+    """Live numbers for the shared standard-separation allowance.
+
+    Imported lazily and guarded: /limits is a public contract read on
+    nearly every page load, and it must not start 500ing because a
+    limits module failed to import.
+    """
+    try:
+        from separation_limits import current_limits
+
+        return current_limits()
+    except Exception:  # noqa: BLE001
+        logger.warning("[LIMITS] shared separation limits unavailable", exc_info=True)
+        return {
+            "bucket": "separation-standard",
+            "hourly_max": SEPARATION_RATE_LIMIT_MAX_REQUESTS,
+            "hourly_window": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+            "daily_max": 0,
+            "daily_window": 86400,
+        }
+
+
 @router.get("/limits")
 async def limits():
     """
@@ -882,6 +904,11 @@ async def limits():
     docstring for the /audio-to-midi case that made this necessary - a
     limit published as twelve times looser than the one enforced.
     """
+    # Resolved through separation_limits, not from the per-route constants,
+    # so a limit tuned at runtime through /admin/credits/settings shows up
+    # here immediately instead of waiting for a redeploy.
+    _shared_sep = _shared_separation_limits()
+
     return {
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
@@ -1087,17 +1114,30 @@ async def limits():
             },
         },
         "rate_limits": {
-            "separate": SEPARATION_RATE_LIMIT_MAX_REQUESTS,
+            # THE FOUR STANDARD SEPARATION KEYS REPORT A SHARED ALLOWANCE
+            # (2026-09-13). /separate, /stems, /youtube/separate and
+            # /youtube/stems no longer hold a bucket each - they share one
+            # window, so the honest per-key number is the shared hourly
+            # figure repeated, not the four per-route constants that used
+            # to gate them. Those constants still exist and still describe
+            # nothing this endpoint serves.
+            #
+            # The hourly number ALONE understates the limit, because there
+            # is now a second window: see `shared` below for the daily cap
+            # and the route list. A client showing only these keys tells a
+            # user about 10/hour and nothing about 30/day, which is the
+            # drift this endpoint exists to prevent.
+            "separate": _shared_sep["hourly_max"],
             "separate_hq": SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
-            "stems": STEMS_RATE_LIMIT_MAX_REQUESTS,
+            "stems": _shared_sep["hourly_max"],
             "stems_hq": STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
             # One key per chained YouTube tool (2026-08-21). These used
             # to be a single youtube_chain / youtube_chain_hq pair, back
             # when all three standard chained routes shared one constant.
             "youtube_analyze": YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
-            "youtube_separate": YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_separate": _shared_sep["hourly_max"],
             "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
-            "youtube_stems": YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_stems": _shared_sep["hourly_max"],
             "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
             # ADDED 2026-08-27, now that all three transcription routes
             # are metered. They share one credits rule and one GPU
@@ -1130,7 +1170,7 @@ async def limits():
             #
             # Remove once lib/data/rate-limits.ts is confirmed to be on
             # the per-tool keys above and nothing else reads these.
-            "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
+            "youtube_chain": _shared_sep["hourly_max"],
             "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
             # PER-TOOL WINDOWS (added 2026-08-30). Every key above has an
             # entry here, read from that tool's OWN window constant.
@@ -1155,14 +1195,14 @@ async def limits():
             # can be dropped once nothing reads it, which is the same
             # condition already written against those legacy keys.
             "windows": {
-                "separate": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+                "separate": _shared_sep["hourly_window"],
                 "separate_hq": SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
-                "stems": STEMS_RATE_LIMIT_WINDOW_SECONDS,
+                "stems": _shared_sep["hourly_window"],
                 "stems_hq": STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
                 "youtube_analyze": YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
-                "youtube_separate": YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_separate": _shared_sep["hourly_window"],
                 "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
-                "youtube_stems": YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_stems": _shared_sep["hourly_window"],
                 "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
                 "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
                 "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
@@ -1170,14 +1210,32 @@ async def limits():
                 "audio_to_midi": MIDI_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_sheet": SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS,
-                "youtube_chain": YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
+                "youtube_chain": _shared_sep["hourly_window"],
                 "youtube_chain_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
             },
             # LEGACY as of 2026-08-30, same status as the two chain keys
             # above: correct for every tool except audio_to_midi, kept
             # because the frontend may still index it. Read `windows`
             # instead.
-            "window_seconds": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
+            # THE COMPLETE PICTURE for the standard separation tier. The
+            # flat keys above can only carry one number per tool, and this
+            # tier now has two windows on one bucket, so a client that
+            # wants to be accurate reads this. Additive: nothing above
+            # changed shape.
+            "shared": [
+                {
+                    "key": _shared_sep["bucket"],
+                    "routes": ["/separate", "/stems", "/youtube/separate", "/youtube/stems"],
+                    "scope": "per_ip",
+                    "windows": [
+                        {"max_requests": _shared_sep["hourly_max"],
+                         "window_seconds": _shared_sep["hourly_window"]},
+                        {"max_requests": _shared_sep["daily_max"],
+                         "window_seconds": _shared_sep["daily_window"]},
+                    ],
+                }
+            ],
+            "window_seconds": _shared_sep["hourly_window"],
         },
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,

@@ -515,6 +515,12 @@ SEPARATION_JOB_TTL_SECONDS = int(os.environ.get("SEPARATION_JOB_TTL_SECONDS", st
 # spend, but not its total over an hour. Watch the RunPod balance for a
 # week after this lands; if it moves faster than expected, this constant
 # is the first knob to turn back, not the concurrency.
+#
+# NO LONGER GATES /separate (2026-09-13). That route is on the shared
+# SEPARATION_SHARED_* allowance below. Kept because credits/limits.py
+# quotes the reasoning above, and because routes/admin.py falls back to
+# it if separation_limits cannot be imported. Changing it changes nothing
+# a user experiences.
 SEPARATION_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_RATE_LIMIT_MAX_REQUESTS", "6"))
 SEPARATION_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
@@ -525,11 +531,14 @@ SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_HQ_RATE_L
 SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
 # /stems costs the same CPU as /separate (same model, same run - only the
-# output files differ) so it gets the same limits. Note these are
-# SEPARATE per-IP buckets from /separate's, since the rate limiter keys
-# on path: one IP can spend its /separate budget AND its /stems budget in
-# the same hour. All of it queues behind MAX_CONCURRENT_SEPARATIONS
-# regardless, so the practical cap is wait time, not throughput.
+# output files differ) so it got the same limits.
+#
+# THE SEPARATE-BUCKET PROBLEM THIS COMMENT USED TO DESCRIBE IS FIXED
+# (2026-09-13). It read: "one IP can spend its /separate budget AND its
+# /stems budget in the same hour." True, and it generalised to four
+# routes, so the real ceiling was 24/hour rather than the 6 written here.
+# bucket_key in rate_limit.py now lets those four share one window - see
+# SEPARATION_SHARED_* above. This constant no longer gates /stems.
 STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "6"))
 STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
@@ -1375,6 +1384,11 @@ LOUDNORM_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("LOUDNORM_RATE_LIMIT_WIN
 YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS", "15"))
 YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
+# NEITHER OF THE NEXT TWO PAIRS GATES ITS ROUTE ANY MORE (2026-09-13).
+# /youtube/separate and /youtube/stems are on the shared
+# SEPARATION_SHARED_* allowance with /separate and /stems, which is what
+# the note above about the loosest tool setting the limit was ultimately
+# reaching for. The analyze pair above is unaffected and still live.
 YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS", "6"))
 YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 

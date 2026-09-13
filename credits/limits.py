@@ -316,7 +316,42 @@ def summary_for(identity, route_free_limits: dict[str, tuple[int, int]]) -> dict
         else:
             tools[route_key] = {"max_requests": free_max, "window_seconds": free_window}
 
-    return {"tier": "credited" if credited else "free", "tools": tools}
+    return {
+        "tier": "credited" if credited else "free",
+        "tools": tools,
+        # The standard separation tier is not in `tools` and cannot be:
+        # it is unmetered (no rule), covers four routes at once, and has
+        # TWO windows, while every entry above is one metered tool with
+        # one. Reported here so the UI can state the daily cap instead of
+        # discovering it as an unexplained 429.
+        "shared": _shared_separation_block(),
+    }
+
+
+def _shared_separation_block() -> list[dict]:
+    """The shared standard-separation allowance, resolved live.
+
+    Guarded: this feeds GET /credits/me, which the frontend calls on
+    every page load, and a limits import problem must degrade to an empty
+    list rather than take the endpoint down.
+    """
+    try:
+        from separation_limits import current_limits
+
+        limits = current_limits()
+    except Exception:  # noqa: BLE001
+        log.warning("shared separation limits unavailable", exc_info=True)
+        return []
+    return [{
+        "key": limits["bucket"],
+        "routes": ["/separate", "/stems", "/youtube/separate", "/youtube/stems"],
+        "scope": "per_ip",
+        "metered": False,
+        "windows": [
+            {"max_requests": limits["hourly_max"], "window_seconds": limits["hourly_window"]},
+            {"max_requests": limits["daily_max"], "window_seconds": limits["daily_window"]},
+        ],
+    }]
 
 
 def tiered_rate_limit(route_key: str, *, free_max: int, free_window: int) -> Callable:
