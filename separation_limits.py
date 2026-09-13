@@ -73,8 +73,12 @@ def _limit(name: str, default: int) -> int:
     try:
         value = int(raw) if raw not in (None, "") else default
     except (TypeError, ValueError):
+        logger.warning("[SEPARATION LIMIT] %s=%r is not an integer, using %s", name, raw, default)
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        logger.warning("[SEPARATION LIMIT] %s=%s must be positive, using %s", name, value, default)
+        return default
+    return value
 
 
 def current_limits() -> dict:

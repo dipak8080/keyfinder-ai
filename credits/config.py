@@ -651,6 +651,25 @@ def build_settings() -> Settings:
                 f"FREE_MONTHLY_OPS."
             )
 
+    # ---- THE SECOND INVARIANT ------------------------------------------
+    # ledger.free_remaining() returns
+    #     min(free_monthly_ops - owner_used, free_monthly_ops_per_ip - ip_used)
+    # so a per-IP allowance BELOW the per-user one makes part of the
+    # per-user allowance unreachable even for someone alone on their own
+    # connection. That is the same contradiction the rate-limit invariant
+    # above refuses to boot over, in a different pair of numbers, and it
+    # became reachable the moment these stopped being env-only.
+    if settings.free_monthly_ops_per_ip < settings.free_monthly_ops:
+        raise RuntimeError(
+            f"Free allowance contradiction: FREE_MONTHLY_OPS is "
+            f"{settings.free_monthly_ops} but FREE_MONTHLY_OPS_PER_IP is "
+            f"{settings.free_monthly_ops_per_ip}. One person alone on their own "
+            f"IP could never spend more than {settings.free_monthly_ops_per_ip} of "
+            f"the {settings.free_monthly_ops} free ops advertised to them. Either "
+            f"raise FREE_MONTHLY_OPS_PER_IP to >= {settings.free_monthly_ops}, or "
+            f"lower FREE_MONTHLY_OPS."
+        )
+
     # Fail at boot, not at the first checkout.
     if settings.paywall_enabled:
         if not settings.webhook_secret:

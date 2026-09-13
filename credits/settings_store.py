@@ -81,10 +81,16 @@ KNOWN_KEYS: dict[str, dict] = {
     "CLAIM_TTL_MINUTES": {"type": "int", "group": "payments"},
     "PAYMENTS_TEST_MODE": {"type": "bool", "group": "payments"},
     "MAIL_PROVIDER": {"type": "str", "group": "mail"},
-    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": {"type": "int", "group": "separation limits"},
-    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits"},
-    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits"},
-    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits"},
+    # THESE FOUR ARE NOT SEEN BY THE TRIAL BOOT. separation_limits._limit()
+    # reads them directly, so build_settings() never touches them and
+    # validate() cannot judge them. Without the "min" check below, a PUT of
+    # "abc" or "-1" was accepted, written and audited, then silently
+    # discarded at request time in favour of the code default. A setting
+    # that reports success and does nothing is worse than one that fails.
+    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1},
+    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 1},
+    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1},
+    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 1},
 }
 
 _TOOLS = (
@@ -116,6 +122,31 @@ _SECRETISH_FRAGMENTS = (
     "SECRET", "TOKEN", "PASSWORD", "PASSWD", "API_KEY", "APIKEY",
     "CREDENTIAL", "PRIVATE", "SALT", "_KEY", "COOKIE", "WEBHOOK",
 )
+
+
+def _check_type(key: str, value: str) -> None:
+    """Reject a value that does not match its declared type or minimum.
+
+    Runs for every key in KNOWN_KEYS. The trial boot catches anything
+    build_settings() reads, but keys consumed elsewhere have no other
+    guard - see the note on the separation limits above.
+    """
+    meta = KNOWN_KEYS.get(key)
+    if not meta:
+        return
+    kind = meta.get("type")
+    if kind == "bool":
+        if value.strip().lower() not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
+            raise ValueError(f"{key} must be a boolean, got {value!r}")
+        return
+    if kind in ("int", "float"):
+        try:
+            number = int(value) if kind == "int" else float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be {'an integer' if kind == 'int' else 'a number'}, got {value!r}") from None
+        minimum = meta.get("min")
+        if minimum is not None and number < minimum:
+            raise ValueError(f"{key} must be >= {minimum}, got {number}")
 
 
 def _is_secretish(key: str) -> bool:
@@ -228,6 +259,8 @@ def set_many(values: dict[str, str], *, actor: str = "admin", note: str = "") ->
             raise ValueError(f"{key} looks like a credential and cannot be set at runtime")
         if not key or len(key) > 128:
             raise ValueError("setting key must be 1-128 chars")
+        if value is not None:
+            _check_type(key, str(value))
 
     normalised = {k: (None if v is None else str(v)) for k, v in values.items()}
     validate(normalised)

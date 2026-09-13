@@ -68,8 +68,11 @@ WHAT THIS DELIBERATELY DOES NOT DO. It does not try to make the free
 tier unbeatable. A genuinely new browser on a genuinely new IP is a new
 person as far as this code can tell, and treating that as fraud would
 mean punishing shared offices and mobile CGNAT. The IP counter
-(free_monthly_ops_per_ip, 4) is the backstop, and the real ceiling on
-abuse is that a free op costs about two cents.
+(free_monthly_ops_per_ip, 2 by default and tunable at runtime through the
+settings table) is the backstop, and the real ceiling on abuse is that a
+free op costs about two cents. get_settings() refuses to boot if it is
+set below free_monthly_ops, since that would make part of the advertised
+allowance unreachable.
 --------------------------------------------------------------------------
 """
 

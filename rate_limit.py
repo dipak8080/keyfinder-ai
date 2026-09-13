@@ -167,10 +167,15 @@ def _sweep_memory(now: float) -> None:
 _last_sweep = 0.0
 _last_mem_sweep = 0.0
 
-# A bucket idle this long cannot affect any decision: the longest window
-# in use anywhere is an hour, so an hour of slack on top is already
-# generous and keeps the sweep from fighting an active caller.
-_MEM_KEY_TTL_SECONDS = 7200
+# A bucket idle this long cannot affect any decision. The longest window
+# in use is now a DAY (separation_limits.py's 30/day cap), not an hour -
+# and the daily bucket lands in this dict whenever the persistent path
+# errors and falls back to memory. At the old 7200 an idle daily bucket
+# was dropped after two hours by unrelated traffic, because _sweep_memory
+# scans every key and fires from any of the ~35 non-persistent call
+# sites. Matched to _sweep_persistent's cutoff so both paths forget at
+# the same point.
+_MEM_KEY_TTL_SECONDS = 172800
 _MEM_SWEEP_INTERVAL_SECONDS = 600
 
 
@@ -211,9 +216,15 @@ def _format_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
-def _reject(ip, path, key_override, timestamps, effective_max, effective_window, now, tier):
+def _reject(ip, path, key_override, timestamps, effective_max, effective_window,
+            now, tier, route=None):
+    # route is logged ALONGSIDE the bucket, never instead of it. With a
+    # shared bucket the two differ, and the route is the half that says
+    # which endpoint someone is actually hitting - the signal the
+    # endpoint-hopping investigation ran on in the first place.
+    where = path if not route or route == path else f"{path} (route {route})"
     logger.warning(
-        f"[RATE LIMIT] Blocked {ip} on {path} - {len(timestamps)} requests in window"
+        f"[RATE LIMIT] Blocked {ip} on {where} - {len(timestamps)} requests in window"
         + (f" (keyed on {key_override})" if key_override else "")
     )
     retry_after = int(effective_window - (now - timestamps[0])) if timestamps else effective_window
@@ -303,7 +314,8 @@ def check_rate_limit(
             if len(timestamps) >= effective_max:
                 _requests[key] = timestamps
                 _reject(ip, path, key_override, timestamps,
-                        effective_max, effective_window, now, tier)
+                        effective_max, effective_window, now, tier,
+                        route=request.url.path)
 
             timestamps.append(now)
             _requests[key] = timestamps
@@ -324,7 +336,8 @@ def check_rate_limit(
 
         if not allowed:
             _reject(ip, path, key_override, timestamps,
-                    effective_max, effective_window, now, tier)
+                    effective_max, effective_window, now, tier,
+                    route=request.url.path)
     except HTTPException:
         raise
     except Exception:
@@ -337,6 +350,7 @@ def check_rate_limit(
             timestamps = [t for t in _requests.get(key, []) if t >= now - effective_window]
             if len(timestamps) >= effective_max:
                 _reject(ip, path, key_override, timestamps,
-                        effective_max, effective_window, now, tier)
+                        effective_max, effective_window, now, tier,
+                        route=request.url.path)
             timestamps.append(now)
             _requests[key] = timestamps
