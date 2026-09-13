@@ -217,10 +217,14 @@ def validate(candidate: dict[str, str]) -> None:
 
 def set_many(values: dict[str, str], *, actor: str = "admin", note: str = "") -> dict[str, str]:
     """Validate then write. All or nothing."""
-    for key in values:
+    for key, value in values.items():
         if key in LOCKED_KEYS:
             raise ValueError(f"{key} cannot be set at runtime")
-        if _is_secretish(key):
+        # The credential guard applies to WRITES only. Deleting a row can
+        # neither leak nor create anything, and blocking it would strand
+        # any row written before the guard existed - with no way to remove
+        # it through the API.
+        if value is not None and _is_secretish(key):
             raise ValueError(f"{key} looks like a credential and cannot be set at runtime")
         if not key or len(key) > 128:
             raise ValueError("setting key must be 1-128 chars")
