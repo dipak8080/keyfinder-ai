@@ -77,6 +77,8 @@ def _db_file() -> str:
 
 
 def _connect() -> sqlite3.Connection:
+    """Caller MUST close. `with sqlite3.connect(...)` is a TRANSACTION
+    context manager, not a closing one - it never released the handle."""
     global _db_ready
     path = _db_file()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -99,29 +101,75 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _persistent_window(bucket: str, window: float, now: float) -> list:
-    """Timestamps still inside the window, oldest first. Prunes as it goes."""
-    with _connect() as conn:
-        conn.execute("DELETE FROM rate_hits WHERE bucket = ? AND ts < ?",
-                     (bucket, now - window))
-        rows = conn.execute(
-            "SELECT ts FROM rate_hits WHERE bucket = ? ORDER BY ts", (bucket,)
-        ).fetchall()
-    return [float(r[0]) for r in rows]
+def _persistent_check_and_record(bucket: str, window: float, limit: int, now: float):
+    """Prune, count, and (if under the limit) record - as ONE transaction.
 
+    Read and write used to be two separate connections with nothing
+    between them, so N concurrent requests on the same bucket all read
+    the same pre-insert count and all passed a limit of 1. BEGIN
+    IMMEDIATE takes SQLite's write lock up front, which serializes this
+    across threads AND across uvicorn workers; busy_timeout (set in
+    _connect) is what makes the losers wait rather than error.
 
-def _persistent_record(bucket: str, now: float) -> None:
-    with _connect() as conn:
-        conn.execute("INSERT INTO rate_hits (bucket, ts) VALUES (?, ?)", (bucket, now))
+    Returns (allowed, timestamps_before_this_request).
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM rate_hits WHERE bucket = ? AND ts < ?",
+                         (bucket, now - window))
+            rows = conn.execute(
+                "SELECT ts FROM rate_hits WHERE bucket = ? ORDER BY ts", (bucket,)
+            ).fetchall()
+            timestamps = [float(r[0]) for r in rows]
+
+            allowed = len(timestamps) < limit
+            if allowed:
+                conn.execute("INSERT INTO rate_hits (bucket, ts) VALUES (?, ?)",
+                             (bucket, now))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return allowed, timestamps
+    finally:
+        conn.close()
 
 
 def _sweep_persistent(now: float) -> None:
     """Drops rows older than any window we use. Cheap and rare."""
-    with _connect() as conn:
+    conn = _connect()
+    try:
         conn.execute("DELETE FROM rate_hits WHERE ts < ?", (now - 86400,))
+    finally:
+        conn.close()
+
+
+def _sweep_memory(now: float) -> None:
+    """Drops buckets whose newest hit is older than any window in use.
+
+    _requests pruned timestamps INSIDE a bucket but never removed the
+    bucket itself, so every unique (ip, path) ever seen stayed resident
+    for the container's lifetime. Called under _lock.
+    """
+    cutoff = now - _MEM_KEY_TTL_SECONDS
+    dead = [k for k, ts in _requests.items() if not ts or ts[-1] < cutoff]
+    for k in dead:
+        del _requests[k]
+    if dead:
+        logger.info(f"[RATE LIMIT] Swept {len(dead)} idle in-memory buckets "
+                    f"({len(_requests)} remain)")
 
 
 _last_sweep = 0.0
+_last_mem_sweep = 0.0
+
+# A bucket idle this long cannot affect any decision: the longest window
+# in use anywhere is an hour, so an hour of slack on top is already
+# generous and keeps the sweep from fighting an active caller.
+_MEM_KEY_TTL_SECONDS = 7200
+_MEM_SWEEP_INTERVAL_SECONDS = 600
 
 
 def _get_client_ip(request: Request) -> str:
@@ -218,7 +266,7 @@ def check_rate_limit(
     whose tools cost real GPU money and whose throttle must therefore
     outlive a deploy.
     """
-    global _last_sweep
+    global _last_sweep, _last_mem_sweep
 
     if not RATE_LIMIT_ENABLED:
         return
@@ -235,11 +283,16 @@ def check_rate_limit(
     if tier is None:
         key = (subject, path)
         with _lock:
+            if now - _last_mem_sweep > _MEM_SWEEP_INTERVAL_SECONDS:
+                _last_mem_sweep = now
+                _sweep_memory(now)
+
             timestamps = _requests.get(key, [])
             cutoff = now - effective_window
             timestamps = [t for t in timestamps if t >= cutoff]
 
             if len(timestamps) >= effective_max:
+                _requests[key] = timestamps
                 _reject(ip, path, key_override, timestamps,
                         effective_max, effective_window, now, tier)
 
@@ -256,13 +309,13 @@ def check_rate_limit(
             _last_sweep = now
             _sweep_persistent(now)
 
-        timestamps = _persistent_window(bucket, effective_window, now)
+        allowed, timestamps = _persistent_check_and_record(
+            bucket, effective_window, effective_max, now
+        )
 
-        if len(timestamps) >= effective_max:
+        if not allowed:
             _reject(ip, path, key_override, timestamps,
                     effective_max, effective_window, now, tier)
-
-        _persistent_record(bucket, now)
     except HTTPException:
         raise
     except Exception:
