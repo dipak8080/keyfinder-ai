@@ -164,11 +164,11 @@ async def transcribe_to_midi(
             "suffix": suffix,
         }
 
-        register_gpu_input(token, source_path)
         logger.info(
             f"[PIANO] Submitting token={token[:8]}... "
             f"({os.path.basename(source_path)}, isolate={isolate})"
         )
+        register_gpu_input(token, source_path)
         try:
             result = await run_worker_job(
                 RUNPOD_PIANO_ENDPOINT_ID,

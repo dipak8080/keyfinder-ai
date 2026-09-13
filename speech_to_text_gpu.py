@@ -175,13 +175,13 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
         "suffix": suffix,
     }
 
-    register_gpu_input(token, input_path)
     logger.info(
         f"[SPEECH_TO_TEXT_GPU] Submitting token={token[:8]}... "
         f"({os.path.basename(input_path)}, language={language or 'auto'}, "
         f"task={task}, mode={mode}, beam_size={beam_size})"
     )
 
+    register_gpu_input(token, input_path)
     try:
         result = await run_worker_job(
             RUNPOD_WHISPER_ENDPOINT_ID,

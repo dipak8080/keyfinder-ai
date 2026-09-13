@@ -369,7 +369,6 @@ async def transcribe_to_midi(
     if min_note_ms:
         payload["min_note_ms"] = float(min_note_ms)
 
-    register_gpu_input(token, input_path)
     logger.info(
         f"[MIDI_HQ] Submitting token={token[:8]}... "
         f"({os.path.basename(input_path)}, "
@@ -377,6 +376,7 @@ async def transcribe_to_midi(
         f"min_note={min_note_ms or '-'}ms)"
     )
 
+    register_gpu_input(token, input_path)
     try:
         result = await run_worker_job(
             RUNPOD_MT3_ENDPOINT_ID,
