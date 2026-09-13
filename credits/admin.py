@@ -91,6 +91,23 @@ def slot_info() -> dict:
     }
 
 
+def _enforced_separation_limits():
+    """What separation_limits is actually enforcing, after its clamp.
+
+    The settings table reports the ROW; _limit() clamps at read time
+    against KNOWN_KEYS, so a legacy row or an out-of-range env var is
+    shown as one number and enforced as another. Same failure as the two
+    /limits fallbacks disagreeing: a panel that states a value nothing
+    enforces. The clamp knew the truth and only told the log.
+    """
+    try:
+        from separation_limits import current_limits
+
+        return current_limits()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def require_active_slot() -> None:
     """Refuse writes on a container that is draining, not serving.
 
@@ -741,6 +758,7 @@ def list_settings() -> dict:
         "settings": settings_store.describe(),
         "locked": sorted(settings_store.LOCKED_KEYS),
         "slot": slot_info(),
+        "enforced": {"separation": _enforced_separation_limits()},
     }
 
 

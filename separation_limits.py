@@ -61,6 +61,58 @@ from rate_limit import check_rate_limits, refund_rate_limit_hits
 SHARED_BUCKET = "separation-standard"
 
 
+# Warn once per distinct (key, value). _limit() runs inside
+# current_limits(), which serves shared_separation_limit AND /limits AND
+# /credits/me - the last two on nearly every page load. Warning per call
+# turned one bad value into a WARNING row per request in system_logs,
+# which shares a volume with credits.db and rate_limits.db. Disk pressure
+# on that volume is the DB-error condition that makes the persistent
+# limiter fall back to memory, silently resetting the 30/day counter - so
+# a single mistyped limit could walk into the one silent cost-control
+# failure left.
+_warned: set = set()
+
+
+def _warn_once(token, message: str, *args) -> None:
+    if token in _warned:
+        return
+    if len(_warned) > 64:
+        _warned.clear()
+    _warned.add(token)
+    logger.warning(message, *args)
+
+
+def _safe_default(default: int, low: int, high) -> int:
+    """The fallback to use when the resolved value is out of range.
+
+    `default` is the config.py constant, and config.py reads THE SAME ENV
+    VAR - so SEPARATION_SHARED_DAILY_MAX_REQUESTS=30000 poisons the value
+    and the fallback together, and the clamp warned then enforced 30000
+    anyway. Falling back to the code default is right whenever the code
+    default is itself sane; when it is not, the bound is the only number
+    left that was actually chosen by someone.
+
+    WORTH BEING EXPLICIT ABOUT THE TRADE. An env var of 30000 lands on
+    max (500/day), not on the intended 30. That is 16x looser than the
+    default, and it is deliberate: reaching this branch means someone
+    edited .env and redeployed to ask for a big number, so honouring the
+    largest value we consider sane respects the intent while capping the
+    damage - and it warns once. Reverting silently to 30 would be the
+    safer number and the more surprising behaviour.
+
+    Note config.py itself will not survive a NON-NUMERIC env var here -
+    int(os.environ.get(...)) raises at import, as it does for all ~50 of
+    its constants. That is pre-existing and defensible (a config typo
+    fails the health check and rolls the deploy back), so it is left
+    alone rather than made inconsistent for one key.
+    """
+    if default < low:
+        return low
+    if high is not None and default > high:
+        return high
+    return default
+
+
 def _bounds(name: str):
     """The min/max KNOWN_KEYS declares for this key, if any."""
     try:
@@ -93,22 +145,25 @@ def _limit(name: str, default: int) -> int:
         raw = None
     if raw in (None, ""):
         raw = os.environ.get(name)
+    low, high = _bounds(name)
+    low = 1 if low is None else low
+    fallback = _safe_default(default, low, high)
+
     try:
         value = int(raw) if raw not in (None, "") else default
     except (TypeError, ValueError):
-        logger.warning("[SEPARATION LIMIT] %s=%r is not an integer, using %s", name, raw, default)
-        return default
+        _warn_once((name, raw), "[SEPARATION LIMIT] %s=%r is not an integer, using %s",
+                   name, raw, fallback)
+        return fallback
 
-    low, high = _bounds(name)
-    low = 1 if low is None else low
     if value < low:
-        logger.warning("[SEPARATION LIMIT] %s=%s is below the %s minimum, using %s",
-                       name, value, low, default)
-        return default
+        _warn_once((name, raw), "[SEPARATION LIMIT] %s=%s is below the %s minimum, using %s",
+                   name, value, low, fallback)
+        return fallback
     if high is not None and value > high:
-        logger.warning("[SEPARATION LIMIT] %s=%s exceeds the %s maximum, using %s",
-                       name, value, high, default)
-        return default
+        _warn_once((name, raw), "[SEPARATION LIMIT] %s=%s exceeds the %s maximum, using %s",
+                   name, value, high, fallback)
+        return fallback
     return value
 
 
