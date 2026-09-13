@@ -26,7 +26,7 @@ SOURCE_CODECS = {
     "aac": ("m4a", "bestaudio[ext=m4a]/bestaudio"),
 }
 
-SOURCE_MAX_SECONDS = int(os.environ.get("DOWNLOAD_SOURCE_MAX_SECONDS", "600"))
+SOURCE_MAX_SECONDS = int(os.environ.get("DOWNLOAD_SOURCE_MAX_SECONDS", "1200"))
 
 _PROBE_TIMEOUT_SECONDS = 30
 _WAV_TIMEOUT_SECONDS = 300
