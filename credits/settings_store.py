@@ -28,6 +28,20 @@ THREE RULES THAT MATTER
    through here, so the admin API cannot leak the signing key or set the
    DB path out from under a running process.
 
+THREE CLASSES OF KEY, AND THE DIFFERENCE MATTERS
+-----------------------------------------------
+  1. OVERRIDABLE AND TRIAL-BOOTED. Anything build_settings() reads. A bad
+     value is caught by the same invariant that would have refused the
+     boot. Most of KNOWN_KEYS.
+  2. OVERRIDABLE, _check_type ONLY. Read somewhere else - the
+     SEPARATION_SHARED_* four, which separation_limits._limit() resolves
+     directly. The trial boot cannot see them, so the type and "min"
+     checks below are their only guard.
+  3. NOT OVERRIDABLE AT ALL. Anything the host config.py reads via
+     os.environ at import time. Setting it here writes a row that nothing
+     reads. Only LOCKED_KEYS and the credential guard stop that, and
+     neither is a general answer.
+
 VALIDATION IS A TRIAL BOOT
 --------------------------
 A bad value must not be discoverable at the next restart. stage() lets
@@ -43,6 +57,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +76,11 @@ LOCKED_KEYS = frozenset({
     "RESEND_API_KEY",
     "SMTP_USER",
     "SMTP_PASSWORD",
+    # NOT a secret, but auth.py builds RedirectResponse from it on the
+    # magic-link verification flow, so a settable value turns a leaked
+    # admin token into an open redirect on the one flow that carries a
+    # session. Changing where the frontend lives is a deploy, not a knob.
+    "FRONTEND_URL",
 })
 
 # Keys the admin UI lists, with the type it should render. Anything not
@@ -81,6 +101,12 @@ KNOWN_KEYS: dict[str, dict] = {
     "CLAIM_TTL_MINUTES": {"type": "int", "group": "payments"},
     "PAYMENTS_TEST_MODE": {"type": "bool", "group": "payments"},
     "MAIL_PROVIDER": {"type": "str", "group": "mail"},
+    # In KNOWN_KEYS specifically so _is_secretish() lets them through.
+    # build_settings() genuinely reads all three, and the fragment match
+    # on "COOKIE" was refusing them with "looks like a credential".
+    "COOKIE_DOMAIN": {"type": "str", "group": "cookies"},
+    "COOKIE_SECURE": {"type": "bool", "group": "cookies"},
+    "COOKIE_SAMESITE": {"type": "str", "group": "cookies"},
     # THESE FOUR ARE NOT SEEN BY THE TRIAL BOOT. separation_limits._limit()
     # reads them directly, so build_settings() never touches them and
     # validate() cannot judge them. Without the "min" check below, a PUT of
@@ -158,6 +184,24 @@ def _is_secretish(key: str) -> bool:
 
 _staged: threading.local = threading.local()
 
+# load_overrides() opened a fresh connection on every call. That was fine
+# when only get_settings() (lru_cached) read it, but current_limits() now
+# runs on GET /limits and GET /credits/me - two of the hottest endpoints
+# on the site - four times per call. One second is short enough that an
+# admin PUT looks instant and long enough to collapse a page load's worth
+# of reads into one query. set_many() busts it explicitly so a write is
+# never invisible to the response that follows it, and stage() is checked
+# BEFORE the cache so a trial boot is never served cached rows.
+_CACHE_TTL_SECONDS = 1.0
+_cache_lock = threading.Lock()
+_cache: dict = {"at": 0.0, "value": None}
+
+
+def _invalidate_cache() -> None:
+    with _cache_lock:
+        _cache["at"] = 0.0
+        _cache["value"] = None
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -185,17 +229,28 @@ def load_overrides() -> dict[str, str]:
     if staged is not None:
         return staged
 
+    now = time.monotonic()
+    with _cache_lock:
+        if _cache["value"] is not None and now - _cache["at"] < _CACHE_TTL_SECONDS:
+            return _cache["value"]
+
     if not Path(_db_path()).exists():
-        return {}
-    try:
-        with _conn() as conn:
-            rows = conn.execute("SELECT key, value FROM settings").fetchall()
-        return {r["key"]: r["value"] for r in rows if r["key"] not in LOCKED_KEYS}
-    except sqlite3.Error:
-        return {}
-    except Exception:  # noqa: BLE001
-        log.exception("settings overrides unreadable, falling back to env")
-        return {}
+        value = {}
+    else:
+        try:
+            with _conn() as conn:
+                rows = conn.execute("SELECT key, value FROM settings").fetchall()
+            value = {r["key"]: r["value"] for r in rows if r["key"] not in LOCKED_KEYS}
+        except sqlite3.Error:
+            return {}
+        except Exception:  # noqa: BLE001
+            log.exception("settings overrides unreadable, falling back to env")
+            return {}
+
+    with _cache_lock:
+        _cache["at"] = now
+        _cache["value"] = value
+    return value
 
 
 def resolve(name: str) -> str | None:
@@ -295,6 +350,7 @@ def set_many(values: dict[str, str], *, actor: str = "admin", note: str = "") ->
             conn.execute("ROLLBACK")
             raise
 
+    _invalidate_cache()
     log.info("settings updated by %s: %s", actor, ", ".join(sorted(normalised)))
     return load_overrides()
 

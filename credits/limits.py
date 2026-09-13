@@ -340,8 +340,27 @@ def _shared_separation_block() -> list[dict]:
 
         limits = current_limits()
     except Exception:  # noqa: BLE001
+        # Same fallback as routes/admin.py's /limits, deliberately: two
+        # endpoints describing one bucket must not disagree about it, and
+        # an empty list reads as "no shared limit" rather than "could not
+        # resolve it".
         log.warning("shared separation limits unavailable", exc_info=True)
-        return []
+        try:
+            from config import (
+                SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS,
+                SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS,
+                SEPARATION_SHARED_DAILY_MAX_REQUESTS,
+                SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
+            )
+        except ImportError:
+            return []
+        limits = {
+            "bucket": "separation-standard",
+            "hourly_max": SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS,
+            "hourly_window": SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS,
+            "daily_max": SEPARATION_SHARED_DAILY_MAX_REQUESTS,
+            "daily_window": SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
+        }
     return [{
         "key": limits["bucket"],
         "routes": ["/separate", "/stems", "/youtube/separate", "/youtube/stems"],

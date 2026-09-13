@@ -173,6 +173,10 @@ from config import (
     JOIN_MAX_TOTAL_BYTES,
     ALLOWED_AUDIO_INPUT_FORMATS,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
+    SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS,
+    SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS,
+    SEPARATION_SHARED_DAILY_MAX_REQUESTS,
+    SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
     SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
     STEMS_RATE_LIMIT_MAX_REQUESTS,
     STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
@@ -869,12 +873,16 @@ def _shared_separation_limits() -> dict:
         return current_limits()
     except Exception:  # noqa: BLE001
         logger.warning("[LIMITS] shared separation limits unavailable", exc_info=True)
+        # Host config.py constants, not zeros. Only separation_limits can
+        # fail to import here, never config, so these are always present -
+        # and "0 per day" would tell a client everything is blocked, which
+        # is false in the more alarming direction.
         return {
             "bucket": "separation-standard",
-            "hourly_max": SEPARATION_RATE_LIMIT_MAX_REQUESTS,
-            "hourly_window": SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
-            "daily_max": 0,
-            "daily_window": 86400,
+            "hourly_max": SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS,
+            "hourly_window": SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS,
+            "daily_max": SEPARATION_SHARED_DAILY_MAX_REQUESTS,
+            "daily_window": SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
         }
 
 

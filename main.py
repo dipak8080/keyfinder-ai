@@ -352,23 +352,44 @@ app = FastAPI(
     openapi_url=None,
 )
 
-# Hands back separation rate-limit slots when the route answers with an
-# error. Deliberately keyed on the RESPONSE rather than called at each
-# failure branch: the branches that reject a submission (queue full,
-# tool disabled, bad file, validation) are spread across two route
-# modules and _shared.py, and a new one added later would silently stop
-# refunding. A 429 is excluded because that request never recorded
-# anything - check_rate_limits rolls back before rejecting.
+_REFUND_STATUSES = frozenset({500, 502, 503, 504})
+
+
+def _refund_separation_slots(request) -> None:
+    try:
+        from separation_limits import refund_unused_slots
+
+        refund_unused_slots(request)
+    except Exception:  # noqa: BLE001
+        logger.warning("[SEPARATION LIMIT] refund hook failed", exc_info=True)
+
+
+# Refunds separation rate-limit slots for submissions we refused to run:
+# queue full, tool disabled, upstream failure, unhandled error. Keyed on
+# the response rather than on each failure branch, because those branches
+# span two route modules and _shared.py and a new one would silently stop
+# refunding.
+#
+# 5xx ONLY, deliberately. Refunding 4xx made the limiter UNBOUNDED: a
+# request with no body records a hit, 422s, and gets it straight back, so
+# an unlimited stream of malformed uploads passed through the limiter
+# without ever consuming an allowance. On /separate and /stems the
+# multipart body is read before validation fails, so those bytes had
+# already landed. A malformed submission still costs the upload, which is
+# the resource the hourly window exists to bound.
+#
+# The except branch matters as much as the status check: an unhandled
+# exception propagates out of call_next, ServerErrorMiddleware builds the
+# 500 above this, and nothing after the await would ever run.
 @app.middleware("http")
 async def refund_unused_separation_slots(request, call_next):
-    response = await call_next(request)
-    if response.status_code >= 400 and response.status_code != 429:
-        try:
-            from separation_limits import refund_unused_slots
-
-            refund_unused_slots(request)
-        except Exception:  # noqa: BLE001
-            logger.warning("[SEPARATION LIMIT] refund hook failed", exc_info=True)
+    try:
+        response = await call_next(request)
+    except Exception:
+        _refund_separation_slots(request)
+        raise
+    if response.status_code in _REFUND_STATUSES:
+        _refund_separation_slots(request)
     return response
 
 

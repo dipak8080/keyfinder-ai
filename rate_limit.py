@@ -155,10 +155,13 @@ def _sweep_memory(now: float) -> None:
     bucket itself, so every unique (ip, path) ever seen stayed resident
     for the container's lifetime. Called under _lock.
     """
-    cutoff = now - _MEM_KEY_TTL_SECONDS
-    dead = [k for k, ts in _requests.items() if not ts or ts[-1] < cutoff]
+    dead = [
+        k for k, ts in _requests.items()
+        if not ts or ts[-1] < now - (_key_windows.get(k, 3600) + _MEM_KEY_SLACK_SECONDS)
+    ]
     for k in dead:
         del _requests[k]
+        _key_windows.pop(k, None)
     if dead:
         logger.info(f"[RATE LIMIT] Swept {len(dead)} idle in-memory buckets "
                     f"({len(_requests)} remain)")
@@ -167,16 +170,21 @@ def _sweep_memory(now: float) -> None:
 _last_sweep = 0.0
 _last_mem_sweep = 0.0
 
-# A bucket idle this long cannot affect any decision. The longest window
-# in use is now a DAY (separation_limits.py's 30/day cap), not an hour -
-# and the daily bucket lands in this dict whenever the persistent path
-# errors and falls back to memory. At the old 7200 an idle daily bucket
-# was dropped after two hours by unrelated traffic, because _sweep_memory
-# scans every key and fires from any of the ~35 non-persistent call
-# sites. Matched to _sweep_persistent's cutoff so both paths forget at
-# the same point.
-_MEM_KEY_TTL_SECONDS = 172800
+# Slack added on top of a bucket's OWN window before it may be swept.
+#
+# This used to be one flat number for every key, which forced a choice
+# between two wrong answers once a daily window existed: 7200 dropped an
+# idle daily bucket after two hours (any of the ~35 non-persistent call
+# sites triggers a sweep, and the sweep scans everything), while a flat
+# 172800 kept every cheap per-minute bucket resident for 48 hours to
+# serve a fallback path only the separation buckets ever use.
+#
+# _key_windows records each bucket's window at insert, so the sweep can
+# ask "how long does THIS key need" instead of applying the longest
+# window in the app to all of them.
+_MEM_KEY_SLACK_SECONDS = 3600
 _MEM_SWEEP_INTERVAL_SECONDS = 600
+_key_windows: dict = {}
 
 
 def _get_client_ip(request: Request) -> str:
@@ -340,15 +348,23 @@ def check_rate_limits(
             f"falling back to in-memory", exc_info=True,
         )
         with _lock:
+            # Key shape matches the single-window path: (subject, bucket).
+            # full_key already contains the subject, so using it here made
+            # a second, incompatible shape in the same dict.
             for full_key, bucket, limit, window in specs:
-                key = (full_key, bucket)
+                key = (subject, bucket)
                 timestamps = [t for t in _requests.get(key, []) if t >= now - window]
                 if len(timestamps) >= limit:
                     _reject(ip, bucket, key_override, timestamps, limit,
                             int(window), now, tier, route=route)
                 _requests[key] = timestamps
-            for full_key, bucket, _limit, _window in specs:
-                _requests[(full_key, bucket)].append(now)
+            for _full_key, bucket, _limit, window in specs:
+                _requests[(subject, bucket)].append(now)
+                _key_windows[(subject, bucket)] = window
+        # No receipt: these hits live in memory, and the refund path only
+        # knows how to delete SQLite rows. So during a DB outage slots are
+        # counted but never refunded - the safe direction, and worth an
+        # alert once spend alerting exists.
         return []
 
 
@@ -375,8 +391,18 @@ def refund_rate_limit_hits(receipt) -> None:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 for bucket, ts in receipt:
-                    conn.execute("DELETE FROM rate_hits WHERE bucket = ? AND ts = ?",
-                                 (bucket, ts))
+                    # By rowid, one row at a time. `now` is read before
+                    # BEGIN IMMEDIATE, so the write lock serializes the
+                    # inserts but not the clock read: two requests in the
+                    # same bucket can land on an identical ts, and a bare
+                    # DELETE on (bucket, ts) then hands back a slot
+                    # belonging to a request still in flight.
+                    conn.execute(
+                        "DELETE FROM rate_hits WHERE rowid = ("
+                        " SELECT rowid FROM rate_hits WHERE bucket = ? AND ts = ?"
+                        " LIMIT 1)",
+                        (bucket, ts),
+                    )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -457,6 +483,7 @@ def check_rate_limit(
 
             timestamps.append(now)
             _requests[key] = timestamps
+            _key_windows[key] = effective_window
         return
 
     # Metered path: survives restarts. A DB failure must never hand out
