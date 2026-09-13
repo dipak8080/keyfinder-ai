@@ -49,16 +49,30 @@ import os
 
 from fastapi import Request
 
-from config import (
-    logger,
-    SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS,
-    SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS,
-    SEPARATION_SHARED_DAILY_MAX_REQUESTS,
-    SEPARATION_SHARED_DAILY_WINDOW_SECONDS,
-)
+from config import logger
 from rate_limit import check_rate_limits, refund_rate_limit_hits
 
 SHARED_BUCKET = "separation-standard"
+
+# The fallback must NOT come from config.py. Those constants read the
+# same env vars _limit() already reads below, so an out-of-range env var
+# poisoned the value and the fallback together - which is how 30000 got
+# enforced as 30000, and then, once clamped, as 500 from env but 30 from
+# a settings row. One bad value, two answers, depending only on where it
+# was written. Held here as literals so the fallback is always a number
+# someone chose and both paths agree.
+#
+# config.py keeps its constants: routes/admin.py falls back to them when
+# this module fails to import, and that path needs them. Drift between
+# the two copies surfaces as /limits reporting a stale number on a path
+# that already exists to be approximate, which is why this is a comment
+# rather than a mechanism.
+_DEFAULTS = {
+    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": 10,
+    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": 3600,
+    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": 30,
+    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": 86400,
+}
 
 
 # Warn once per distinct (key, value). _limit() runs inside
@@ -92,19 +106,16 @@ def _safe_default(default: int, low: int, high) -> int:
     default is itself sane; when it is not, the bound is the only number
     left that was actually chosen by someone.
 
-    WORTH BEING EXPLICIT ABOUT THE TRADE. An env var of 30000 lands on
-    max (500/day), not on the intended 30. That is 16x looser than the
-    default, and it is deliberate: reaching this branch means someone
-    edited .env and redeployed to ask for a big number, so honouring the
-    largest value we consider sane respects the intent while capping the
-    damage - and it warns once. Reverting silently to 30 would be the
-    safer number and the more surprising behaviour.
+    NO LONGER REACHABLE FROM AN ENV VAR. _DEFAULTS holds literals now, so
+    the fallback cannot be poisoned by the same variable that poisoned the
+    value. Kept as a guard against someone later editing _DEFAULTS out of
+    range, which is the only way in left.
 
-    Note config.py itself will not survive a NON-NUMERIC env var here -
-    int(os.environ.get(...)) raises at import, as it does for all ~50 of
-    its constants. That is pre-existing and defensible (a config typo
-    fails the health check and rolls the deploy back), so it is left
-    alone rather than made inconsistent for one key.
+    The earlier version clamped to the BOUND, which meant an env var of
+    30000 enforced 500/day - about $1/day from a single IP, against a
+    whole-site spend of roughly $0.55/day. "Someone asked for a big
+    number" and "someone typed an extra zero" are indistinguishable here,
+    and the branch should not gamble on the generous reading.
     """
     if default < low:
         return low
@@ -124,8 +135,8 @@ def _bounds(name: str):
         return None, None
 
 
-def _limit(name: str, default: int) -> int:
-    """Resolve settings table -> env -> default, CLAMPED to KNOWN_KEYS.
+def _limit(name: str) -> int:
+    """Resolve settings table -> env -> _DEFAULTS, CLAMPED to KNOWN_KEYS.
 
     Bounded at READ time, not only at write time. _check_type guards
     set_many and nothing else, so a row written before max shipped, a row
@@ -137,6 +148,7 @@ def _limit(name: str, default: int) -> int:
     Out-of-range falls back to the code default and says so, rather than
     silently enforcing a number nobody chose.
     """
+    default = _DEFAULTS[name]
     try:
         from credits.settings_store import resolve
 
@@ -164,6 +176,15 @@ def _limit(name: str, default: int) -> int:
         _warn_once((name, raw), "[SEPARATION LIMIT] %s=%s exceeds the %s maximum, using %s",
                    name, value, high, fallback)
         return fallback
+    # Forget every remembered complaint about THIS KEY once it resolves
+    # cleanly, so reintroducing the same bad string later warns again -
+    # the warning exists to catch the second occurrence as much as the
+    # first. Discarding (name, raw) alone would drop the token for the
+    # value that just succeeded, which was never in the set; the bad one
+    # would stay remembered forever.
+    if _warned:
+        for token in [t for t in _warned if t[0] == name]:
+            _warned.discard(token)
     return value
 
 
@@ -171,14 +192,10 @@ def current_limits() -> dict:
     """What the four standard routes are enforcing right now."""
     return {
         "bucket": SHARED_BUCKET,
-        "hourly_max": _limit("SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS",
-                             SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS),
-        "hourly_window": _limit("SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS",
-                                SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS),
-        "daily_max": _limit("SEPARATION_SHARED_DAILY_MAX_REQUESTS",
-                            SEPARATION_SHARED_DAILY_MAX_REQUESTS),
-        "daily_window": _limit("SEPARATION_SHARED_DAILY_WINDOW_SECONDS",
-                               SEPARATION_SHARED_DAILY_WINDOW_SECONDS),
+        "hourly_max": _limit("SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS"),
+        "hourly_window": _limit("SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS"),
+        "daily_max": _limit("SEPARATION_SHARED_DAILY_MAX_REQUESTS"),
+        "daily_window": _limit("SEPARATION_SHARED_DAILY_WINDOW_SECONDS"),
     }
 
 

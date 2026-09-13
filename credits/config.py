@@ -4,11 +4,13 @@ Reads its own env vars rather than the backend's config.py, so the package
 can be added without touching anything else.
 
 THAT ISOLATION IS NO LONGER ABSOLUTE, and the docstring used to claim it
-was. credits/limits.py reaches the host config.py transitively through
-separation_limits, to report the shared standard-separation allowance on
-GET /credits/me. The import is lazy and inside a function, so there is no
-cycle and no import-time cost, but the package can no longer be described
-as free of host imports.
+was. credits/limits.py and credits/admin.py both reach the host
+config.py transitively through separation_limits - the first to report
+the shared standard-separation allowance on GET /credits/me, the second
+to report the ENFORCED limits on GET /admin/credits/settings. Both
+imports are lazy and inside a function, so there is no cycle and no
+import-time cost, but the package can no longer be described as free of
+host imports.
 
 Defaults are the "off" state: PAYWALL_ENABLED unset means nothing is charged
 and nothing is blocked, on every tool.
