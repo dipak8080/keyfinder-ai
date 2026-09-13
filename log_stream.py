@@ -345,6 +345,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from admin_auth import guard_admin_request, verify_admin_key
+from client_ip import get_client_ip
 from config import NOISE_PATH_MARKERS
 
 DB_PATH = os.environ.get("REQUEST_LOG_DB_PATH", "/app/data/logs.db")
@@ -1091,10 +1092,7 @@ def _get_real_client_ip(request: Request) -> str:
     back to request.client.host only if it's missing (e.g. hitting the app
     directly on :8000, bypassing nginx entirely).
     """
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else "-"
+    return get_client_ip(request, default="-")
 
 
 class RequestLoggerMiddleware(BaseHTTPMiddleware):

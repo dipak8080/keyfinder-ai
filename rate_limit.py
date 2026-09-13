@@ -44,6 +44,8 @@ from pathlib import Path
 
 from fastapi import Request, HTTPException
 
+from client_ip import get_client_ip
+
 from config import (
     logger,
     RATE_LIMIT_ENABLED,
@@ -173,12 +175,10 @@ _MEM_SWEEP_INTERVAL_SECONDS = 600
 
 
 def _get_client_ip(request: Request) -> str:
-    # Behind a reverse proxy (Nginx/Caddy on the VPS, same as it was
-    # behind Railway's proxy before) - the real client IP is in
-    # X-Forwarded-For, not request.client.host (which would just be the
-    # proxy's internal address, identical for every request).
-    forwarded = request.headers.get("x-forwarded-for")
-    return forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    # CF-Connecting-IP first: X-Forwarded-For's first entry is whatever
+    # the caller put there, and this value IS the bucket key for every
+    # free-tier limit. See client_ip.py.
+    return get_client_ip(request, default="unknown")
 
 
 def _format_duration(seconds: int) -> str:

@@ -49,6 +49,7 @@ from typing import Optional
 
 from fastapi import HTTPException, Request
 
+from client_ip import get_client_ip
 from config import (
     logger,
     ADMIN_STATUS_KEY,
@@ -76,16 +77,11 @@ _admin_locked_until: dict = {}
 
 
 def _get_client_ip(request: Request) -> str:
-    """Same X-Forwarded-For-first logic as log_stream.py's
-    _get_real_client_ip() - nginx sits in front of this app, so
-    request.client.host would just be nginx's own address, not the real
-    caller's. Duplicated here rather than imported to keep this module
-    free of a dependency on log_stream.py, which is one of the three
-    files this module itself protects."""
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else "-"
+    """Prefers CF-Connecting-IP, which Cloudflare overwrites and a client
+    cannot forge. Both guards in this module key on the return value, so
+    a caller-controlled IP meant unlimited key guesses - see client_ip.py
+    for the production demonstration."""
+    return get_client_ip(request, default="-")
 
 
 def _prune(events: list, window_seconds: int, now: float) -> list:
