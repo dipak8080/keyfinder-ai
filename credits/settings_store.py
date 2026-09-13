@@ -81,6 +81,10 @@ KNOWN_KEYS: dict[str, dict] = {
     "CLAIM_TTL_MINUTES": {"type": "int", "group": "payments"},
     "PAYMENTS_TEST_MODE": {"type": "bool", "group": "payments"},
     "MAIL_PROVIDER": {"type": "str", "group": "mail"},
+    "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS": {"type": "int", "group": "separation limits"},
+    "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits"},
+    "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits"},
+    "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits"},
 }
 
 _TOOLS = (

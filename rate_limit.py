@@ -143,7 +143,7 @@ def _sweep_persistent(now: float) -> None:
     """Drops rows older than any window we use. Cheap and rare."""
     conn = _connect()
     try:
-        conn.execute("DELETE FROM rate_hits WHERE ts < ?", (now - 86400,))
+        conn.execute("DELETE FROM rate_hits WHERE ts < ?", (now - 172800,))
     finally:
         conn.close()
 
@@ -244,6 +244,8 @@ def check_rate_limit(
     window_seconds: int = None,
     key_override: str = None,
     tier: str = None,
+    bucket_key: str = None,
+    persistent: bool = False,
 ):
     """
     Use as a FastAPI dependency on rate-limited routes:
@@ -274,13 +276,20 @@ def check_rate_limit(
     effective_max = max_requests if max_requests is not None else RATE_LIMIT_MAX_REQUESTS
     effective_window = window_seconds if window_seconds is not None else RATE_LIMIT_WINDOW_SECONDS
 
-    path = request.url.path
+    # bucket_key replaces the PATH half of the key, so several routes can
+    # share one window. Without it the key is per-path, which is why the
+    # four standard separation routes each had an independent allowance
+    # and one IP could spend all four in the same hour.
+    path = bucket_key if bucket_key is not None else request.url.path
     ip = _get_client_ip(request)
     subject = key_override if key_override is not None else ip
 
     now = time.time()
 
-    if tier is None:
+    # tier still implies persistence, but persistence no longer implies
+    # tier: a route can have a restart-proof window while keeping the
+    # plain-string 429 detail its frontend already parses.
+    if tier is None and not persistent:
         key = (subject, path)
         with _lock:
             if now - _last_mem_sweep > _MEM_SWEEP_INTERVAL_SECONDS:

@@ -533,6 +533,30 @@ SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_HQ_RATE
 STEMS_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_RATE_LIMIT_MAX_REQUESTS", "6"))
 STEMS_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 
+# ----- SHARED standard-separation allowance -----
+# The four standard routes (/separate, /stems, /youtube/separate,
+# /youtube/stems) now share ONE bucket via separation_limits.py instead of
+# holding four independent ones. The per-route constants above are kept
+# because other code reports them, but they no longer gate those routes.
+#
+# 10/hour, down from an effective 24 (4 routes x 6). Still looser than any
+# single route was, so a normal session is untouched - what changes is that
+# hopping endpoints no longer buys a fresh allowance.
+#
+# 30/day is the one that bounds the BILL. The hourly number alone permits
+# 240/day, and at ~$0.002 a standard job that is ~$0.50/day from one IP.
+# 30 caps an IP near $2/month while sitting far above any real day: the
+# whole site currently runs about 28 standard separations a day across all
+# users combined.
+#
+# Both are read per-request through the settings table, so they are tunable
+# from /admin/credits/settings without a redeploy. These values are the
+# fallback when no override is set.
+SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS", "10"))
+SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS", "3600"))
+SEPARATION_SHARED_DAILY_MAX_REQUESTS = int(os.environ.get("SEPARATION_SHARED_DAILY_MAX_REQUESTS", "30"))
+SEPARATION_SHARED_DAILY_WINDOW_SECONDS = int(os.environ.get("SEPARATION_SHARED_DAILY_WINDOW_SECONDS", "86400"))
+
 STEMS_HQ_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_MAX_REQUESTS", "1"))
 STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS", "3600"))  # 1 hour
 

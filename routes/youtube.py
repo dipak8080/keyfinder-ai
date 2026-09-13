@@ -334,6 +334,7 @@ from youtube import (
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
 from rate_limit import check_rate_limit
+from separation_limits import shared_separation_limit
 from cache import get_cached_audio, put_cached_audio, get_cached_path, put_cached_file
 from youtube_source import (
     SOURCE_CODECS, SOURCE_MAX_SECONDS,
@@ -1419,11 +1420,7 @@ async def youtube_analyze_result(job_id: str):
 
 @router.post(
     "/youtube/separate",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_SEPARATE_RATE_LIMIT_WINDOW_SECONDS,
-    ))],
+    dependencies=[Depends(shared_separation_limit)],
 )
 async def youtube_separate_route(url: str = Form(...)):
     """Downloads then runs standard-tier vocal/instrumental separation.
@@ -1593,11 +1590,7 @@ async def youtube_separate_download(job_id: str, stem: str = Query(...)):
 
 @router.post(
     "/youtube/stems",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
-    ))],
+    dependencies=[Depends(shared_separation_limit)],
 )
 async def youtube_stems_route(url: str = Form(...)):
     """Downloads then runs standard-tier full 4-stem separation.

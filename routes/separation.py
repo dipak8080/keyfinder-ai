@@ -109,6 +109,7 @@ from config import (
     MAX_QUEUED_SEPARATIONS,
 )
 from rate_limit import check_rate_limit
+from separation_limits import shared_separation_limit
 from jobs import (
     create_job,
     mark_complete,
@@ -348,11 +349,7 @@ async def _queue_separation(
 
 @router.post(
     "/separate",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=SEPARATION_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
-    ))],
+    dependencies=[Depends(shared_separation_limit)],
 )
 async def separate_audio(file: UploadFile = File(...)):
     """
@@ -483,11 +480,7 @@ async def separation_download(job_id: str, stem: str = Query(...)):
 
 @router.post(
     "/stems",
-    dependencies=[Depends(partial(
-        check_rate_limit,
-        max_requests=STEMS_RATE_LIMIT_MAX_REQUESTS,
-        window_seconds=STEMS_RATE_LIMIT_WINDOW_SECONDS,
-    ))],
+    dependencies=[Depends(shared_separation_limit)],
 )
 async def stems_route(file: UploadFile = File(...)):
     """
