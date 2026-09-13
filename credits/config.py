@@ -25,15 +25,33 @@ def _supported_providers() -> tuple[str, ...]:
 
 # --- env helpers ------------------------------------------------------------
 
+def _raw(name: str) -> str | None:
+    """Settings-table override first, then env. See credits/settings_store.py.
+
+    Imported lazily so credits/ stays importable with no DB present.
+    """
+    try:
+        from .settings_store import resolve as _resolve
+        override = _resolve(name)
+    except Exception:  # noqa: BLE001
+        override = None
+    return override if override is not None else os.getenv(name)
+
+
+def _str(name: str, default: str = "") -> str:
+    raw = _raw(name)
+    return raw if raw not in (None, "") else default
+
+
 def _bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+    raw = _raw(name)
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _raw(name)
     try:
         return int(raw) if raw not in (None, "") else default
     except ValueError:
@@ -41,7 +59,7 @@ def _int(name: str, default: int) -> int:
 
 
 def _float(name: str, default: float) -> float:
-    raw = os.getenv(name)
+    raw = _raw(name)
     try:
         return float(raw) if raw not in (None, "") else default
     except ValueError:
@@ -49,7 +67,7 @@ def _float(name: str, default: float) -> float:
 
 
 def _json(name: str, default: Any) -> Any:
-    raw = os.getenv(name)
+    raw = _raw(name)
     if not raw:
         return default
     try:
@@ -59,7 +77,7 @@ def _json(name: str, default: Any) -> Any:
 
 
 def _csv(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-    raw = os.getenv(name)
+    raw = _raw(name)
     if not raw:
         return default
     return tuple(part.strip() for part in raw.split(",") if part.strip())
@@ -500,14 +518,15 @@ def _load_packs() -> dict[str, Pack]:
             credits=credits,
             price_usd=_float(f"PACK_{slug}_PRICE_USD", float(cfg.get("price_usd", 0) or 0)),
             label=str(cfg.get("label") or f"{credits} credits"),
-            price_ref=str(os.getenv(f"PACK_{slug}_PRICE_REF") or cfg.get("price_ref", "") or ""),
-            buy_url=str(os.getenv(f"PACK_{slug}_BUY_URL") or cfg.get("buy_url", "") or ""),
+            price_ref=str(_str(f"PACK_{slug}_PRICE_REF") or cfg.get("price_ref", "") or ""),
+            buy_url=str(_str(f"PACK_{slug}_BUY_URL") or cfg.get("buy_url", "") or ""),
         )
     return packs
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
+def build_settings() -> Settings:
+    """Uncached. Every boot invariant lives in here, so settings_store's
+    trial validation can reuse them instead of reimplementing them."""
     secret = os.getenv("CREDITS_SECRET_KEY", "")
     if len(secret) < 32:
         raise RuntimeError(
@@ -515,7 +534,7 @@ def get_settings() -> Settings:
             '  python -c "import secrets; print(secrets.token_urlsafe(48))"'
         )
 
-    provider = os.getenv("PAYMENTS_PROVIDER", "kofi").lower().strip()
+    provider = _str("PAYMENTS_PROVIDER", "kofi").lower().strip()
     supported = _supported_providers()
     if provider not in supported:
         raise RuntimeError(f"PAYMENTS_PROVIDER={provider!r} is not one of {supported}")
@@ -528,8 +547,8 @@ def get_settings() -> Settings:
         # it - so rotating the secret silently re-hashes every IP and hands
         # the whole internet a fresh per-IP free allowance (ledger.py:207).
         ip_hash_salt=os.getenv("IP_HASH_SALT") or secret,
-        frontend_url=(os.getenv("FRONTEND_URL") or "https://audioforges.com").rstrip("/"),
-        api_base_url=(os.getenv("CREDITS_API_BASE_URL") or "https://api.audioforges.com").rstrip("/"),
+        frontend_url=(_str("FRONTEND_URL") or "https://audioforges.com").rstrip("/"),
+        api_base_url=(_str("CREDITS_API_BASE_URL") or "https://api.audioforges.com").rstrip("/"),
         # UNUSED. Nothing in credits/ reads this field - CORS for the whole
         # app is the host's own ALLOWED_ORIGINS (a different variable). Kept
         # only so admin.py can report it; do not treat it as a control.
@@ -537,9 +556,9 @@ def get_settings() -> Settings:
             "CREDITS_ALLOWED_ORIGINS",
             ("https://audioforges.com", "https://www.audioforges.com"),
         ),
-        cookie_domain=os.getenv("COOKIE_DOMAIN") or None,
+        cookie_domain=_str("COOKIE_DOMAIN") or None,
         cookie_secure=_bool("COOKIE_SECURE", True),
-        cookie_samesite=os.getenv("COOKIE_SAMESITE", "lax").lower(),
+        cookie_samesite=_str("COOKIE_SAMESITE", "lax").lower(),
         trust_cf_ip=_bool("TRUST_CF_CONNECTING_IP", True),
 
         paywall_enabled=_bool("PAYWALL_ENABLED", False),
@@ -568,17 +587,17 @@ def get_settings() -> Settings:
         payments_provider=provider,
         webhook_secret=os.getenv("PAYMENTS_WEBHOOK_SECRET", ""),
         provider_api_key=os.getenv("PAYMENTS_API_KEY", ""),
-        provider_store_id=os.getenv("PAYMENTS_STORE_ID", ""),
-        provider_store_slug=os.getenv("PAYMENTS_STORE_SLUG", "audioforges"),
+        provider_store_id=_str("PAYMENTS_STORE_ID", ""),
+        provider_store_slug=_str("PAYMENTS_STORE_SLUG", "audioforges"),
         provider_test_mode=_bool("PAYMENTS_TEST_MODE", False),
         claim_ttl_minutes=_int("CLAIM_TTL_MINUTES", 120),
         packs=_load_packs(),
 
-        mail_provider=os.getenv("MAIL_PROVIDER", "console").lower(),
-        mail_from=os.getenv("MAIL_FROM", "noreply@audioforges.com"),
-        mail_from_name=os.getenv("MAIL_FROM_NAME", "AudioForges"),
+        mail_provider=_str("MAIL_PROVIDER", "console").lower(),
+        mail_from=_str("MAIL_FROM", "noreply@audioforges.com"),
+        mail_from_name=_str("MAIL_FROM_NAME", "AudioForges"),
         resend_api_key=os.getenv("RESEND_API_KEY", ""),
-        smtp_host=os.getenv("SMTP_HOST", ""),
+        smtp_host=_str("SMTP_HOST", ""),
         smtp_port=_int("SMTP_PORT", 587),
         smtp_user=os.getenv("SMTP_USER", ""),
         smtp_password=os.getenv("SMTP_PASSWORD", ""),
@@ -658,7 +677,17 @@ def get_settings() -> Settings:
     return settings
 
 
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return build_settings()
+
+
 def reload_settings() -> Settings:
-    """Re-read env without restarting the process (admin action, step 7)."""
+    """Drop the cached Settings so the next read picks up changed overrides.
+
+    Now actually useful: the settings table is read at build time, so a
+    write through settings_store followed by this call applies a config
+    change to a running container with no restart.
+    """
     get_settings.cache_clear()
     return get_settings()

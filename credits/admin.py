@@ -41,7 +41,7 @@ import logging
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import ledger, metering
+from . import ledger, metering, settings_store
 from .config import get_settings, reload_settings
 from .db import connect, healthcheck, now_iso, tx
 
@@ -612,17 +612,11 @@ def sweep() -> dict:
 
 @router.post("/reload-config", dependencies=ADMIN)
 def reload_config() -> dict:
-    """Re-read env WITHOUT a restart.
+    """Drop the cached Settings and report what the process now believes.
 
-    Honest caveat: this only helps if the environment of the RUNNING
-    process changed, which for a Docker container it normally hasn't -
-    editing .env and calling this does nothing, because the container
-    still holds the values it booted with. Flipping PAYWALL_ENABLED for
-    real means editing .env and restarting the container.
-
-    What it IS for: dropping a cached settings object after a config
-    change that was applied some other way, and confirming what the
-    process currently believes.
+    The old caveat here is gone: settings now resolve from the settings
+    table first, which a running container CAN see. Editing .env still
+    needs a restart, but every knob in /settings applies immediately.
     """
     settings = reload_settings()
     return {
@@ -631,3 +625,85 @@ def reload_config() -> dict:
         "provider": settings.payments_provider,
         "metered_routes": [r.tool for r in settings.tool_rules.values() if r.enabled],
     }
+
+
+# ---------------------------------------------------------------------------
+# 7. Runtime configuration
+# ---------------------------------------------------------------------------
+
+class SettingsUpdate(BaseModel):
+    values: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    note: str = Field(default="", max_length=500)
+
+
+@router.get("/settings", dependencies=ADMIN)
+def list_settings() -> dict:
+    """Every tunable key with its effective value and where it came from.
+
+    Secrets are absent by construction: settings_store.LOCKED_KEYS is
+    filtered out of both reads and writes, so this endpoint cannot leak
+    the signing key or the admin token.
+    """
+    return {
+        "settings": settings_store.describe(),
+        "locked": sorted(settings_store.LOCKED_KEYS),
+    }
+
+
+@router.put("/settings", dependencies=ADMIN)
+def update_settings(body: SettingsUpdate) -> dict:
+    """Set or clear overrides. Null clears a key back to env or default.
+
+    Validated by a trial build of the whole Settings object, so a value
+    that would fail a boot invariant is rejected here rather than at the
+    next restart. Nothing is written unless every key in the batch passes.
+    """
+    if not body.values:
+        raise HTTPException(400, detail={"error": "no_values"})
+    if len(body.values) > 50:
+        raise HTTPException(400, detail={"error": "too_many_keys"})
+
+    payload: dict[str, str | None] = {}
+    for key, value in body.values.items():
+        if value is None:
+            payload[key] = None
+        elif isinstance(value, bool):
+            payload[key] = "true" if value else "false"
+        else:
+            payload[key] = str(value)
+
+    try:
+        settings_store.set_many(payload, actor="admin", note=body.note)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": "invalid_settings", "message": str(exc)})
+
+    settings = reload_settings()
+    log.info("settings changed: %s", ", ".join(sorted(payload)))
+    return {
+        "ok": True,
+        "changed": sorted(payload),
+        "paywall_enabled": settings.paywall_enabled,
+        "free_monthly_ops": settings.free_monthly_ops,
+        "free_monthly_ops_per_ip": settings.free_monthly_ops_per_ip,
+        "metered_routes": [r.tool for r in settings.tool_rules.values() if r.enabled],
+    }
+
+
+@router.delete("/settings/{key}", dependencies=ADMIN)
+def clear_setting(key: str) -> dict:
+    """Revert one key to its env value or code default."""
+    try:
+        settings_store.clear(key, actor="admin")
+    except ValueError as exc:
+        raise HTTPException(400, detail={"error": "invalid_settings", "message": str(exc)})
+    reload_settings()
+    return {"ok": True, "cleared": key}
+
+
+@router.get("/settings/audit", dependencies=ADMIN)
+def settings_audit(
+    limit: int = Query(default=100, ge=1, le=1000),
+    key: str | None = Query(default=None, max_length=128),
+) -> dict:
+    """Who changed what, when, and what it was before."""
+    return {"entries": settings_store.audit(limit=limit, key=key)}
