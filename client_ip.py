@@ -34,6 +34,7 @@ makes is about public traffic, which is where the attack lives.
 No dependency but the Request object, so any module can import it -
 including the three this one protects.
 """
+import ipaddress
 import os
 
 
@@ -58,3 +59,32 @@ def get_client_ip(request, default: str = "unknown") -> str:
             return first
 
     return request.client.host if request.client else default
+
+def normalise_for_bucketing(ip: str) -> str:
+    """Collapse an IPv6 address to its /64 before it is used as a limit key.
+
+    credits/security.py::hash_ip has done this since the free-op cap
+    shipped, for the reason stated there: a household delegated a /64 can
+    otherwise rotate inside its own prefix and get a fresh bucket every
+    request. rate_limit.py and admin_auth.py key on the raw string, so the
+    shared separation allowance and the admin lockout both had that hole -
+    the defence was written and the rationale recorded, and the limiter
+    shipped alongside it did not get either.
+
+    Cloudflare serves IPv6 by default and cannot be turned off on the free
+    plan, and a residential customer is normally delegated a /64 or /56, so
+    the addresses are already theirs. No proxy, no botnet, no cost.
+
+    /64 rather than /56 deliberately: a stricter mask is defensible, but
+    agreeing with the function that already exists is worth more than a
+    second opinion on prefix length, and /64 removes the free bypass.
+
+    IPv4 and anything unparseable pass through unchanged.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return ip.strip()
+    if addr.version != 6:
+        return str(addr)
+    return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address)

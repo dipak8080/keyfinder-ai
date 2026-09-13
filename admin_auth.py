@@ -49,7 +49,7 @@ from typing import Optional
 
 from fastapi import HTTPException, Request
 
-from client_ip import get_client_ip
+from client_ip import get_client_ip, normalise_for_bucketing
 from config import (
     logger,
     ADMIN_STATUS_KEY,
@@ -80,8 +80,13 @@ def _get_client_ip(request: Request) -> str:
     """Prefers CF-Connecting-IP, which Cloudflare overwrites and a client
     cannot forge. Both guards in this module key on the return value, so
     a caller-controlled IP meant unlimited key guesses - see client_ip.py
-    for the production demonstration."""
-    return get_client_ip(request, default="-")
+    for the production demonstration.
+
+    Collapsed to a /64 on IPv6: the wrong-key lockout that exists because
+    a pentest brute-forced /admin/upload-cookies was rotatable inside a
+    prefix the caller already holds. Header spoofing was closed here; this
+    is the other half of the same question."""
+    return normalise_for_bucketing(get_client_ip(request, default="-"))
 
 
 def _prune(events: list, window_seconds: int, now: float) -> list:

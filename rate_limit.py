@@ -44,7 +44,7 @@ from pathlib import Path
 
 from fastapi import Request, HTTPException
 
-from client_ip import get_client_ip
+from client_ip import get_client_ip, normalise_for_bucketing
 
 from config import (
     logger,
@@ -191,7 +191,15 @@ def _get_client_ip(request: Request) -> str:
     # CF-Connecting-IP first: X-Forwarded-For's first entry is whatever
     # the caller put there, and this value IS the bucket key for every
     # free-tier limit. See client_ip.py.
-    return get_client_ip(request, default="unknown")
+    #
+    # Collapsed to a /64 on IPv6 for the same reason, and by the same
+    # rule, as credits/security.py::hash_ip. Without it a caller on IPv6
+    # gets a fresh 10/hour and 30/day allowance per address in a prefix
+    # they already hold - 60 requests from one /64 all passed a 30/day
+    # cap. The 429 text and the [RATE LIMIT] Blocked line now show the
+    # prefix rather than the address for IPv6 callers, which is correct
+    # and will look different in the logs.
+    return normalise_for_bucketing(get_client_ip(request, default="unknown"))
 
 
 def _format_duration(seconds: int) -> str:
@@ -283,7 +291,7 @@ def check_rate_limits(
     request later fails for an unrelated reason can hand back the slots
     it never used. See refund_rate_limit_hits.
     """
-    global _last_sweep
+    global _last_sweep, _last_mem_sweep
 
     if not RATE_LIMIT_ENABLED:
         return []
@@ -292,6 +300,15 @@ def check_rate_limits(
     subject = key_override if key_override is not None else ip
     now = time.time()
     route = request.url.path
+
+    # Same hoist as check_rate_limit, and this is the function the four
+    # separation routes actually use. Its fallback writes _requests and
+    # _key_windows, so without this nothing schedules a prune from the
+    # path that matters most during a DB outage.
+    with _lock:
+        if now - _last_mem_sweep > _MEM_SWEEP_INTERVAL_SECONDS:
+            _last_mem_sweep = now
+            _sweep_memory(now)
 
     specs = [(f"{subject}|{bucket}", bucket, int(limit), float(window))
              for bucket, limit, window in windows]

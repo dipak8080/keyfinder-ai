@@ -81,6 +81,17 @@ LOCKED_KEYS = frozenset({
     # admin token into an open redirect on the one flow that carries a
     # session. Changing where the frontend lives is a deploy, not a knob.
     "FRONTEND_URL",
+    # ONE KEY, TWO MEANINGS, and only one of them would move. client_ip.py
+    # reads TRUST_CF_CONNECTING_IP from os.environ at import, so
+    # rate_limit.py, admin_auth.py and log_stream.py are unaffected by a
+    # row here. credits/config.py reads it through _bool, so
+    # credits/identity.py IS. A PUT of false would therefore flip only the
+    # half that resolves subject identity and the free-ops-per-IP cap onto
+    # X-Forwarded-For, which client_ip.py documents as forgeable and
+    # demonstrated against production. Same reasoning as FRONTEND_URL: a
+    # key that turns a leaked admin token into something worse than
+    # config drift.
+    "TRUST_CF_CONNECTING_IP",
 })
 
 # Keys the admin UI lists, with the type it should render. Anything not

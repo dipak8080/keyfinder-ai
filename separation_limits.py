@@ -61,7 +61,30 @@ from rate_limit import check_rate_limits, refund_rate_limit_hits
 SHARED_BUCKET = "separation-standard"
 
 
+def _bounds(name: str):
+    """The min/max KNOWN_KEYS declares for this key, if any."""
+    try:
+        from credits.settings_store import KNOWN_KEYS
+
+        meta = KNOWN_KEYS.get(name) or {}
+        return meta.get("min"), meta.get("max")
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def _limit(name: str, default: int) -> int:
+    """Resolve settings table -> env -> default, CLAMPED to KNOWN_KEYS.
+
+    Bounded at READ time, not only at write time. _check_type guards
+    set_many and nothing else, so a row written before max shipped, a row
+    written by a draining container running an older build, or a plain env
+    var all reach here unchecked. That is the same asymmetry the free-tier
+    keys got an absolute boot invariant for; these are the keys that
+    motivated the mechanism in the first place.
+
+    Out-of-range falls back to the code default and says so, rather than
+    silently enforcing a number nobody chose.
+    """
     try:
         from credits.settings_store import resolve
 
@@ -75,8 +98,16 @@ def _limit(name: str, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("[SEPARATION LIMIT] %s=%r is not an integer, using %s", name, raw, default)
         return default
-    if value <= 0:
-        logger.warning("[SEPARATION LIMIT] %s=%s must be positive, using %s", name, value, default)
+
+    low, high = _bounds(name)
+    low = 1 if low is None else low
+    if value < low:
+        logger.warning("[SEPARATION LIMIT] %s=%s is below the %s minimum, using %s",
+                       name, value, low, default)
+        return default
+    if high is not None and value > high:
+        logger.warning("[SEPARATION LIMIT] %s=%s exceeds the %s maximum, using %s",
+                       name, value, high, default)
         return default
     return value
 
