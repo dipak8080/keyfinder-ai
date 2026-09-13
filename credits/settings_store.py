@@ -304,12 +304,18 @@ def validate(candidate: dict[str, str]) -> None:
 def set_many(values: dict[str, str], *, actor: str = "admin", note: str = "") -> dict[str, str]:
     """Validate then write. All or nothing."""
     for key, value in values.items():
-        if key in LOCKED_KEYS:
+        # BOTH GUARDS APPLY TO WRITES ONLY, and that is not a softening.
+        # Deleting a row can neither leak nor create anything: load_overrides()
+        # filters LOCKED_KEYS out, so a locked row is already inert, and
+        # removing it can only move behaviour back towards env.
+        #
+        # Blocking the delete is what actually bites. It happened twice:
+        # a row written by an older container before the guard shipped
+        # became unremovable through the API, so cleaning it up meant
+        # hand-editing production SQLite. A guard that can create
+        # permanent garbage is worse than the write it prevents.
+        if value is not None and key in LOCKED_KEYS:
             raise ValueError(f"{key} cannot be set at runtime")
-        # The credential guard applies to WRITES only. Deleting a row can
-        # neither leak nor create anything, and blocking it would strand
-        # any row written before the guard existed - with no way to remove
-        # it through the API.
         if value is not None and _is_secretish(key):
             raise ValueError(f"{key} looks like a credential and cannot be set at runtime")
         if not key or len(key) > 128:
