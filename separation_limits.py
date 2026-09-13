@@ -46,6 +46,7 @@ to the config constant on any failure.
 from __future__ import annotations
 
 import os
+import threading
 
 from fastapi import Request
 
@@ -85,15 +86,33 @@ _DEFAULTS = {
 # a single mistyped limit could walk into the one silent cost-control
 # failure left.
 _warned: set = set()
+# Locked for the same reason rate_limit._requests and settings_store._cache
+# are. _limit() runs on the threadpool from four routes plus /limits and
+# /credits/me, and _forget_warnings ITERATES this set while _warn_once adds
+# to it. In practice the set holds at most four entries, so the
+# comprehension completes in one bytecode burst and the race has not been
+# reproducible - but the clear() at 64 is where it would bite, and this was
+# the one shared mutable in the codebase without a lock.
+_warned_lock = threading.Lock()
 
 
 def _warn_once(token, message: str, *args) -> None:
-    if token in _warned:
-        return
-    if len(_warned) > 64:
-        _warned.clear()
-    _warned.add(token)
+    with _warned_lock:
+        if token in _warned:
+            return
+        if len(_warned) > 64:
+            _warned.clear()
+        _warned.add(token)
+    # Logged OUTSIDE the lock: BufferLogHandler writes this to SQLite.
     logger.warning(message, *args)
+
+
+def _forget_warnings(name: str) -> None:
+    """Drop every remembered complaint about this key once it resolves
+    cleanly, so reintroducing the same bad string later warns again."""
+    with _warned_lock:
+        for token in [t for t in _warned if t[0] == name]:
+            _warned.discard(token)
 
 
 def _safe_default(default: int, low: int, high) -> int:
@@ -148,7 +167,25 @@ def _limit(name: str) -> int:
     Out-of-range falls back to the code default and says so, rather than
     silently enforcing a number nobody chose.
     """
-    default = _DEFAULTS[name]
+    default = _DEFAULTS.get(name)
+    if default is None:
+        # Unreachable: _validate_defaults() below refuses to import
+        # without every key current_limits() asks for, so a missing entry
+        # fails the deploy health check and rolls back rather than
+        # surfacing here. Kept anyway because _limit() used to take its
+        # default as an argument and now depends on a lookup table, and a
+        # bare KeyError would be a 500 on all four separation routes.
+        #
+        # Falls back to the KNOWN_KEYS MAXIMUM, not zero and not the
+        # minimum. Zero blocks every separation request, and the minimum
+        # (1/hour) is an outage wearing a limit's clothes; this module's
+        # posture everywhere else is fail-open, and the maximum is at
+        # least a number someone chose.
+        _, high = _bounds(name)
+        fallback = high if high is not None else 0
+        _warn_once((name, "__missing__"),
+                   "[SEPARATION LIMIT] %s has no entry in _DEFAULTS, using %s", name, fallback)
+        return fallback
     try:
         from credits.settings_store import resolve
 
@@ -176,16 +213,34 @@ def _limit(name: str) -> int:
         _warn_once((name, raw), "[SEPARATION LIMIT] %s=%s exceeds the %s maximum, using %s",
                    name, value, high, fallback)
         return fallback
-    # Forget every remembered complaint about THIS KEY once it resolves
-    # cleanly, so reintroducing the same bad string later warns again -
-    # the warning exists to catch the second occurrence as much as the
-    # first. Discarding (name, raw) alone would drop the token for the
-    # value that just succeeded, which was never in the set; the bad one
-    # would stay remembered forever.
-    if _warned:
-        for token in [t for t in _warned if t[0] == name]:
-            _warned.discard(token)
+    _forget_warnings(name)
     return value
+
+
+def _validate_defaults() -> None:
+    """Every key current_limits() resolves must have a literal default.
+
+    At IMPORT, so a missing entry fails the deploy health check and rolls
+    back - the same fail-at-boot treatment credits/config.py gives its
+    own contradictions. The alternative is discovering it as a 500 on
+    /separate in production.
+    """
+    required = {
+        "SEPARATION_SHARED_RATE_LIMIT_MAX_REQUESTS",
+        "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS",
+        "SEPARATION_SHARED_DAILY_MAX_REQUESTS",
+        "SEPARATION_SHARED_DAILY_WINDOW_SECONDS",
+    }
+    missing = sorted(required - set(_DEFAULTS))
+    if missing:
+        raise RuntimeError(
+            f"separation_limits._DEFAULTS is missing {missing}. Every key "
+            f"current_limits() resolves needs a literal default here - it "
+            f"cannot come from config.py, which reads the same env vars."
+        )
+
+
+_validate_defaults()
 
 
 def current_limits() -> dict:

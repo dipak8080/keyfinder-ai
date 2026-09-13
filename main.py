@@ -386,10 +386,17 @@ async def refund_unused_separation_slots(request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        _refund_separation_slots(request)
+        # to_thread, not a direct call: refund_rate_limit_hits opens
+        # SQLite and takes BEGIN IMMEDIATE with a 30s busy_timeout, and
+        # this middleware is async - a contended write would stall the
+        # WHOLE event loop, every in-flight request on the server, not
+        # just the one being refunded. Measured at 1.83s blocked while
+        # another writer held the lock, against 0.16ms uncontended.
+        # Same reason IdempotencyMiddleware wraps its own reserve call.
+        await asyncio.to_thread(_refund_separation_slots, request)
         raise
     if response.status_code in _REFUND_STATUSES:
-        _refund_separation_slots(request)
+        await asyncio.to_thread(_refund_separation_slots, request)
     return response
 
 

@@ -886,8 +886,13 @@ def _shared_separation_limits() -> dict:
         }
 
 
+# SYNC on purpose. The body has no await, but it reaches
+# settings_store.load_overrides() on a cache miss, which opens SQLite.
+# FastAPI runs a sync handler on the threadpool; an async one would do
+# that read on the event loop, on an endpoint read on nearly every page
+# load. Same defect class as the refund middleware in main.py.
 @router.get("/limits")
-async def limits():
+def limits():
     """
     The single source of truth for every limit the frontend needs to
     enforce or display.
