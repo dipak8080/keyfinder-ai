@@ -253,6 +253,16 @@ jobs:
               exit 1
             fi
 
+            # Tells every container which slot is live. The draining one
+            # reads this too and refuses admin WRITES once it no longer
+            # matches its own INSTANCE_SLOT - it keeps serving its jobs,
+            # but stops accepting config changes its older build would
+            # validate differently from the build now serving traffic.
+            # Both containers mount this volume, so one file answers for
+            # both. Written after af-switch, so a failed switch leaves the
+            # previous slot authoritative.
+            echo "$NEW" > /home/deploy/app/data/.active_slot
+
             # The live container is always named audioforges-api, so the
             # canary, cheatsheet and handoff commands keep working.
             OLD_ID=$(docker inspect -f '{{.Id}}' audioforges-api 2>/dev/null || true)

@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -47,6 +49,10 @@ from .db import connect, healthcheck, now_iso, tx
 
 log = logging.getLogger("credits.admin")
 router = APIRouter(prefix="/admin/credits", tags=["admin"])
+
+# Written by deploy.yml the moment af-switch succeeds. Lives on the shared
+# data volume so every container, live or draining, reads the same answer.
+ACTIVE_SLOT_FILE = os.environ.get("ACTIVE_SLOT_FILE", "/app/data/.active_slot")
 
 
 def require_admin(x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> None:
@@ -60,6 +66,54 @@ def require_admin(x_admin_token: str | None = Header(default=None, alias="X-Admi
 
 
 ADMIN = [Depends(require_admin)]
+
+
+def require_active_slot() -> None:
+    """Refuse writes on a container that is draining, not serving.
+
+    WHY. deploy.yml is blue/green: the previous container keeps running
+    after a switch so its in-flight jobs finish, and drain_old.sh stops
+    it once idle. That is correct and users depend on it. But both
+    containers mount the same data volume and therefore the same
+    credits.db - so the draining one, running the PREVIOUS build, can
+    still write settings rows its own validation approves and the new
+    build would reject. That happened twice in one session, once writing
+    an open-redirect FRONTEND_URL.
+
+    Reads the active slot from the shared volume, written by deploy.yml
+    when af-switch succeeds, and compares it to this container's own
+    INSTANCE_SLOT. Reads are untouched - checking config on a draining
+    container is useful, changing it is not.
+
+    FAILS OPEN on purpose. No slot file, no INSTANCE_SLOT, or an
+    unreadable file all mean "cannot tell", which is the state of every
+    local dev run and of production before this ships. Only a confident
+    mismatch refuses.
+    """
+    mine = os.environ.get("INSTANCE_SLOT", "").strip()
+    if not mine:
+        return
+    try:
+        active = Path(ACTIVE_SLOT_FILE).read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return
+    if not active or active == mine:
+        return
+    log.warning("refused admin write on draining slot %s (active is %s)", mine, active)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "not_active_slot",
+            "message": (
+                f"This container is slot {mine}, which is draining. Slot {active} "
+                f"is live. Send config changes there so they are validated by the "
+                f"build that is actually serving traffic."
+            ),
+        },
+    )
+
+
+ADMIN_WRITE = [Depends(require_admin), Depends(require_active_slot)]
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +612,7 @@ class AdjustRequest(BaseModel):
     note: str = Field(..., min_length=3, max_length=200)
 
 
-@router.post("/adjust", dependencies=ADMIN)
+@router.post("/adjust", dependencies=ADMIN_WRITE)
 def adjust(body: AdjustRequest) -> dict:
     """Grant or remove credits by hand, with a mandatory reason.
 
@@ -652,7 +706,7 @@ def list_settings() -> dict:
     }
 
 
-@router.put("/settings", dependencies=ADMIN)
+@router.put("/settings", dependencies=ADMIN_WRITE)
 def update_settings(body: SettingsUpdate) -> dict:
     """Set or clear overrides. Null clears a key back to env or default.
 
@@ -691,7 +745,7 @@ def update_settings(body: SettingsUpdate) -> dict:
     }
 
 
-@router.delete("/settings/{key}", dependencies=ADMIN)
+@router.delete("/settings/{key}", dependencies=ADMIN_WRITE)
 def clear_setting(key: str) -> dict:
     """Revert one key to its env value or code default."""
     try:
