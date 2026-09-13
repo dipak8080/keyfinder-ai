@@ -569,6 +569,14 @@ def _is_embed_only_unavailable(ydl_opts: dict, error_text: str) -> bool:
 # in.
 PERMANENT_ERROR_MARKERS = (
     "video unavailable",
+    # CONFIRMED 2026-09-13 on Clmfml7EPUM: all five cookie-ladder clients
+    # returned "This video is unavailable", which contains neither
+    # "video unavailable" nor "this video is not available", so it matched
+    # nothing and fell through to the generic 500. Distinct wording from
+    # the bare "Video unavailable" the web_embedded carve-out below keys
+    # on - that one means embedding disabled, this one means dead - so it
+    # is added HERE only and deliberately left out of that carve-out.
+    "video is unavailable",
     "this video is not available",
     "private video",
     "video has been removed",
