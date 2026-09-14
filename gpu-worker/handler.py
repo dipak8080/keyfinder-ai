@@ -223,6 +223,12 @@ _UPLOAD_BACKOFF_SECONDS = 2.0
 _DOWNLOAD_MAX_ATTEMPTS = 3
 _DOWNLOAD_BACKOFF_SECONDS = 2.0
 
+# Level 3 rather than the default 5: encode time is billed at GPU rates,
+# and the extra compression past 3 is a couple of percent for several
+# times the CPU.
+FLAC_COMPRESSION_LEVEL = int(os.environ.get("FLAC_COMPRESSION_LEVEL", "3"))
+FLAC_ENCODE_TIMEOUT_SECONDS = int(os.environ.get("FLAC_ENCODE_TIMEOUT_SECONDS", "120"))
+
 
 def _safe_extension(filename: str, fallback: str = "wav") -> str:
     if not filename:
@@ -323,10 +329,45 @@ def _download_input(job_id: str, dest_path: str) -> None:
     )
 
 
+def _to_flac(wav_path: str):
+    """
+    Demucs writes uncompressed WAV, so a 10-minute stem is ~105MB. FLAC
+    is lossless - the VPS decodes it back to bit-identical PCM - and
+    roughly halves what crosses the wire.
+
+    Returns (path_to_upload, encoding). A failed encode is NOT fatal:
+    the GPU work is already done and paid for, so falling back to the
+    original WAV costs bandwidth but still delivers the stem.
+    """
+    flac_path = f"{wav_path}.flac"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", wav_path,
+             "-c:a", "flac", "-compression_level", str(FLAC_COMPRESSION_LEVEL), flac_path],
+            capture_output=True, text=True, timeout=FLAC_ENCODE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        print(f"[TRANSFER] FLAC encode failed ({e}) - uploading WAV", flush=True)
+        return wav_path, "wav"
+
+    if result.returncode != 0 or not os.path.exists(flac_path) or os.path.getsize(flac_path) == 0:
+        print(f"[TRANSFER] FLAC encode failed ({result.stderr[:200]}) - uploading WAV", flush=True)
+        try:
+            os.remove(flac_path)
+        except Exception:
+            pass
+        return wav_path, "wav"
+
+    before = os.path.getsize(wav_path) / (1024 * 1024)
+    after = os.path.getsize(flac_path) / (1024 * 1024)
+    print(f"[TRANSFER] FLAC {before:.1f}MB -> {after:.1f}MB", flush=True)
+    return flac_path, "flac"
+
+
 def _upload_result(job_id: str, name: str, file_path: str) -> None:
     """
-    POSTs one finished stem's raw bytes straight to the VPS. Streams the
-    file from disk rather than reading it whole into memory.
+    POSTs one finished stem straight to the VPS, FLAC-encoded. Streams
+    the file from disk rather than reading it whole into memory.
 
     RETRIED, unlike the input fetch, and the asymmetry is deliberate.
     By the time this runs the GPU work is ALREADY DONE AND ALREADY PAID
@@ -342,40 +383,50 @@ def _upload_result(job_id: str, name: str, file_path: str) -> None:
     that would surface much later as an unplayable stem.
     """
     url = f"{VPS_BASE_URL}/internal/gpu/upload/{job_id}/{name}"
+
+    upload_path, encoding = _to_flac(file_path)
     headers = {
         "Authorization": f"Bearer {GPU_SHARED_SECRET}",
-        "Content-Type": "audio/wav",
+        "Content-Type": "audio/flac" if encoding == "flac" else "audio/wav",
+        "X-Stem-Encoding": encoding,
     }
 
-    last_error = None
-    for attempt in range(1, _UPLOAD_MAX_ATTEMPTS + 1):
-        try:
-            with open(file_path, "rb") as f:
-                res = requests.post(
-                    url, headers=headers, data=f, timeout=_TRANSFER_TIMEOUT_SECONDS
-                )
-            if res.status_code == 200:
-                return
-            # 4xx means the VPS rejected this request on its merits
-            # (bad secret, job no longer in flight, name rejected).
-            # Retrying reproduces it identically, so fail fast rather
-            # than burning three attempts on a guaranteed repeat.
-            if 400 <= res.status_code < 500:
-                raise RuntimeError(
-                    f"Upload of '{name}' rejected by VPS (HTTP {res.status_code}): {res.text[:300]}"
-                )
-            last_error = f"HTTP {res.status_code}: {res.text[:200]}"
-        except RuntimeError:
-            raise
-        except Exception as e:
-            last_error = str(e)
+    try:
+        last_error = None
+        for attempt in range(1, _UPLOAD_MAX_ATTEMPTS + 1):
+            try:
+                with open(upload_path, "rb") as f:
+                    res = requests.post(
+                        url, headers=headers, data=f, timeout=_TRANSFER_TIMEOUT_SECONDS
+                    )
+                if res.status_code == 200:
+                    return
+                # 4xx means the VPS rejected this request on its merits
+                # (bad secret, job no longer in flight, name rejected).
+                # Retrying reproduces it identically, so fail fast rather
+                # than burning three attempts on a guaranteed repeat.
+                if 400 <= res.status_code < 500:
+                    raise RuntimeError(
+                        f"Upload of '{name}' rejected by VPS (HTTP {res.status_code}): {res.text[:300]}"
+                    )
+                last_error = f"HTTP {res.status_code}: {res.text[:200]}"
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_error = str(e)
 
-        if attempt < _UPLOAD_MAX_ATTEMPTS:
-            time.sleep(_UPLOAD_BACKOFF_SECONDS * attempt)
+            if attempt < _UPLOAD_MAX_ATTEMPTS:
+                time.sleep(_UPLOAD_BACKOFF_SECONDS * attempt)
 
-    raise RuntimeError(
-        f"Failed to upload result '{name}' after {_UPLOAD_MAX_ATTEMPTS} attempts: {last_error}"
-    )
+        raise RuntimeError(
+            f"Failed to upload result '{name}' after {_UPLOAD_MAX_ATTEMPTS} attempts: {last_error}"
+        )
+    finally:
+        if upload_path != file_path:
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
 
 
 class _RetryTransfer(Exception):
