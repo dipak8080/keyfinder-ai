@@ -49,7 +49,9 @@ SECURITY HARDENING (2026-08-11) - three fixes, one of them a real bug
 import hmac
 import os
 import re
+import subprocess
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
@@ -72,6 +74,8 @@ _STEM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # is a few hundred MB across all stems, but any SINGLE stem well past
 # this is not something this pipeline legitimately produces.
 MAX_GPU_UPLOAD_BYTES = int(os.environ.get("MAX_GPU_UPLOAD_BYTES", str(500 * 1024 * 1024)))  # 500 MB
+
+FLAC_DECODE_TIMEOUT_SECONDS = int(os.environ.get("FLAC_DECODE_TIMEOUT_SECONDS", "180"))
 
 # job_id -> input file path, registered by separation.py immediately
 # before it submits a job and unregistered in a `finally` once the job
@@ -148,6 +152,32 @@ def _safe_dest_path(job_id: str, name: str) -> str:
     return dest
 
 
+def _cleanup(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _decode_flac(src_path: str, dest_path: str) -> None:
+    """
+    FLAC back to the 16-bit PCM WAV the rest of the pipeline expects at
+    {job_id}_{name}.wav. Lossless in, lossless out - the decoded samples
+    are identical to what Demucs wrote on the GPU.
+
+    Runs in a worker thread: ffmpeg on a 100MB stem takes seconds, and
+    blocking the event loop for that would stall every other request.
+    """
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", src_path,
+         "-c:a", "pcm_s16le", dest_path],
+        capture_output=True, text=True, timeout=FLAC_DECODE_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0 or not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise RuntimeError(result.stderr[:300] or "ffmpeg produced no output")
+
+
 @router.get("/internal/gpu/input/{job_id}")
 async def get_gpu_input(job_id: str, request: Request):
     _check_secret(request)
@@ -183,18 +213,26 @@ async def upload_gpu_result(job_id: str, name: str, request: Request):
 
     dest_path = _safe_dest_path(job_id, name)
 
+    # The worker FLAC-encodes stems before upload (lossless, roughly half
+    # the bytes). Absent header means WAV, so an older worker image keeps
+    # working against this route unchanged.
+    encoding = request.headers.get("x-stem-encoding", "wav").lower()
+    if encoding not in ("wav", "flac"):
+        raise HTTPException(400, "Unsupported stem encoding.")
+    recv_path = f"{dest_path}.flac.part" if encoding == "flac" else dest_path
+
     written = 0
     try:
         # Streamed in chunks, never buffered whole via request.body() -
         # these are real audio files and this box has no swap.
-        with open(dest_path, "wb") as f:
+        with open(recv_path, "wb") as f:
             async for chunk in request.stream():
                 written += len(chunk)
                 if written > MAX_GPU_UPLOAD_BYTES:
                     # Abort mid-stream rather than after the fact: the
                     # point is to never let the bytes land at all.
                     f.close()
-                    os.remove(dest_path)
+                    os.remove(recv_path)
                     logger.error(
                         f"[GPU_INTERNAL] Upload for job={job_id} name={name} exceeded "
                         f"{MAX_GPU_UPLOAD_BYTES} bytes - aborted and partial file removed."
@@ -206,13 +244,19 @@ async def upload_gpu_result(job_id: str, name: str, request: Request):
     except Exception as e:
         # Never leave a half-written stem on disk to be mistaken for a
         # real result by _verify_output_files().
-        try:
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-        except Exception:
-            pass
+        _cleanup(recv_path)
         logger.error(f"[GPU_INTERNAL] Failed writing upload for job={job_id} name={name}: {e}")
         raise HTTPException(500, "Failed to save uploaded file.")
+
+    if encoding == "flac":
+        try:
+            await anyio.to_thread.run_sync(_decode_flac, recv_path, dest_path)
+        except Exception as e:
+            _cleanup(recv_path)
+            _cleanup(dest_path)
+            logger.error(f"[GPU_INTERNAL] FLAC decode failed for job={job_id} name={name}: {e}")
+            raise HTTPException(500, "Failed to decode uploaded stem.")
+        _cleanup(recv_path)
 
     logger.info(
         f"[GPU_INTERNAL] job={job_id}: received '{name}' "
