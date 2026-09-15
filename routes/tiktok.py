@@ -67,6 +67,7 @@ router = APIRouter()
 # adding it here is a visible KeyError in review, not a silent 500.
 _STATUS_BY_KIND = {
     "photo_post": 400,   # user error, actionable, will never work
+    "not_a_video": 400,  # short link to a sound/hashtag/profile page
     "too_long": 400,
     "age_gated": 403,    # needs a login we deliberately do not have
     "blocked": 451,      # legally/regionally restricted by TikTok

@@ -128,7 +128,16 @@ _PHOTO_URL_PATTERN = re.compile(r"tiktok\.com/@[\w.\-]+/photo/\d+", re.IGNORECAS
 # has to happen TWICE: once on the URL here (cheap, catches direct
 # links) and once on yt-dlp's error text (catches short links). Only
 # doing the first would leave the most common share format unhandled.
-_SHORT_URL_PATTERN = re.compile(r"^https?://(?:vt|vm)\.tiktok\.com/", re.IGNORECASE)
+_SHORT_URL_PATTERN = re.compile(
+    r"^https?://(?:(?:vt|vm)\.tiktok\.com/|(?:www\.)?tiktok\.com/t/)", re.IGNORECASE
+)
+
+# Sound, effect, hashtag and profile pages. Short links can resolve to
+# these, and yt-dlp's extractors for them need TikTok app credentials.
+_NOT_VIDEO_URL_PATTERN = re.compile(
+    r"tiktok\.com/(?:music/|sticker/|tag/|@[\w.\-]+/collection/|@[\w.\-]+/?(?:[?#]|$))",
+    re.IGNORECASE,
+)
 
 _VIDEO_ID_PATTERN = re.compile(r"/(?:video|photo|v)/(\d+)")
 
@@ -161,6 +170,10 @@ def is_photo_url(url: str) -> bool:
     """True for a DIRECT photo-post URL. Short links resolving to a
     photo post are caught later by is_photo_error() instead."""
     return bool(_PHOTO_URL_PATTERN.search(url or ""))
+
+
+def is_not_video_url(url: str) -> bool:
+    return bool(_NOT_VIDEO_URL_PATTERN.search(url or ""))
 
 
 def is_short_url(url: str) -> bool:
@@ -208,6 +221,12 @@ def _norm(text: str) -> str:
 PHOTO_MARKERS = (
     "unsupported url",
     "falling back on generic information extractor",
+)
+
+# OBSERVED 2026-09-15: a /t/ short link resolving to a sound or hashtag
+# page. Those extractors call TikTok's app API, which has no credentials.
+NOT_VIDEO_MARKERS = (
+    "no working app info is available",
 )
 
 # OBSERVED: "This post may not be comfortable for some audiences.
@@ -266,6 +285,11 @@ def is_photo_error(text: str) -> bool:
     return any(m in n for m in PHOTO_MARKERS)
 
 
+def is_not_video_error(text: str) -> bool:
+    n = _norm(text)
+    return any(m in n for m in NOT_VIDEO_MARKERS)
+
+
 def is_age_gated_error(text: str) -> bool:
     n = _norm(text)
     return any(m in n for m in AGE_GATE_MARKERS)
@@ -293,7 +317,7 @@ def is_retryable_error(text: str) -> bool:
     retryable, so those are excluded first. Being wrong in the
     retryable direction is cheap (a few wasted seconds); being wrong in
     the other direction loses a request that would have succeeded."""
-    if (is_photo_error(text) or is_age_gated_error(text)
+    if (is_photo_error(text) or is_not_video_error(text) or is_age_gated_error(text)
             or is_blocked_error(text) or is_unavailable_error(text)
             or is_no_audio_error(text)):
         return False
@@ -311,6 +335,12 @@ def classify(text: str) -> Tuple[str, str]:
         return ("photo_post", (
             "This looks like a TikTok photo/slideshow post. Only videos "
             "with audio can be converted - try a video post instead."
+        ))
+    if is_not_video_error(text):
+        return ("not_a_video", (
+            "This link opens a TikTok sound, hashtag or profile page, not a "
+            "video. Open a video on TikTok, tap Share, copy that link and "
+            "paste it here."
         ))
     if is_age_gated_error(text):
         return ("age_gated", (
@@ -367,6 +397,29 @@ def _base_opts(outtmpl: str) -> dict:
         # No cookiefile - public posts need none, and the one case that
         # would need it (age-gated) is deliberately unsupported.
     }
+
+
+def _resolve_short_url(ydl, url: str) -> str:
+    """Follows a vt./vm./t/ link without extracting, so non-video
+    targets are rejected before yt-dlp hits the app API."""
+    if not is_short_url(url):
+        return url
+    result = ydl.extract_info(url, download=False, process=False) or {}
+    resolved = result.get("url") or result.get("webpage_url") or url
+    if is_photo_url(resolved):
+        raise TikTokError(
+            "This is a TikTok photo/slideshow post. Only videos with "
+            "audio can be converted - try a video post instead.",
+            kind="photo_post",
+        )
+    if is_not_video_url(resolved):
+        raise TikTokError(
+            "This link opens a TikTok sound, hashtag or profile page, not a "
+            "video. Open a video on TikTok, tap Share, copy that link and "
+            "paste it here.",
+            kind="not_a_video",
+        )
+    return resolved
 
 
 def _probe_has_audio(path: str) -> bool:
@@ -426,7 +479,10 @@ def extract_and_download(url: str, out_dir: str, job_id: str) -> Tuple[str, str,
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+                target = _resolve_short_url(ydl, url)
+                if target != url:
+                    logger.info(f"[TIKTOK] job={job_id} short link resolved to {target[:120]}")
+                info = ydl.extract_info(target, download=False)
 
                 duration = (info or {}).get("duration")
                 if duration and duration > MAX_TIKTOK_DURATION_SECONDS:
