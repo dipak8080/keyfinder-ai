@@ -11,6 +11,7 @@ BPM:  three-way consensus (Essentia RhythmExtractor, Essentia Percival,
 import os
 import subprocess
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -72,8 +73,14 @@ PREFERRED_BPM_HI = 185
 # TEMPOCNN_MODEL_PATH. Absent or unreadable, the engine just skips it.
 TEMPOCNN_MODEL_PATH = os.environ.get("TEMPOCNN_MODEL_PATH", "").strip()
 TEMPOCNN_SR = 11025
-_tempocnn = None
-_tempocnn_tried = False
+_tempocnn_local = threading.local()
+_tempocnn_warned = False
+_TEMPOCNN_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("TEMPOCNN_WORKERS", "2")),
+                                    thread_name_prefix="tempocnn")
+
+# With TempoCNN active its answer is final, so the DSP tempo detectors are
+# skipped. Set BPM_ALL_VOTES=1 to run them anyway (tune_bpm_policy.py needs them).
+BPM_ALL_VOTES = os.environ.get("BPM_ALL_VOTES", "").strip() == "1"
 REL_KEY_MARGIN = 1.05
 
 # When Essentia's own key strength is at least this high, its major/minor call
@@ -299,28 +306,35 @@ def _estimate_tempo(onset_env: np.ndarray, sr: int, hop_length: int, start_bpm: 
     return float(t[0] if hasattr(t, "__len__") else t)
 
 
-def _get_tempocnn():
-    global _tempocnn, _tempocnn_tried
-    if _tempocnn_tried:
-        return _tempocnn
-    _tempocnn_tried = True
+def _tempocnn_available() -> bool:
+    global _tempocnn_warned
+    reason = None
     if TempoCNN is None:
-        logger.warning("TempoCNN unavailable: install essentia-tensorflow (plain essentia lacks it). "
-                       "Falling back to DSP tempo detectors.")
+        reason = "install essentia-tensorflow (plain essentia lacks it)"
+    elif not TEMPOCNN_MODEL_PATH:
+        reason = "TEMPOCNN_MODEL_PATH unset"
+    elif not os.path.exists(TEMPOCNN_MODEL_PATH):
+        reason = f"TEMPOCNN_MODEL_PATH not found: {TEMPOCNN_MODEL_PATH}"
+    if reason and not _tempocnn_warned:
+        _tempocnn_warned = True
+        logger.warning(f"TempoCNN unavailable ({reason}) - falling back to DSP tempo detectors.")
+    return reason is None
+
+
+def _get_tempocnn():
+    # Essentia algorithm instances are not thread-safe: one model per thread.
+    if not _tempocnn_available():
         return None
-    if not TEMPOCNN_MODEL_PATH:
-        logger.warning("TEMPOCNN_MODEL_PATH unset - falling back to DSP tempo detectors.")
-        return None
-    if not os.path.exists(TEMPOCNN_MODEL_PATH):
-        logger.warning(f"TEMPOCNN_MODEL_PATH not found: {TEMPOCNN_MODEL_PATH}")
-        return None
+    if getattr(_tempocnn_local, "tried", False):
+        return _tempocnn_local.model
+    _tempocnn_local.tried = True
+    _tempocnn_local.model = None
     try:
-        _tempocnn = TempoCNN(graphFilename=TEMPOCNN_MODEL_PATH)
-        logger.info(f"TempoCNN loaded: {TEMPOCNN_MODEL_PATH}")
+        _tempocnn_local.model = TempoCNN(graphFilename=TEMPOCNN_MODEL_PATH)
+        logger.info(f"TempoCNN loaded in {threading.current_thread().name}: {TEMPOCNN_MODEL_PATH}")
     except Exception as e:
         logger.warning(f"TempoCNN failed to load (non-fatal): {e}")
-        _tempocnn = None
-    return _tempocnn
+    return _tempocnn_local.model
 
 
 def _tempocnn_bpm(audio_path: str) -> Optional[float]:
@@ -333,6 +347,28 @@ def _tempocnn_bpm(audio_path: str) -> Optional[float]:
         return float(global_bpm)
     except Exception as e:
         logger.warning(f"TempoCNN inference skipped (non-fatal): {e}")
+        return None
+
+
+def _start_tempocnn(audio_path: str) -> Optional[Future]:
+    if not _tempocnn_available():
+        return None
+    try:
+        return _TEMPOCNN_POOL.submit(_tempocnn_bpm, audio_path)
+    except Exception as e:
+        logger.warning(f"TempoCNN background start failed (non-fatal): {e}")
+        return None
+
+
+def _await_tempocnn(job) -> Optional[float]:
+    if job is None:
+        return None
+    if isinstance(job, str):
+        return _tempocnn_bpm(job)
+    try:
+        return job.result(timeout=120)
+    except Exception as e:
+        logger.warning(f"TempoCNN background result skipped (non-fatal): {e}")
         return None
 
 
@@ -353,6 +389,7 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
     returned for cross_check_with_librosa to reuse; the caller frees it."""
     audio = None
     try:
+        cnn_job = _start_tempocnn(audio_path)
         audio = MonoLoader(filename=audio_path, sampleRate=sr)()
 
         rhythm_extractor = RhythmExtractor2013(method=BPM_METHOD)
@@ -382,7 +419,7 @@ def detect_key_bpm_essentia(audio_path: str, sr: int = 44100) -> Tuple[str, str,
         if bpm_corrected:
             bpm_conf = max(50, int(bpm_conf * 0.9))
 
-        _stash_prep(audio, (harm, perc, hsr, rel_scores, audio_path))
+        _stash_prep(audio, (harm, perc, hsr, rel_scores, cnn_job or audio_path))
         logger.info(f"Essentia (final) -> Key: {key} {scale} ({key_conf}%), BPM: {bpm} ({bpm_conf}%)")
         return key, scale, key_conf / 100, bpm, bpm_conf, audio, sr
 
@@ -407,7 +444,8 @@ def fallback_librosa_key_bpm(audio_path: str) -> Tuple[str, str, float, int, int
         release_memory_to_os()
 
 
-def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int, prep: Optional[tuple] = None) -> Tuple[str, str, float, int, int]:
+def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int, prep: Optional[tuple] = None,
+                                need_bpm: bool = True) -> Tuple[str, str, float, Optional[int], int]:
     harm, perc, hsr = prep if prep is not None else _prep_hpss(y, sr)
 
     chroma = librosa.feature.chroma_cqt(y=harm, sr=hsr, hop_length=2048)
@@ -420,6 +458,9 @@ def _librosa_key_bpm_from_audio(y: np.ndarray, sr: int, prep: Optional[tuple] = 
     best_key, best_scale, key_corrected = correct_relative_major_minor(y, sr, best_key, best_scale, harm=harm, hsr=hsr)
     if key_corrected:
         key_conf = max(50, int(key_conf * 0.9))
+
+    if not need_bpm:
+        return normalize_key(best_key), best_scale, key_conf / 100, None, 0
 
     onset_env = librosa.onset.onset_strength(y=perc, sr=hsr, hop_length=256)
     bpm = int(round(_estimate_tempo(onset_env, hsr, hop_length=256, start_bpm=PREFERRED_BPM_CENTER)))
@@ -440,18 +481,20 @@ def cross_check_with_librosa(audio: np.ndarray, sr: int, key: str, scale: str, k
     }
     try:
         stashed = _take_prep(audio)
-        src_path = None
+        cnn_job = None
         if stashed is not None:
-            harm, perc, hsr, rel_scores, src_path = stashed
+            harm, perc, hsr, rel_scores, cnn_job = stashed
         else:
             harm, perc, hsr = _prep_hpss(audio, sr)
             rel_scores = None
         prep = (harm, perc, hsr)
         agreement["rel_key_scores"] = rel_scores
         agreement["essentia_key"] = f"{key} {scale}"
-        lb_key, lb_scale, lb_key_conf, lb_bpm, lb_bpm_conf = _librosa_key_bpm_from_audio(audio, sr, prep=prep)
-        pv_bpm = _percival_bpm(audio, sr)
-        cnn_bpm = _tempocnn_bpm(src_path) if src_path else None
+        cnn_bpm = _await_tempocnn(cnn_job)
+        dsp_votes = BPM_ALL_VOTES or not (cnn_bpm and cnn_bpm > 0)
+        lb_key, lb_scale, lb_key_conf, lb_bpm, lb_bpm_conf = _librosa_key_bpm_from_audio(
+            audio, sr, prep=prep, need_bpm=dsp_votes)
+        pv_bpm = _percival_bpm(audio, sr) if dsp_votes else None
 
         key_agrees = (lb_key == key and lb_scale == scale)
         agreement["key_agrees"] = key_agrees
