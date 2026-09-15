@@ -27,6 +27,8 @@ stdout/stderr are INHERITED from the parent deliberately - that is what
 puts this process's [TIKTOK] lines into the same container log stream as
 everything else. Piping them silently discarded every log line.
 """
+import ipv4_only  # noqa: F401  must stay the first import
+
 import sys
 import json
 import traceback

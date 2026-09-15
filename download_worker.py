@@ -28,6 +28,8 @@ puts this process's [COOKIES]/[PROXY]/[CDN] lines and yt-dlp's verbose
 output into the same container log stream as everything else. Piping
 them silently discarded every log line a download produced.
 """
+import ipv4_only  # noqa: F401  must stay the first import
+
 import sys
 import json
 
