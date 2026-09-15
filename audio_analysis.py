@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import librosa
+from scipy.ndimage import median_filter
 from essentia.standard import MonoLoader, KeyExtractor, RhythmExtractor2013
 
 try:
@@ -54,6 +55,7 @@ BPM_METHOD = "degara"
 
 ANALYSIS_SR = 22050
 HPSS_MARGIN = 2.0
+HPSS_KERNEL = 31
 KEY_SEGMENTS = 3
 PREFERRED_BPM_CENTER = 120.0
 BPM_MATCH_TOL = 0.04
@@ -104,10 +106,39 @@ _PREP_CACHE_MAX = 8
 
 # ========== SIGNAL PREP ==========
 
+def _median_time(mag: np.ndarray, size: int) -> np.ndarray:
+    # Row-by-row 1-D calls hit scipy's fast 1-D rank filter: bit-identical to
+    # median_filter(size=(1, size)) and several times faster.
+    out = np.empty_like(mag)
+    for i in range(mag.shape[0]):
+        out[i] = median_filter(mag[i], size=size, mode="reflect")
+    return out
+
+
+def _median_freq(mag: np.ndarray, size: int) -> np.ndarray:
+    out = np.empty_like(mag)
+    for j in range(mag.shape[1]):
+        out[:, j] = median_filter(mag[:, j], size=size, mode="reflect")
+    return out
+
+
+def _fast_hpss(y: np.ndarray, margin: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Same maths and output as librosa.effects.hpss(y, margin=margin)."""
+    stft = librosa.stft(y)
+    mag, phase = librosa.magphase(stft)
+    harm = _median_time(mag, HPSS_KERNEL)
+    perc = _median_freq(mag, HPSS_KERNEL)
+    mask_harm = librosa.util.softmask(harm, perc * margin, power=2.0, split_zeros=False)
+    mask_perc = librosa.util.softmask(perc, harm * margin, power=2.0, split_zeros=False)
+    y_harm = librosa.istft((mag * mask_harm) * phase, dtype=y.dtype, length=y.shape[-1])
+    y_perc = librosa.istft((mag * mask_perc) * phase, dtype=y.dtype, length=y.shape[-1])
+    return y_harm, y_perc
+
+
 def _prep_hpss(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, int]:
     y22 = librosa.resample(y, orig_sr=sr, target_sr=ANALYSIS_SR) if sr != ANALYSIS_SR else y
     y22 = np.ascontiguousarray(y22, dtype=np.float32)
-    harm, perc = librosa.effects.hpss(y22, margin=HPSS_MARGIN)
+    harm, perc = _fast_hpss(y22, HPSS_MARGIN)
     return np.ascontiguousarray(harm, dtype=np.float32), np.ascontiguousarray(perc, dtype=np.float32), ANALYSIS_SR
 
 
@@ -372,6 +403,48 @@ def _await_tempocnn(job) -> Optional[float]:
         return None
 
 
+def warm_up_engine() -> None:
+    """Load TempoCNN in every pool thread and run the full pipeline once on a
+    short synthetic clip, so the first real request after a deploy does not
+    pay for model loading and first-call compilation."""
+    import tempfile
+    import time
+    import wave
+
+    started = time.monotonic()
+    path = None
+    try:
+        sr = 44100
+        t = np.arange(sr * 12) / sr
+        beat = (np.sin(2 * np.pi * 2 * t) > 0.95).astype(np.float32)
+        sig = 0.3 * np.sin(2 * np.pi * 220 * t) + 0.2 * np.sin(2 * np.pi * 277.2 * t) + 0.3 * beat
+        pcm = (np.clip(sig, -1, 1) * 32767).astype("<i2")
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="warmup_")
+        os.close(fd)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(pcm.tobytes())
+
+        if _tempocnn_available():
+            workers = _TEMPOCNN_POOL._max_workers
+            jobs = [_TEMPOCNN_POOL.submit(_tempocnn_bpm, path) for _ in range(workers)]
+            for j in jobs:
+                j.result(timeout=300)
+
+        key, scale, kc, bpm, bc, audio, a_sr = detect_key_bpm_essentia(path)
+        cross_check_with_librosa(audio, a_sr, key, scale, kc, bpm, bc)
+        del audio
+        logger.info(f"[ANALYZE] Engine warm-up done in {time.monotonic() - started:.1f}s")
+    except Exception as e:
+        logger.warning(f"[ANALYZE] Engine warm-up failed (non-fatal): {e}")
+    finally:
+        if path:
+            cleanup_file(path)
+        release_memory_to_os()
+
+
 def _percival_bpm(audio: np.ndarray, sr: int) -> Optional[float]:
     if PercivalBpmEstimator is None:
         return None
@@ -516,6 +589,7 @@ def cross_check_with_librosa(audio: np.ndarray, sr: int, key: str, scale: str, k
         }
         if cnn_bpm and cnn_bpm > 0:
             recon = (int(round(cnn_bpm)), 93, "tempocnn", ["tempocnn"])
+            essentia_bpm = bpm
         else:
             recon = consensus_bpm([("essentia", bpm, 3),
                                    ("librosa", lb_bpm, 2), ("percival", pv_bpm, 1)])
@@ -523,7 +597,11 @@ def cross_check_with_librosa(audio: np.ndarray, sr: int, key: str, scale: str, k
             new_bpm, new_conf, mode, supporters = recon
             logger.info(f"BPM consensus ({mode}, {supporters}): {agreement['bpm_votes']} -> {new_bpm}")
             agreement["bpm_mode"] = mode
-            agreement["bpm_agrees"] = mode == "window" and len(supporters) > 1
+            if mode == "tempocnn":
+                agreement["bpm_agrees"] = bool(essentia_bpm) and any(
+                    _bpm_close(cnn_bpm * r, essentia_bpm) for r in (1.0, 2.0, 0.5))
+            else:
+                agreement["bpm_agrees"] = mode == "window" and len(supporters) > 1
             agreement["bpm_switched_to_librosa"] = new_bpm != bpm and "librosa" in supporters and "essentia" not in supporters
             bpm, bpm_conf = new_bpm, new_conf
 

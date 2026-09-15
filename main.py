@@ -282,6 +282,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[CREDITS] Startup hold sweep failed: {e}", exc_info=True)
 
+    # Warm the key/BPM engine off the event loop so boot and the health
+    # check are not held up; the first real /analyze skips the cold start.
+    from audio_analysis import warm_up_engine
+
+    warmup_task = asyncio.create_task(asyncio.to_thread(warm_up_engine))
+
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
     credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
     log_prune_task = asyncio.create_task(_log_prune_loop())
