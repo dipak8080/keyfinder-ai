@@ -169,7 +169,11 @@ class SeparationRejected(SeparationError):
 # samples: Demucs' pad1d assertion) this way. 2026-09-11: 5 s of silence
 # reached users as "RunPod job ... ended with status=FAILED" and was
 # counted as a server failure.
-_DEGENERATE_INPUT_MARKER = "appears to be too short or contains no usable audio"
+_DEGENERATE_INPUT_MARKERS = (
+    "appears to be too short or contains no usable audio",
+    "separation needs at least",
+)
+MIN_SEPARATION_SECONDS = 3.0
 DEGENERATE_INPUT_MESSAGE = (
     "This audio couldn't be processed. It appears to be silent, too short, "
     "or has no usable audio. Please try a different file."
@@ -239,6 +243,14 @@ async def _run_demucs_on_gpu(
         metering.record_job_finished(job_id, status="failed", error=message, client_side=True)
         raise SeparationRejected(message)
 
+    if duration < MIN_SEPARATION_SECONDS:
+        message = (
+            f"Track is only {duration:.1f}s long. Separation needs at least "
+            f"{MIN_SEPARATION_SECONDS:.0f} seconds of audio."
+        )
+        metering.record_job_finished(job_id, status="failed", error=message, client_side=True)
+        raise SeparationRejected(message)
+
     if not RUNPOD_API_KEY or not RUNPOD_DEMUCS_ENDPOINT_ID:
         message = (
             "Separation is temporarily unavailable (GPU worker not configured). "
@@ -273,7 +285,8 @@ async def _run_demucs_on_gpu(
             )
         except RunPodJobError as e:
             error_text = str(e)
-            rejected = _DEGENERATE_INPUT_MARKER in error_text.lower()
+            lowered = error_text.lower()
+            rejected = any(m in lowered for m in _DEGENERATE_INPUT_MARKERS)
 
             # A failed job still burned GPU seconds - often MORE than a
             # successful one, because a timeout runs to the wall before
