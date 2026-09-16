@@ -32,7 +32,7 @@ from config import (
     MIDI_WORKER_SHARED_SECRET,
     MIDI_WORKER_TIMEOUT_SECONDS,
 )
-from audio_common import AudioToolError, atomic_write_bytes
+from audio_common import AudioToolError, InputRejected, atomic_write_bytes
 
 from typing import Optional
 
@@ -124,15 +124,13 @@ def convert_to_midi(
         pass
 
     if reason == "no_notes":
-        # Expected outcome, not a bug - the user uploaded something with
-        # no detectable pitched content.
-        raise AudioToolError(
+        raise InputRejected(
             "No musical notes were detected in this audio. This tool works best on a "
             "single instrument or clear melody - try a different section or a cleaner recording."
         )
 
     if response.status_code == 413 or reason == "too_large":
-        raise AudioToolError("File too large for MIDI conversion.")
+        raise InputRejected("File too large for MIDI conversion.")
 
     if response.status_code == 401 or reason in ("unauthorized", "misconfigured"):
         logger.error(
@@ -140,6 +138,9 @@ def convert_to_midi(
             f"MIDI_WORKER_SHARED_SECRET does not match between the two containers."
         )
         raise AudioToolError("MIDI conversion is temporarily unavailable. Please try again later.")
+
+    if reason == "empty":
+        raise InputRejected("That file appears to be empty. Please try another file.")
 
     if response.status_code == 422:
         raise AudioToolError("Could not transcribe this audio. It may be corrupt or in an unsupported format.")
@@ -226,15 +227,18 @@ def convert_guitar_to_midi(
         pass
 
     if reason == "no_notes":
-        raise AudioToolError(
+        raise InputRejected(
             "No guitar notes were detected in this audio. Try a cleaner recording, "
             "or turn on 'isolate guitar' if this is a full mix."
         )
     if response.status_code == 413 or reason == "too_large":
-        raise AudioToolError("File too large for MIDI conversion.")
+        raise InputRejected("File too large for MIDI conversion.")
     if response.status_code == 401 or reason in ("unauthorized", "misconfigured"):
         logger.error(f"[AUDIO_TO_MIDI_GUITAR] midi-worker auth failure (status={response.status_code})")
         raise AudioToolError("Guitar MIDI transcription is temporarily unavailable. Please try again later.")
+    if reason == "empty":
+        raise InputRejected("That file appears to be empty. Please try another file.")
+
     if response.status_code == 422:
         raise AudioToolError("Could not transcribe this audio. It may be corrupt or in an unsupported format.")
 

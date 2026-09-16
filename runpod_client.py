@@ -235,7 +235,7 @@ async def poll_job(
             if isinstance(output, dict) and output.get("error"):
                 # A worker-reported error - the job is already finished,
                 # so there is nothing to cancel.
-                raise RunPodJobError(str(output["error"]))
+                raise RunPodJobError(str(output["error"]), worker_error=str(output["error"]))
             if not isinstance(output, dict):
                 raise RunPodJobError(
                     f"RunPod job {job_id} completed with an unexpected output shape: {output!r}"

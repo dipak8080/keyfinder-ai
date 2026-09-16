@@ -483,16 +483,18 @@ async def _run_tool_job(
             failure = str(e)
             client_side = is_client_side(e)
             mark_failed(job_id, str(e))
-            logger.warning(
-                f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
+            (logger.info if client_side else logger.warning)(
+                f"[{tool}] job={job_id} {'REJECTED' if client_side else 'FAILED'} "
+                f"in {time.monotonic() - run_started:.1f}s: {e}"
             )
 
         except SeparationError as e:
             failure = str(e)
             client_side = is_client_side(e)
             mark_failed(job_id, str(e))
-            logger.warning(
-                f"[{tool}] job={job_id} FAILED in {time.monotonic() - run_started:.1f}s: {e}"
+            (logger.info if client_side else logger.warning)(
+                f"[{tool}] job={job_id} {'REJECTED' if client_side else 'FAILED'} "
+                f"in {time.monotonic() - run_started:.1f}s: {e}"
             )
 
         except asyncio.CancelledError:

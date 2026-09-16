@@ -173,6 +173,10 @@ _DEGENERATE_INPUT_MARKERS = (
     "appears to be too short or contains no usable audio",
     "separation needs at least",
 )
+UNDECODABLE_INPUT_MESSAGE = (
+    "This file could not be read as audio. It may be corrupted or not an "
+    "audio file. Please try a different file."
+)
 MIN_SEPARATION_SECONDS = 3.0
 DEGENERATE_INPUT_MESSAGE = (
     "This audio couldn't be processed. It appears to be silent, too short, "
@@ -287,6 +291,7 @@ async def _run_demucs_on_gpu(
             error_text = str(e)
             lowered = error_text.lower()
             rejected = any(m in lowered for m in _DEGENERATE_INPUT_MARKERS)
+            undecodable = "could not be decoded as audio" in lowered
 
             # A failed job still burned GPU seconds - often MORE than a
             # successful one, because a timeout runs to the wall before
@@ -296,12 +301,16 @@ async def _run_demucs_on_gpu(
                 job_id,
                 status="timeout" if "timeout" in error_text.lower() else "failed",
                 error=DEGENERATE_INPUT_MESSAGE if rejected else error_text[:500],
-                client_side=rejected,
+                client_side=rejected or undecodable,
             )
 
             if rejected:
-                logger.warning(f"[SEPARATION] Job {job_id}: worker rejected the input as silent or too short")
+                logger.info(f"[SEPARATION] Job {job_id}: worker rejected the input as silent or too short")
                 raise SeparationRejected(DEGENERATE_INPUT_MESSAGE)
+
+            if undecodable:
+                logger.info(f"[SEPARATION] Job {job_id}: worker could not decode the input")
+                raise SeparationRejected(UNDECODABLE_INPUT_MESSAGE)
 
             if _is_insufficient_balance_error(error_text):
                 # This is the ACTUAL ceiling on GPU spend - RunPod's own
@@ -319,7 +328,7 @@ async def _run_demucs_on_gpu(
                     "Separation is temporarily unavailable. Please try again later."
                 )
             logger.error(f"[SEPARATION] Job {job_id} failed on the GPU worker: {error_text}")
-            raise SeparationError(error_text)
+            raise SeparationError("Separation failed. Please try again in a moment.")
     finally:
         unregister_gpu_input(job_id)
 

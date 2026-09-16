@@ -75,6 +75,11 @@ from config import (
     DEFAULT_TRANSCRIPTION_MODE,
 )
 from audio_common import AudioToolError, InputRejected
+
+_NO_SPEECH_MESSAGE = (
+    "No speech was detected in this file. It may be silent, "
+    "music-only, or too quiet to pick up."
+)
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
 
@@ -197,6 +202,9 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
         raise
 
     except RunPodJobError as e:
+        if (e.worker_error or "").strip() == "NO_SPEECH_DETECTED":
+            logger.info("[SPEECH_TO_TEXT_GPU] No speech in input")
+            raise InputRejected(_NO_SPEECH_MESSAGE)
         logger.error(f"[SPEECH_TO_TEXT_GPU] RunPod job failed: {e}")
         raise AudioToolError(
             "Transcription failed. Please try again in a moment."
@@ -226,10 +234,7 @@ async def transcribe(input_path: str, language: str = None, task: str = "transcr
             # Translated back into the SAME message the local backend
             # produces - a user must not be able to tell which backend
             # ran from the wording of an error.
-            raise InputRejected(
-                "No speech was detected in this file. It may be silent, "
-                "music-only, or too quiet to pick up."
-            )
+            raise InputRejected(_NO_SPEECH_MESSAGE)
         logger.error(f"[SPEECH_TO_TEXT_GPU] Worker returned an error: {error}")
         raise AudioToolError(
             "Transcription failed. The file may be corrupt, silent, or in an "
