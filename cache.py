@@ -60,8 +60,12 @@ CACHE_MAX_BYTES = int(os.environ.get(
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
+_DB_BUSY_TIMEOUT_SECONDS = 30
+
+
 def _init_db():
-    with sqlite3.connect(CACHE_DB_PATH) as conn:
+    with sqlite3.connect(CACHE_DB_PATH, timeout=_DB_BUSY_TIMEOUT_SECONDS) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cache_entries (
@@ -97,7 +101,7 @@ _init_db()
 
 @contextmanager
 def _get_db():
-    conn = sqlite3.connect(CACHE_DB_PATH)
+    conn = sqlite3.connect(CACHE_DB_PATH, timeout=_DB_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -353,16 +357,28 @@ def put_cached_file(video_id: str, fmt: str, src_path: str, title: str) -> Optio
         shutil.move(src_path, dest_path)
 
         now = time.time()
-        with _get_db() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO cache_entries
-                    (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (video_id, fmt, title or "Unknown", dest_path, size_bytes, now, now),
-            )
-            conn.commit()
+        last_err = None
+        for attempt in range(3):
+            try:
+                with _get_db() as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO cache_entries
+                            (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (video_id, fmt, title or "Unknown", dest_path, size_bytes, now, now),
+                    )
+                    conn.commit()
+                last_err = None
+                break
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if "locked" not in str(e).lower():
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
 
         logger.info(f"[CACHE] SAVED (moved): {video_id}_{fmt} ({size_bytes} bytes, title='{title}')")
 
