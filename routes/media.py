@@ -497,18 +497,18 @@ async def silence_split_route(
         raise HTTPException(
             400, f"target_format must be one of: {', '.join(sorted(ALLOWED_AUDIO_INPUT_FORMATS))}"
         )
-    if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
+    if not (SILENCE_THRESHOLD_MIN_DB <= threshold_db <= SILENCE_THRESHOLD_MAX_DB):
         raise HTTPException(
             400,
             f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}."
         )
-    if min_duration_seconds < SILENCE_MIN_DURATION_SECONDS or min_duration_seconds > SILENCE_MAX_DURATION_SECONDS:
+    if not (SILENCE_MIN_DURATION_SECONDS <= min_duration_seconds <= SILENCE_MAX_DURATION_SECONDS):
         raise HTTPException(
             400,
             f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} "
             f"and {SILENCE_MAX_DURATION_SECONDS}."
         )
-    if min_segment_seconds < SILENCE_SPLIT_MIN_SEGMENT_SECONDS or min_segment_seconds > SILENCE_SPLIT_MIN_SEGMENT_MAX_SECONDS:
+    if not (SILENCE_SPLIT_MIN_SEGMENT_SECONDS <= min_segment_seconds <= SILENCE_SPLIT_MIN_SEGMENT_MAX_SECONDS):
         raise HTTPException(
             400,
             f"min_segment_seconds must be between {SILENCE_SPLIT_MIN_SEGMENT_SECONDS} "

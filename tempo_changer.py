@@ -25,7 +25,7 @@ def change_tempo(input_path: str, output_path: str, tempo_factor: float) -> None
 
     Raises AudioToolError on out-of-range factor or subprocess failure.
     """
-    if tempo_factor < TEMPO_MIN_FACTOR or tempo_factor > TEMPO_MAX_FACTOR:
+    if not (TEMPO_MIN_FACTOR <= tempo_factor <= TEMPO_MAX_FACTOR):
         raise AudioToolError(
             f"tempo_factor must be between {TEMPO_MIN_FACTOR} and {TEMPO_MAX_FACTOR}."
         )

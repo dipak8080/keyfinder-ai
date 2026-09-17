@@ -143,7 +143,7 @@ def resolve_target_lufs(preset: str = None, custom_lufs: float = None) -> float:
     alternative is refusing to process the file at all.
     """
     if custom_lufs is not None:
-        if custom_lufs < LOUDNORM_MIN_LUFS or custom_lufs > LOUDNORM_MAX_LUFS:
+        if not (LOUDNORM_MIN_LUFS <= custom_lufs <= LOUDNORM_MAX_LUFS):
             raise AudioToolError(
                 f"custom_lufs must be between {LOUDNORM_MIN_LUFS} and {LOUDNORM_MAX_LUFS}."
             )
@@ -222,7 +222,7 @@ def _clamp_measured(param: str, value: float) -> float:
     something has changed about the files people are uploading.
     """
     low, high = _LOUDNORM_PARAM_RANGES[param]
-    if value < low or value > high:
+    if not (low <= value <= high):
         clamped = min(max(value, low), high)
         logger.warning(
             f"[LOUDNORM] {param}={value} is outside ffmpeg's accepted range "
@@ -265,6 +265,8 @@ def _measure_loudness(input_path: str, target_lufs: float) -> dict:
     # useful thing to be told, and a much harder one to debug from a log.
     if result.returncode != 0:
         logger.error(f"[LOUDNORM] Analysis pass failed (exit {result.returncode}): {result.stderr[-2000:]}")
+        if "Error applying option" in result.stderr or "out of range" in result.stderr:
+            raise AudioToolError("Loudness settings were rejected. Pick a target between -70 and -5 LUFS.")
         raise AudioToolError(
             "Could not read this file as valid audio. It may be corrupt or in an "
             "unsupported format."

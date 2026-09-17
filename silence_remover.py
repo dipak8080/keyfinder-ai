@@ -30,11 +30,11 @@ _MAX_KEPT_SPANS = 2000
 def _validate(threshold_db: float, min_duration_seconds: float, mode: str) -> None:
     if mode not in SILENCE_MODES:
         raise AudioToolError(f"mode must be one of: {', '.join(SILENCE_MODES)}.")
-    if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
+    if not (SILENCE_THRESHOLD_MIN_DB <= threshold_db <= SILENCE_THRESHOLD_MAX_DB):
         raise AudioToolError(
             f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}."
         )
-    if min_duration_seconds < SILENCE_MIN_DURATION_SECONDS or min_duration_seconds > SILENCE_MAX_DURATION_SECONDS:
+    if not (SILENCE_MIN_DURATION_SECONDS <= min_duration_seconds <= SILENCE_MAX_DURATION_SECONDS):
         raise AudioToolError(
             f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} and {SILENCE_MAX_DURATION_SECONDS}."
         )

@@ -1315,10 +1315,9 @@ LOUDNORM_PRESETS = {
     "broadcast": -23.0,
 }
 
-# Bounds for the custom_lufs override. -70 to 5 covers every legitimate
-# use case (even -5 is absurdly loud) while rejecting typos like "-1400".
-LOUDNORM_MIN_LUFS = float(os.environ.get("LOUDNORM_MIN_LUFS", "-70"))
-LOUDNORM_MAX_LUFS = float(os.environ.get("LOUDNORM_MAX_LUFS", "5"))
+# ffmpeg's loudnorm only accepts I in [-70, -5]; env values are clamped into it.
+LOUDNORM_MIN_LUFS = max(-70.0, float(os.environ.get("LOUDNORM_MIN_LUFS", "-70")))
+LOUDNORM_MAX_LUFS = min(-5.0, float(os.environ.get("LOUDNORM_MAX_LUFS", "-5")))
 
 # True peak ceiling and loudness range target, held fixed rather than
 # exposed as user params - these are secondary to the integrated loudness

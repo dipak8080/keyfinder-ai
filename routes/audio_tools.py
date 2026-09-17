@@ -83,6 +83,7 @@ the full writeup.
 --------------------------------------------------------------------------
 """
 import os
+import math
 import asyncio
 from functools import partial
 
@@ -259,7 +260,7 @@ async def trim_audio_route(
     # cap-and-reject check), so it gets its own tag here.
     set_job_context(tool="TRIM", tier="standard")
 
-    if start_seconds < 0 or end_seconds <= start_seconds:
+    if not (math.isfinite(start_seconds) and math.isfinite(end_seconds)) or start_seconds < 0 or end_seconds <= start_seconds:
         raise HTTPException(
             400,
             "Invalid range: end_seconds must be greater than start_seconds, "
@@ -390,7 +391,7 @@ async def trim_download(job_id: str):
 )
 async def volume_route(file: UploadFile = File(...), gain_db: float = Form(...)):
     """Gain boost or reduction. Poll GET /volume/status/{job_id}."""
-    if gain_db < VOLUME_GAIN_MIN_DB or gain_db > VOLUME_GAIN_MAX_DB:
+    if not (VOLUME_GAIN_MIN_DB <= gain_db <= VOLUME_GAIN_MAX_DB):
         raise HTTPException(400, f"gain_db must be between {VOLUME_GAIN_MIN_DB} and {VOLUME_GAIN_MAX_DB}.")
 
     return await _submit_audio_tool(
@@ -433,7 +434,7 @@ async def volume_download(job_id: str):
 )
 async def pitch_route(file: UploadFile = File(...), semitones: float = Form(...)):
     """Pitch shift, independent of tempo (rubberband)."""
-    if semitones < PITCH_SHIFT_MIN_SEMITONES or semitones > PITCH_SHIFT_MAX_SEMITONES:
+    if not (PITCH_SHIFT_MIN_SEMITONES <= semitones <= PITCH_SHIFT_MAX_SEMITONES):
         raise HTTPException(
             400,
             f"semitones must be between {PITCH_SHIFT_MIN_SEMITONES} and {PITCH_SHIFT_MAX_SEMITONES}."
@@ -479,7 +480,7 @@ async def pitch_download(job_id: str):
 )
 async def tempo_route(file: UploadFile = File(...), tempo_factor: float = Form(...)):
     """Tempo/speed change, independent of pitch (rubberband)."""
-    if tempo_factor < TEMPO_MIN_FACTOR or tempo_factor > TEMPO_MAX_FACTOR:
+    if not (TEMPO_MIN_FACTOR <= tempo_factor <= TEMPO_MAX_FACTOR):
         raise HTTPException(400, f"tempo_factor must be between {TEMPO_MIN_FACTOR} and {TEMPO_MAX_FACTOR}.")
 
     return await _submit_audio_tool(
@@ -561,7 +562,7 @@ async def reverse_download(job_id: str):
 )
 async def noise_remove_route(file: UploadFile = File(...), strength: float = Form(12.0)):
     """Background noise reduction (ffmpeg afftdn)."""
-    if strength < NOISE_REDUCTION_MIN_STRENGTH or strength > NOISE_REDUCTION_MAX_STRENGTH:
+    if not (NOISE_REDUCTION_MIN_STRENGTH <= strength <= NOISE_REDUCTION_MAX_STRENGTH):
         raise HTTPException(
             400,
             f"strength must be between {NOISE_REDUCTION_MIN_STRENGTH} and {NOISE_REDUCTION_MAX_STRENGTH}."
@@ -701,12 +702,12 @@ async def silence_remove_route(
     mode = mode.strip().lower()
     if mode not in SILENCE_MODES:
         raise HTTPException(400, f"mode must be one of: {', '.join(SILENCE_MODES)}.")
-    if threshold_db < SILENCE_THRESHOLD_MIN_DB or threshold_db > SILENCE_THRESHOLD_MAX_DB:
+    if not (SILENCE_THRESHOLD_MIN_DB <= threshold_db <= SILENCE_THRESHOLD_MAX_DB):
         raise HTTPException(
             400,
             f"threshold_db must be between {SILENCE_THRESHOLD_MIN_DB} and {SILENCE_THRESHOLD_MAX_DB}."
         )
-    if min_duration_seconds < SILENCE_MIN_DURATION_SECONDS or min_duration_seconds > SILENCE_MAX_DURATION_SECONDS:
+    if not (SILENCE_MIN_DURATION_SECONDS <= min_duration_seconds <= SILENCE_MAX_DURATION_SECONDS):
         raise HTTPException(
             400,
             f"min_duration_seconds must be between {SILENCE_MIN_DURATION_SECONDS} "
@@ -810,9 +811,9 @@ async def fade_route(
     """Fade in and/or out."""
     if fade_in_seconds <= 0 and fade_out_seconds <= 0:
         raise HTTPException(400, "At least one of fade_in_seconds or fade_out_seconds must be greater than 0.")
-    if fade_in_seconds < 0 or fade_in_seconds > FADE_MAX_SECONDS:
+    if not (0 <= fade_in_seconds <= FADE_MAX_SECONDS):
         raise HTTPException(400, f"fade_in_seconds must be between 0 and {FADE_MAX_SECONDS}.")
-    if fade_out_seconds < 0 or fade_out_seconds > FADE_MAX_SECONDS:
+    if not (0 <= fade_out_seconds <= FADE_MAX_SECONDS):
         raise HTTPException(400, f"fade_out_seconds must be between 0 and {FADE_MAX_SECONDS}.")
 
     source_format = _validated_input_format(file.filename)

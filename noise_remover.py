@@ -24,7 +24,7 @@ def remove_noise(input_path: str, output_path: str, strength: float) -> None:
 
     Raises AudioToolError on out-of-range strength or ffmpeg failure.
     """
-    if strength < NOISE_REDUCTION_MIN_STRENGTH or strength > NOISE_REDUCTION_MAX_STRENGTH:
+    if not (NOISE_REDUCTION_MIN_STRENGTH <= strength <= NOISE_REDUCTION_MAX_STRENGTH):
         raise AudioToolError(
             f"strength must be between {NOISE_REDUCTION_MIN_STRENGTH} and {NOISE_REDUCTION_MAX_STRENGTH}."
         )

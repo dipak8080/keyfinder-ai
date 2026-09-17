@@ -25,7 +25,7 @@ def shift_pitch(input_path: str, output_path: str, semitones: float) -> None:
     Raises AudioToolError on out-of-range semitones or subprocess
     failure.
     """
-    if semitones < PITCH_SHIFT_MIN_SEMITONES or semitones > PITCH_SHIFT_MAX_SEMITONES:
+    if not (PITCH_SHIFT_MIN_SEMITONES <= semitones <= PITCH_SHIFT_MAX_SEMITONES):
         raise AudioToolError(
             f"semitones must be between {PITCH_SHIFT_MIN_SEMITONES} and {PITCH_SHIFT_MAX_SEMITONES}."
         )
