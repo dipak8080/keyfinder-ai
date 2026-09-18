@@ -8,6 +8,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+import stats
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -179,6 +180,7 @@ async def _credit_hold_sweep_loop():
 async def lifespan(app: FastAPI):
     # Startup
     attach_system_log_capture()  # starts capturing all logger.info()/error() calls app-wide
+    stats.init()  # persistent processed-jobs counter; seeds once from logs.db history
     ensure_cookies_file()
     logger.info(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
@@ -521,6 +523,14 @@ async def log_http_exceptions(request: Request, exc: StarletteHTTPException):
         content={"detail": exc.detail},
         headers=headers,
     )
+
+
+
+@app.get("/stats/public")
+async def public_stats():
+    """Public, unauthenticated, cached a minute in-process. Powers the
+    processed-tracks line on the site."""
+    return stats.snapshot()
 
 
 app.include_router(router)

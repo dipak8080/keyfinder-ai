@@ -16,6 +16,8 @@ scale horizontally later.
 import sys
 import time
 import threading
+
+import stats
 from typing import Optional
 import requests
 
@@ -104,6 +106,10 @@ def record_result(endpoint: str, success: bool, client_side: bool = False):
     client_side explicitly.
     """
     try:
+        if success:
+            # Genuine success only: the client-side flip below is for alert
+            # arithmetic, not a processed job, so it never reaches the counter.
+            stats.record(endpoint)
         if not success and (client_side or is_client_side(sys.exc_info()[1])):
             logger.debug(f"[monitoring] {endpoint} ended client side, not counted")
             success = True
