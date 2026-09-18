@@ -26,7 +26,6 @@ SILENCE_MODES = ("music", "speech")
 # Keeps the aselect expression well under Linux's 128 KB single-argument limit.
 _MAX_KEPT_SPANS = 2000
 
-
 def _validate(threshold_db: float, min_duration_seconds: float, mode: str) -> None:
     if mode not in SILENCE_MODES:
         raise AudioToolError(f"mode must be one of: {', '.join(SILENCE_MODES)}.")
@@ -50,6 +49,31 @@ def _remove_by_threshold(input_path: str, output_path: str, threshold_db: float,
     run_subprocess([FFMPEG_PATH, "-y", "-i", input_path, "-af", silence_filter, output_path])
 
 
+def _balanced_sum(terms: list) -> str:
+    """
+    Joins terms with '+' as a BALANCED tree of parenthesised pairs, not a
+    flat a+b+c+d chain.
+
+    ffmpeg 7.1 added MAX_DEPTH=100 to libavutil/eval.c. Its parser builds
+    a flat sum as a left-nested chain of add nodes, so depth grows by one
+    per term: past ~100 terms make_eval_expr() returns NULL, which
+    parse_subexpr reports as ENOMEM. That surfaces as "Error while
+    parsing expression" followed by "Cannot allocate memory" and the
+    whole job fails - a 26-minute podcast yields a few hundred speech
+    spans and hit it every time, while short clips stayed under the
+    limit and worked. ffmpeg 6.x has no such limit, which is why this
+    only broke once the VPS moved to ffmpeg 7.
+
+    Grouping in halves makes depth log2(n) instead of n: 2000 spans is
+    depth 11, nowhere near the ceiling. The value is identical either
+    way - addition is associative and these are all 0 or 1.
+    """
+    if len(terms) == 1:
+        return terms[0]
+    mid = len(terms) // 2
+    return f"({_balanced_sum(terms[:mid])}+{_balanced_sum(terms[mid:])})"
+
+
 def _remove_non_speech(input_path: str, output_path: str, min_duration_seconds: float) -> int:
     spans = speech_spans(input_path, min_duration_seconds)
     if not spans:
@@ -58,7 +82,7 @@ def _remove_non_speech(input_path: str, output_path: str, min_duration_seconds: 
         )
 
     spans = merge_to_limit(spans, _MAX_KEPT_SPANS)
-    select = "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in spans)
+    select = _balanced_sum([f"between(t,{start:.3f},{end:.3f})" for start, end in spans])
 
     # asetnsamples makes ~5 ms frames so aselect cuts close to the VAD boundaries
     audio_filter = f"asetnsamples=n=256,aselect='{select}',asetpts=N/SR/TB"
