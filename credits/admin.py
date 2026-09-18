@@ -668,6 +668,15 @@ def _access_state(row) -> str:
     return "not_yet"
 
 
+def _test_emails() -> list[str]:
+    """Operator and test addresses to keep out of the Orders view. Comma
+    separated in CREDITS_TEST_EMAILS. Orders from a test-mode webhook are
+    already flagged by test_mode; this covers real-mode purchases made
+    while building the flow."""
+    raw = os.getenv("CREDITS_TEST_EMAILS", "")
+    return sorted({e.strip().lower() for e in raw.split(",") if e.strip()})
+
+
 @router.get("/orders", dependencies=ADMIN)
 def orders(
     days: int = Query(default=90, ge=1, le=365),
@@ -685,6 +694,8 @@ def orders(
     paywall and went looking for a login).
     """
     window = f"-{days} days"
+    excl = _test_emails()
+    excl_sql = f" AND LOWER({{col}}) NOT IN ({','.join('?' * len(excl))})" if excl else ""
     with connect() as conn:
         rows = conn.execute(
             """SELECT o.id, o.email, o.pack, o.credits, o.amount_cents, o.currency,
@@ -718,9 +729,10 @@ def orders(
                FROM orders o
                LEFT JOIN accounts a ON a.id=o.account_id
                WHERE o.test_mode=0 AND o.status='paid'
-                 AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
-               ORDER BY o.created_at DESC LIMIT ?""",
-            (window, limit),
+                 AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
+            + excl_sql.format(col="o.email")
+            + """ ORDER BY o.created_at DESC LIMIT ?""",
+            (window, *excl, limit),
         ).fetchall()
 
         stale_cutoff = conn.execute(
@@ -731,17 +743,19 @@ def orders(
             """SELECT COUNT(*) AS n FROM pending_claims
                WHERE claimed_at IS NULL
                  AND expires_at < strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
-            (window,),
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
+            + excl_sql.format(col="email"),
+            (window, *excl),
         ).fetchone()["n"]
 
         abandoned_rows = conn.execute(
             """SELECT email, pack, created_at FROM pending_claims
                WHERE claimed_at IS NULL
                  AND expires_at < strftime('%Y-%m-%dT%H:%M:%SZ','now')
-                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
-               ORDER BY created_at DESC LIMIT 25""",
-            (window,),
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
+            + excl_sql.format(col="email")
+            + """ ORDER BY created_at DESC LIMIT 50""",
+            (window, *excl),
         ).fetchall()
 
         no_order_signins = conn.execute(
@@ -752,10 +766,11 @@ def orders(
                FROM magic_links m
                WHERE m.purpose='login'
                  AND m.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
-                 AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.email=m.email)
-               GROUP BY m.email
-               ORDER BY last_at DESC LIMIT 25""",
-            (window,),
+                 AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.email=m.email)"""
+            + excl_sql.format(col="m.email")
+            + """ GROUP BY m.email
+               ORDER BY last_at DESC LIMIT 50""",
+            (window, *excl),
         ).fetchall()
 
     out_rows = []
