@@ -62,10 +62,28 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 _DB_BUSY_TIMEOUT_SECONDS = 30
 
+# LRU eviction only needs a rough recency ordering, not per-second
+# precision - so a cache HIT only rewrites last_accessed_at when the
+# stored value is older than this. On a busy day this removes a
+# constant stream of write transactions from the read path, which is
+# one of the main things put_cached_file's INSERT was colliding with.
+_LRU_TOUCH_MIN_INTERVAL_SECONDS = 15 * 60
+
 
 def _init_db():
     with sqlite3.connect(CACHE_DB_PATH, timeout=_DB_BUSY_TIMEOUT_SECONDS) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode is persistent, but silently falls back to the
+        # rollback journal on filesystems where WAL can't work - and the
+        # rollback journal is exactly the mode where concurrent readers
+        # and writers throw "database is locked" at each other. Check
+        # the pragma's RETURN value so a fallback is at least visible.
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(mode).lower() != "wal":
+            logger.warning(
+                f"[CACHE] WAL mode could not be enabled on {CACHE_DB_PATH} "
+                f"(got '{mode}') - expect lock contention under load"
+            )
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS cache_entries (
@@ -102,6 +120,11 @@ _init_db()
 @contextmanager
 def _get_db():
     conn = sqlite3.connect(CACHE_DB_PATH, timeout=_DB_BUSY_TIMEOUT_SECONDS)
+    # The connect() timeout alone does not cover every lock path (the
+    # deadlock-class SQLITE_BUSY returns immediately without ever
+    # invoking the busy handler). Setting the pragma explicitly makes
+    # SQLite itself wait wherever waiting can help at all.
+    conn.execute(f"PRAGMA busy_timeout={_DB_BUSY_TIMEOUT_SECONDS * 1000}")
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -156,7 +179,7 @@ def get_cached_audio(video_id: str, fmt: str) -> Tuple[Optional[bytes], Optional
     try:
         with _get_db() as conn:
             row = conn.execute(
-                "SELECT file_path, title, created_at FROM cache_entries WHERE video_id = ? AND format = ?",
+                "SELECT file_path, title, created_at, last_accessed_at FROM cache_entries WHERE video_id = ? AND format = ?",
                 (video_id, fmt),
             ).fetchone()
 
@@ -184,12 +207,14 @@ def get_cached_audio(video_id: str, fmt: str) -> Tuple[Optional[bytes], Optional
 
             # Touch last_accessed_at - this is what makes size-cap
             # eviction genuinely LRU (recently-served files survive
-            # longer) rather than just oldest-created-first.
-            conn.execute(
-                "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
-                (time.time(), video_id, fmt),
-            )
-            conn.commit()
+            # longer) rather than just oldest-created-first. Throttled:
+            # see _LRU_TOUCH_MIN_INTERVAL_SECONDS.
+            if time.time() - row["last_accessed_at"] > _LRU_TOUCH_MIN_INTERVAL_SECONDS:
+                conn.execute(
+                    "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
+                    (time.time(), video_id, fmt),
+                )
+                conn.commit()
 
             title = row["title"] or "Unknown"
             logger.info(f"[CACHE] HIT: {video_id}_{fmt} ({len(data)} bytes, age {int(age_seconds)}s, title='{title}')")
@@ -232,7 +257,7 @@ def get_cached_path(video_id: str, fmt: str) -> Tuple[Optional[str], Optional[st
     try:
         with _get_db() as conn:
             row = conn.execute(
-                "SELECT file_path, title, created_at FROM cache_entries WHERE video_id = ? AND format = ?",
+                "SELECT file_path, title, created_at, last_accessed_at FROM cache_entries WHERE video_id = ? AND format = ?",
                 (video_id, fmt),
             ).fetchone()
 
@@ -255,11 +280,13 @@ def get_cached_path(video_id: str, fmt: str) -> Tuple[Optional[str], Optional[st
                 conn.commit()
                 return None, None
 
-            conn.execute(
-                "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
-                (time.time(), video_id, fmt),
-            )
-            conn.commit()
+            # Throttled LRU touch - see _LRU_TOUCH_MIN_INTERVAL_SECONDS.
+            if time.time() - row["last_accessed_at"] > _LRU_TOUCH_MIN_INTERVAL_SECONDS:
+                conn.execute(
+                    "UPDATE cache_entries SET last_accessed_at = ? WHERE video_id = ? AND format = ?",
+                    (time.time(), video_id, fmt),
+                )
+                conn.commit()
 
             title = row["title"] or "Unknown"
             logger.info(
@@ -328,14 +355,17 @@ def put_cached_file(video_id: str, fmt: str, src_path: str, title: str) -> Optio
     the copy path is the likely one. Either way it never holds more than
     a small buffer, unlike the read-then-write pair it replaces.
 
-    RETURNS THE CACHE PATH ON SUCCESS, None on any failure - and the
-    caller must treat None as "the source file may or may not still be
-    where I left it". shutil.move is not atomic across filesystems: a
-    failure partway through can leave the source intact, the destination
-    partial, or both. The cache row is only written after the move
-    returns, so a partial destination is never registered as a cache
-    entry; it is orphaned bytes that the next successful save for the
-    same (video_id, fmt) overwrites.
+    RETURNS THE CACHE PATH whenever the MOVE succeeded - even if the
+    metadata row could not be written afterwards (the file is real and
+    servable either way; see the comment past the move below). Returns
+    None ONLY when the move itself failed, and the caller must treat
+    None as "the source file may or may not still be where I left it".
+    shutil.move is not atomic across filesystems: a failure partway
+    through can leave the source intact, the destination partial, or
+    both. The cache row is only written after the move returns, so a
+    partial destination is never registered as a cache entry; it is
+    orphaned bytes that the next successful save for the same
+    (video_id, fmt) overwrites.
 
     NEVER raises, same as put_cached_audio - a caching failure must not
     fail a download that already succeeded.
@@ -355,42 +385,60 @@ def put_cached_file(video_id: str, fmt: str, src_path: str, title: str) -> Optio
         size_bytes = os.path.getsize(src_path)
 
         shutil.move(src_path, dest_path)
-
-        now = time.time()
-        last_err = None
-        for attempt in range(3):
-            try:
-                with _get_db() as conn:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO cache_entries
-                            (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (video_id, fmt, title or "Unknown", dest_path, size_bytes, now, now),
-                    )
-                    conn.commit()
-                last_err = None
-                break
-            except sqlite3.OperationalError as e:
-                last_err = e
-                if "locked" not in str(e).lower():
-                    raise
-                time.sleep(0.5 * (attempt + 1))
-        if last_err is not None:
-            raise last_err
-
-        logger.info(f"[CACHE] SAVED (moved): {video_id}_{fmt} ({size_bytes} bytes, title='{title}')")
-
-        _evict_if_over_limit()
-        return dest_path
-
     except Exception as e:
         logger.warning(
             f"[CACHE] Failed to save {video_id}_{fmt} from {src_path} "
             f"(non-fatal, download still succeeded): {e}"
         )
         return None
+
+    # PAST THIS POINT THE MOVE SUCCEEDED and the file is sitting at
+    # dest_path. Everything below is metadata bookkeeping, and a
+    # bookkeeping failure must not turn a finished download into a
+    # user-facing 500 - which is exactly what returning None here did:
+    # the /download route read None as "the move failed" and errored,
+    # while the file it wanted was already in the cache dir. So on a
+    # persistent DB failure we still return dest_path (the caller can
+    # serve the file), log the entry as unregistered, and let it
+    # self-heal: the next request for this video is a MISS, downloads
+    # again, and INSERT OR REPLACE overwrites both file and row.
+    now = time.time()
+    last_err = None
+    for attempt in range(3):
+        try:
+            with _get_db() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO cache_entries
+                        (video_id, format, title, file_path, size_bytes, created_at, last_accessed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (video_id, fmt, title or "Unknown", dest_path, size_bytes, now, now),
+                )
+                conn.commit()
+            last_err = None
+            break
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if "locked" not in str(e).lower():
+                break
+            time.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            last_err = e
+            break
+
+    if last_err is not None:
+        logger.warning(
+            f"[CACHE] Saved file for {video_id}_{fmt} but could not register it in "
+            f"cache_meta.db ({last_err}). Serving it anyway; the entry stays "
+            f"unregistered until the next download of this video overwrites it."
+        )
+        return dest_path
+
+    logger.info(f"[CACHE] SAVED (moved): {video_id}_{fmt} ({size_bytes} bytes, title='{title}')")
+
+    _evict_if_over_limit()
+    return dest_path
 
 
 def _delete_entry(conn, video_id: str, fmt: str, file_path: str):
