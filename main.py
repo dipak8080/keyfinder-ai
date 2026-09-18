@@ -267,8 +267,8 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-    stats = get_job_stats()
-    logger.info(f"[JOBS] Shutting down with jobs in table: {stats}")
+    job_stats = get_job_stats()
+    logger.info(f"[JOBS] Shutting down with jobs in table: {job_stats}")
 
 
 # ============================================================
