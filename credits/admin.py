@@ -652,6 +652,143 @@ def recent_webhooks(
 
 
 # ---------------------------------------------------------------------------
+# 3b. Did each buyer actually get in?
+# ---------------------------------------------------------------------------
+
+def _access_state(row) -> str:
+    """in_tab: claim matched, credits appeared silently in the buying tab.
+    signed_in: claim missed (direct Ko-fi buyer, or a different email at
+    checkout) but a session was created after the order, via the receipt
+    link or the recovery form. not_yet: paid, and no evidence they have
+    reached their credits."""
+    if row["subject_id"]:
+        return "in_tab"
+    if row["first_session_after"]:
+        return "signed_in"
+    return "not_yet"
+
+
+@router.get("/orders", dependencies=ADMIN)
+def orders(
+    days: int = Query(default=90, ge=1, le=365),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    """One row per paid order, with everything needed to answer "did they
+    get their credits" without opening the database.
+
+    access is the column that matters. not_yet older than an hour is a
+    person who paid and has not reached what they bought.
+
+    Signals are the two things the tables already held that nothing
+    surfaced: gate checkouts started and abandoned, and sign-in links
+    requested by people with no order (usually someone who hit the
+    paywall and went looking for a login).
+    """
+    window = f"-{days} days"
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT o.id, o.email, o.pack, o.credits, o.amount_cents, o.currency,
+                      o.created_at, o.subject_id, o.account_id, o.provider,
+                      o.provider_order_id, o.receipt_sent_at, o.receipt_error,
+                      a.last_login_at,
+                      (SELECT MIN(s.created_at) FROM sessions s
+                        WHERE s.account_id=o.account_id AND s.created_at >= o.created_at)
+                        AS first_session_after,
+                      (SELECT COUNT(*) FROM sessions s
+                        WHERE s.account_id=o.account_id AND s.created_at >= o.created_at)
+                        AS sessions_after,
+                      (SELECT COUNT(*) FROM magic_links m
+                        WHERE m.email=o.email AND m.created_at >= o.created_at)
+                        AS links_after,
+                      (SELECT COUNT(*) FROM magic_links m
+                        WHERE m.email=o.email AND m.created_at >= o.created_at
+                          AND m.used_at IS NOT NULL)
+                        AS links_used_after,
+                      (SELECT COALESCE(-SUM(l.delta),0) FROM credit_ledger l
+                        WHERE l.delta < 0 AND l.created_at >= o.created_at
+                          AND ((l.owner_type='account' AND l.owner_id=o.account_id)
+                            OR (l.owner_type='subject' AND l.owner_id IN
+                                (SELECT id FROM subjects WHERE account_id=o.account_id))))
+                        AS spent_since,
+                      (SELECT COALESCE(SUM(l.delta),0) FROM credit_ledger l
+                        WHERE (l.owner_type='account' AND l.owner_id=o.account_id)
+                           OR (l.owner_type='subject' AND l.owner_id IN
+                               (SELECT id FROM subjects WHERE account_id=o.account_id)))
+                        AS balance
+               FROM orders o
+               LEFT JOIN accounts a ON a.id=o.account_id
+               WHERE o.test_mode=0 AND o.status='paid'
+                 AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               ORDER BY o.created_at DESC LIMIT ?""",
+            (window, limit),
+        ).fetchall()
+
+        stale_cutoff = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour') AS t"
+        ).fetchone()["t"]
+
+        abandoned = conn.execute(
+            """SELECT COUNT(*) AS n FROM pending_claims
+               WHERE claimed_at IS NULL
+                 AND expires_at < strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+            (window,),
+        ).fetchone()["n"]
+
+        abandoned_rows = conn.execute(
+            """SELECT email, pack, created_at FROM pending_claims
+               WHERE claimed_at IS NULL
+                 AND expires_at < strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               ORDER BY created_at DESC LIMIT 25""",
+            (window,),
+        ).fetchall()
+
+        no_order_signins = conn.execute(
+            """SELECT m.email,
+                      COUNT(*) AS requested,
+                      SUM(CASE WHEN m.used_at IS NOT NULL THEN 1 ELSE 0 END) AS used,
+                      MAX(m.created_at) AS last_at
+               FROM magic_links m
+               WHERE m.purpose='login'
+                 AND m.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+                 AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.email=m.email)
+               GROUP BY m.email
+               ORDER BY last_at DESC LIMIT 25""",
+            (window,),
+        ).fetchall()
+
+    out_rows = []
+    counts = {"in_tab": 0, "signed_in": 0, "not_yet": 0, "not_yet_stale": 0,
+              "receipt_failed": 0}
+    revenue_cents = 0
+    for r in rows:
+        d = dict(r)
+        state = _access_state(r)
+        d["access"] = state
+        d["stale"] = state == "not_yet" and r["created_at"] < stale_cutoff
+        counts[state] += 1
+        if d["stale"]:
+            counts["not_yet_stale"] += 1
+        if r["receipt_error"]:
+            counts["receipt_failed"] += 1
+        revenue_cents += int(r["amount_cents"] or 0)
+        out_rows.append(d)
+
+    return {
+        "days": days,
+        "orders": out_rows,
+        "counts": counts,
+        "revenue_cents": revenue_cents,
+        "signals": {
+            "abandoned_checkouts": abandoned,
+            "abandoned_recent": [dict(r) for r in abandoned_rows],
+            "signins_without_order": [dict(r) for r in no_order_signins],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # 4. The manual lever
 # ---------------------------------------------------------------------------
 

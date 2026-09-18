@@ -191,10 +191,25 @@ async def _send_receipt(event: PaymentEvent, balance: int) -> None:
         link = issue_magic_link(conn, email=event.email, subject_id=None, ip_hash=None)
 
     subject, html, text = mailer.receipt_email(event.credits, balance, link)
+    error: str | None = None
     try:
         await mailer.send_email(event.email, subject, html, text)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # Never re-raise: the credits are already granted and the
         # payment is complete. A failed receipt is a support ticket,
         # not a reason to make the provider redeliver a paid order.
+        error = str(exc)[:500]
         log.exception("receipt email failed for %s - credits WERE granted", event.email)
+
+    # Recorded on the order so the admin can see it. A buyer whose claim
+    # missed AND whose receipt failed has no way in, and this is the only
+    # place that state becomes visible.
+    try:
+        with connect() as conn, tx(conn):
+            conn.execute(
+                """UPDATE orders SET receipt_sent_at=?, receipt_error=?
+                   WHERE provider=? AND provider_order_id=?""",
+                (None if error else now_iso(), error, event.provider, event.provider_txid),
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("could not record receipt status for %s", event.provider_txid)
