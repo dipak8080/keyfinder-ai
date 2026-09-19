@@ -56,6 +56,7 @@ from tiktok.core import (
     extract_tiktok_id,
 )
 from tiktok.runner import run_tiktok_in_subprocess
+from tiktok import maintenance
 
 from ._shared import _mb
 
@@ -74,6 +75,7 @@ _STATUS_BY_KIND = {
     "unavailable": 404,  # gone - do not retry
     "no_audio": 422,     # valid post, nothing to convert
     "media_dead": 503,   # TikTok's play URLs 404 for this post; retry
+    "maintenance": 503,  # switched off by hand from /admin; not a retry case
     "no_output": 500,
     "crashed": 500,
     "unknown": 503,      # unclassified: assume transient, invite a retry
@@ -198,6 +200,13 @@ async def tiktok_to_mp3(url: str = Form(...)):
                 "id": post_id,
             })
 
+    # AFTER the cache lookup, BEFORE spending a slot: a cached result
+    # never touches TikTok, so it still serves while the switch is on.
+    state = await run_blocking(maintenance.get_state)
+    if state["on"]:
+        logger.info(f"[TIKTOK] maintenance on, refusing: {url[:120]}")
+        raise _error(503, "maintenance", state["message"])
+
     job_id = str(uuid.uuid4())
     mp3_path = os.path.join(UPLOAD_DIR, f"{job_id}_tiktok.mp3")
 
@@ -307,6 +316,19 @@ async def tiktok_to_mp3(url: str = Form(...)):
         release_memory_to_os()
         _download_semaphore.release()
         record_result("/tiktok-to-mp3", succeeded)
+
+
+@router.get("/tiktok/status")
+async def tiktok_status():
+    """Public, unauthenticated, tiny. The tool page reads this on load so
+    the maintenance notice shows before anyone pastes a link, instead of
+    after a failed conversion. Not in /limits: that endpoint is static
+    and cached at build time, this one changes at runtime."""
+    state = await run_blocking(maintenance.get_state)
+    return JSONResponse(
+        {"maintenance": state["on"], "message": state["message"] if state["on"] else None},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _read_file_bytes(path: str) -> bytes:

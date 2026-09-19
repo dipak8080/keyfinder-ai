@@ -32,6 +32,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # embedding disabled, the exact case rung 2 exists for. Hourly: each cookie
 # slot on its own, so a rotated or challenged account is reported before
 # anyone needs it. Proxy leg drops to every 6 h while the cookie path is OK.
+#
+# TIKTOK LEG (2026-09-19): /tiktok-to-mp3 had no canary at all. On
+# 2026-09-19 TikTok listed formats fine but 404'd the byte fetch for the
+# top-bitrate one, so a metadata-only probe would have stayed green while
+# every conversion of that video failed. This leg calls the production
+# code path itself (tiktok.core.extract_and_download, real download,
+# real ffmpeg) on a known-good post, every run, ~300 KB. It reports the
+# same `kind` core.py would show a user, and alerts on its own state
+# change - independent of the YouTube legs, so a TikTok break never hides
+# behind a YouTube one or vice versa. If it goes FAIL and stays there,
+# flip the TikTok maintenance switch in /admin and bump yt-dlp.
 set -uo pipefail
 
 VIDEO="https://www.youtube.com/shorts/EzbugeXQMeY"
@@ -45,6 +56,10 @@ ACCOUNTS_EVERY_MIN=60
 STATE="/home/deploy/app/data/canary_state.json"
 PROXY_STATE="/home/deploy/app/data/canary_proxy_state"
 ACCOUNTS_STATE="/home/deploy/app/data/canary_accounts_state"
+TIKTOK_STATE="/home/deploy/app/data/canary_tiktok_state"
+# A public post with a normal soundtrack. If it is ever deleted the leg
+# reports FAIL:unavailable (not a code break) - replace the id then.
+TT_VIDEO="https://www.tiktok.com/@kudog_5339/video/7654843337081572629"
 FAILLOG="/home/deploy/app/data/canary_failures.log"
 POT="/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js"
 HOOK=$(grep -m1 '^ALERT_WEBHOOK_URL=' /home/deploy/app/.env | cut -d= -f2-)
@@ -100,6 +115,40 @@ check() {
     printf '%s\n' "$out" | tail -30 | sed -E 's#://[^@/ ]+@#://***@#g'
   } >> "$FAILLOG" 2>/dev/null
   echo $r
+}
+
+# check_tiktok -> OK | FAIL:<kind>
+# Runs the exact function the route runs, inside the container, so the
+# impersonate target, check_formats, retries and classification are all
+# the production ones. No yt-dlp flags to keep in sync by hand.
+check_tiktok() {
+  local out rc kind
+  out=$(timeout 120 docker exec -e V="$TT_VIDEO" audioforges-api python3 -c '
+import os, sys, shutil, tempfile
+sys.path.insert(0, "/app")
+from tiktok.core import extract_and_download, TikTokError
+d = tempfile.mkdtemp(prefix="canary_tt_")
+try:
+    extract_and_download(os.environ["V"], d, "canary")
+    print("CANARY_OK")
+except TikTokError as e:
+    print("CANARY_KIND=" + (e.kind or "unknown"))
+    print(e.debug or e.message)
+    sys.exit(1)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+' 2>&1)
+  rc=$?
+  if printf '%s' "$out" | grep -q CANARY_OK; then
+    echo OK; return
+  fi
+  kind=$(printf '%s' "$out" | sed -n 's/^CANARY_KIND=//p' | head -1)
+  [ -n "$kind" ] || kind=crashed
+  {
+    date -u +"%Y-%m-%dT%H:%M:%SZ [tiktok] FAIL:$kind ---------------------------"
+    printf '%s\n' "$out" | tail -30
+  } >> "$FAILLOG" 2>/dev/null
+  echo "FAIL:$kind"
 }
 
 send() {
@@ -182,6 +231,20 @@ if [ ! -s "$ACCOUNTS_STATE" ] || [ -z "$(find "$ACCOUNTS_STATE" -mmin -"$ACCOUNT
         send "[CANARY] Cookie accounts: $acc." ;;
     esac
   fi
+fi
+
+tt=$(check_tiktok)
+tt_prev=$(cat "$TIKTOK_STATE" 2>/dev/null || echo "")
+echo "$tt" > "$TIKTOK_STATE"
+if [ "$tt" != "$tt_prev" ]; then
+  case "$tt" in
+    OK)
+      [ -n "$tt_prev" ] && send "[CANARY] TikTok conversions back to healthy. If the maintenance switch is on, turn it off in /admin." ;;
+    FAIL:unavailable|FAIL:blocked|FAIL:age_gated)
+      send "[CANARY] TikTok canary video is gone or restricted ($tt), not a code break. Replace TT_VIDEO in canary.sh with another public post." ;;
+    *)
+      send "[CANARY] TikTok conversions FAILING ($tt). Users see the '$tt' message on every fresh request. Turn on the TikTok maintenance switch in /admin, then: docker exec audioforges-api yt-dlp -vU -F $TT_VIDEO. A yt-dlp bump in requirements.txt is the usual fix. Details: tail -40 $FAILLOG" ;;
+  esac
 fi
 
 current="${direct_state} | ${cookie_state} | ${proxy_state}"

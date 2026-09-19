@@ -161,6 +161,7 @@ hand.
 --------------------------------------------------------------------------
 """
 import requests
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from config import (
@@ -276,6 +277,7 @@ from cache import clear_cache, set_cache_max_gb, get_cache_stats
 from monitoring import get_status_snapshot
 from jobs import get_job_stats, count_processing, instance_slot
 from admin_auth import guard_admin_request, verify_admin_key
+from tiktok import maintenance as tiktok_maintenance
 from log_stream import get_endpoint_counts, get_tool_counts
 
 router = APIRouter()
@@ -307,6 +309,29 @@ async def admin_reset_proxy(request: Request, key: str = Query(...)):
     verify_admin_key(key, client_ip)
     reset_proxy_circuit_breaker()
     return {"status": "proxy circuit breaker reset"}
+
+
+@router.get("/admin/tiktok/maintenance")
+async def admin_tiktok_maintenance_get(request: Request, key: str = Query(...)):
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    return tiktok_maintenance.get_state()
+
+
+@router.post("/admin/tiktok/maintenance")
+async def admin_tiktok_maintenance_set(
+    request: Request,
+    key: str = Query(...),
+    on: bool = Query(...),
+    message: Optional[str] = Query(None, max_length=300),
+):
+    """Pauses or resumes /tiktok-to-mp3 sitewide. Flip it ON when the
+    canary or the logs show every TikTok conversion failing (extractor
+    break, TikTok outage); flip it OFF once a yt-dlp bump or a TikTok-side
+    fix lands. Users get `message` verbatim, so write it for them."""
+    client_ip = guard_admin_request(request)
+    verify_admin_key(key, client_ip)
+    return tiktok_maintenance.set_state(on, message)
 
 
 @router.post("/admin/reset-cdn-breaker")
@@ -787,6 +812,7 @@ async def admin_status(request: Request, key: str = Query(...)):
     # so slow transfers were manufacturing proxy spend. See
     # is_cdn_read_timeout_error() in youtube.py for the full writeup.
     snapshot["cdn"] = cdn_breaker_status()
+    snapshot["tiktok"] = tiktok_maintenance.get_state()
     # Per-path success rates. Answers "is the proxy actually working?"
     # and "did that proxy config change help?" - both previously
     # unanswerable without reading raw logs.
