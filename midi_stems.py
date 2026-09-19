@@ -22,6 +22,7 @@ from separation import run_stem_separation, SeparationError
 from monitoring import is_client_side
 from utils import run_blocking, cleanup_file
 from audio_to_midi import convert_to_midi, convert_guitar_to_midi
+from midi_meta import detect_key_quick, key_signature_number
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ async def _run_stem(stem: str, path: str, job_id: str, tmp_dir: str,
 
 
 def _merge(results: list, output_path: str, bpm: float,
-           min_pitch, max_pitch, min_note_ms) -> dict:
+           min_pitch, max_pitch, min_note_ms, key=None) -> dict:
     """Blocking: parses up to five MIDI files and writes one. Call via
     run_blocking."""
     merged = pretty_midi.PrettyMIDI(initial_tempo=bpm)
@@ -239,6 +240,11 @@ def _merge(results: list, output_path: str, bpm: float,
             "No notes were detected in any instrument. Try a clip with clearer melodic content."
         )
 
+    if key:
+        num = key_signature_number(*key)
+        if num is not None:
+            merged.key_signature_changes.append(pretty_midi.KeySignature(num, 0.0))
+
     merged.write(output_path)
     return {
         "duration_seconds": round(merged.get_end_time(), 2),
@@ -273,6 +279,7 @@ async def transcribe_stems(
     tmp_dir = tempfile.mkdtemp(prefix="midistems_")
     stem_paths: dict = {}
     bpm_task = None
+    key_task = None
 
     try:
         sep_started = time.monotonic()
@@ -289,6 +296,7 @@ async def transcribe_stems(
         # start until it was awaited below, so the BPM detection ran AFTER
         # every stem instead of alongside them.
         bpm_task = asyncio.create_task(run_blocking(_detect_bpm, input_path))
+        key_task = asyncio.create_task(run_blocking(detect_key_quick, input_path))
 
         present, skipped = [], []
         for stem in STEM_PLAN:
@@ -318,13 +326,15 @@ async def transcribe_stems(
             for stem in active
         ])
         bpm = await bpm_task
+        key = await key_task
 
         stats = await run_blocking(
             _merge, results, output_path, bpm or DEFAULT_BPM,
-            min_pitch, max_pitch, min_note_ms,
+            min_pitch, max_pitch, min_note_ms, key,
         )
         stats["engine"] = "stems"
         stats["bpm"] = bpm
+        stats["key"] = f"{key[0]} {key[1]}" if key else None
         stats["stems_used"] = [s for s, p, _ in results if p]
         # SKIPPED AND FAILED ARE NOT THE SAME THING. These used to be one
         # list, so the frontend told a paying user "no piano part was found
@@ -355,6 +365,8 @@ async def transcribe_stems(
         # exception on an unrelated job.
         if bpm_task is not None and not bpm_task.done():
             bpm_task.cancel()
+        if key_task is not None and not key_task.done():
+            key_task.cancel()
         for p in stem_paths.values():
             cleanup_file(p)
         try:

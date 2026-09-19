@@ -14,6 +14,7 @@ numpy<2.0.0, which conflicts with this app's numpy==2.3.5 used by
 essentia/librosa/demucs/torch. Full process isolation was the only
 option that added zero risk to the existing product.
 """
+import logging
 import os
 from functools import partial
 
@@ -32,6 +33,7 @@ from rate_limit import check_rate_limit
 from jobs import get_job
 from audio_common import get_audio_mime_type
 from audio_to_midi import convert_to_midi
+from midi_meta import apply_meta
 
 from ._shared import (
     _submit_audio_tool,
@@ -40,7 +42,19 @@ from ._shared import (
     _reject_if_midi_queue_full,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+async def _convert_and_enrich(inp, out, onset, frame, min_len, min_f, max_f):
+    """basic-pitch via the sidecar, then real tempo and key from the
+    original audio written into the file. Enrichment is best-effort; the
+    transcription is the product and never fails over metadata."""
+    await run_blocking(convert_to_midi, inp, out, onset, frame, min_len, min_f, max_f)
+    meta = await run_blocking(apply_meta, inp, out)
+    if meta:
+        logger.info(f"[AUDIO_TO_MIDI] detected meta written: {meta}")
 
 
 @router.post(
@@ -94,8 +108,8 @@ async def audio_to_midi_route(
         max_duration_seconds=MAX_MIDI_DURATION_SECONDS,
         min_duration_seconds=MIN_MIDI_DURATION_SECONDS,
         allowed_input_formats=MIDI_INPUT_FORMATS,
-        build_work=lambda inp, out: (lambda: run_blocking(
-            convert_to_midi, inp, out,
+        build_work=lambda inp, out: (lambda: _convert_and_enrich(
+            inp, out,
             onset_threshold, frame_threshold, minimum_note_length,
             minimum_frequency, maximum_frequency,
         )),
