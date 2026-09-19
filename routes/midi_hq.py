@@ -114,7 +114,7 @@ from jobs import create_job, mark_tool_complete, mark_data_complete, mark_failed
 from audio_common import get_audio_mime_type, build_output_path
 from log_stream import set_job_context, remember_job_tags, tag_from_job
 
-from midi_hq_gpu import transcribe_to_midi, is_available as midi_hq_available, INSTRUMENTS
+from midi_hq_gpu import transcribe_to_midi, is_available as midi_hq_available
 
 from credits import paywall, metering
 from credits.identity import Identity
@@ -137,7 +137,7 @@ TOOL = "AUDIO_TO_MIDI_HQ"
 METRIC = "/audio-to-midi-hq"
 JOB_TYPE = "audio_to_midi_hq"
 TOOL_KEY = "audio-to-midi-hq"   # credits rule key, see credits/config.py
-MIX_TOOL_KEY = "audio-to-midi-hq-mix"   # 3-credit rule for instrument=auto|mix
+MIX_TOOL_KEY = "audio-to-midi-hq-mix"   # every run bills as full mix (one knob)
 
 
 def _require_available() -> None:
@@ -319,10 +319,9 @@ async def audio_to_midi_hq_route(
         min_pitch    MIDI note number, inclusive. Notes below are dropped.
         max_pitch    MIDI note number, inclusive. Notes above are dropped.
         min_note_ms  Notes shorter than this are dropped, in milliseconds.
-        instrument   auto | piano | mix | guitar. Picks the engine - see
-                     midi_hq_gpu.py. Default auto = YourMT3.
-        isolate      guitar only. Run htdemucs_6s first and transcribe
-                     the guitar stem. Use for guitar inside a full mix.
+        instrument   accepted for backward compatibility, ignored. Every
+                     run uses the full-mix pipeline (midi_stems.py).
+        isolate      accepted for backward compatibility, ignored.
 
     NOT accepted, and deliberately: onset_threshold, frame_threshold.
     Those control basic-pitch's DETECTION and have no counterpart in this
@@ -342,12 +341,13 @@ async def audio_to_midi_hq_route(
 
     min_pitch, max_pitch, min_note_ms = _validated_filters(min_pitch, max_pitch, min_note_ms)
 
-    instrument = (instrument or "auto").lower()
-    if instrument not in INSTRUMENTS:
-        raise HTTPException(400, f"instrument must be one of: {', '.join(INSTRUMENTS)}.")
-    if isolate and instrument not in ("guitar", "piano"):
-        raise HTTPException(400, "isolate is only supported with instrument=guitar or piano.")
-    tool_key = MIX_TOOL_KEY if instrument in ("auto", "mix") else TOOL_KEY
+    # One knob (2026-09-19): every paid run is the full-mix pipeline.
+    # instrument/isolate are still accepted so older clients don't 400,
+    # but their values are ignored - piano on a synth source produced
+    # near-empty paid results, so the preset choice is gone.
+    instrument = "auto"
+    isolate = False
+    tool_key = MIX_TOOL_KEY
 
     _validated_input_format(file.filename)
     original_filename = file.filename

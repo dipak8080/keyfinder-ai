@@ -298,10 +298,13 @@ DEFAULT_TOOL_RULES: dict[str, dict[str, Any]] = {
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
-    # Full-mix runs of /audio-to-midi-hq (instrument=auto|mix): one Demucs
-    # split plus up to three transcriptions, so priced like /audio-to-sheet.
+    # Full-mix runs of /audio-to-midi-hq - since the one-knob change,
+    # every HQ MIDI run. Repriced 3 -> 1 on 2026-09-19 from measurement:
+    # ~$0.034 per input minute, ~$0.10-0.14 a typical song, against
+    # $0.20-0.30 of revenue per credit. The 10-minute duration cap bounds
+    # the worst case near break-even, which a flat, learnable price wins.
     "audio-to-midi-hq-mix": {
-        "enabled": False, "free_under_seconds": 0, "credits": 3,
+        "enabled": False, "free_under_seconds": 0, "credits": 1,
         "paid_rate_limit": 30, "paid_rate_window": 3600,
         "free_rate_limit": 0,
     },
