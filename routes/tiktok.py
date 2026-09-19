@@ -73,6 +73,7 @@ _STATUS_BY_KIND = {
     "blocked": 451,      # legally/regionally restricted by TikTok
     "unavailable": 404,  # gone - do not retry
     "no_audio": 422,     # valid post, nothing to convert
+    "media_dead": 503,   # TikTok's play URLs 404 for this post; retry
     "no_output": 500,
     "crashed": 500,
     "unknown": 503,      # unclassified: assume transient, invite a retry
@@ -89,7 +90,7 @@ _STATUS_BY_KIND = {
 # post, an age-gate, a deleted video and a region block will never
 # succeed on a second attempt, and offering a retry on those trains
 # people to hammer a request that cannot work.
-_RETRYABLE_KINDS = frozenset({"unknown", "crashed", "no_output"})
+_RETRYABLE_KINDS = frozenset({"unknown", "crashed", "no_output", "media_dead"})
 
 
 def _error(status: int, kind: str, message: str) -> HTTPException:

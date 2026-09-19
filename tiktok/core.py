@@ -264,6 +264,18 @@ NO_AUDIO_MARKERS = (
     "unable to obtain file audio codec",
 )
 
+# OBSERVED 2026-09-19: extraction succeeds and lists formats, but the
+# signed play URL for a given format 404s on the byte fetch. Per-video,
+# not IP-related (reproduced 6/6 on the VPS for one video while a
+# neighbouring lower-bitrate format served fine). check_formats in
+# _base_opts probes candidates and falls through; if EVERY candidate is
+# dead yt-dlp raises "Requested format is not available". The raw 404
+# text is kept as a marker for the window between probe and download.
+MEDIA_DEAD_MARKERS = (
+    "unable to download video data",
+    "requested format is not available",
+)
+
 # yt-dlp's own "I don't recognise this response" message. Deliberately
 # treated as RETRYABLE rather than given a specific user message: it
 # means the page shape changed under the extractor, which is sometimes
@@ -310,6 +322,11 @@ def is_no_audio_error(text: str) -> bool:
     return any(m in n for m in NO_AUDIO_MARKERS)
 
 
+def is_media_dead_error(text: str) -> bool:
+    n = _norm(text)
+    return any(m in n for m in MEDIA_DEAD_MARKERS)
+
+
 def is_retryable_error(text: str) -> bool:
     """The ONLY errors that get a retry.
 
@@ -317,6 +334,10 @@ def is_retryable_error(text: str) -> bool:
     retryable, so those are excluded first. Being wrong in the
     retryable direction is cheap (a few wasted seconds); being wrong in
     the other direction loses a request that would have succeeded."""
+    if is_media_dead_error(text):
+        # A fresh extraction re-signs the play URLs; a second pass with
+        # check_formats usually lands on a live one.
+        return True
     if (is_photo_error(text) or is_not_video_error(text) or is_age_gated_error(text)
             or is_blocked_error(text) or is_unavailable_error(text)
             or is_no_audio_error(text)):
@@ -352,6 +373,11 @@ def classify(text: str) -> Tuple[str, str]:
             "TikTok has restricted this post, so it isn't available to "
             "download. Try a different video."
         ))
+    if is_media_dead_error(text):
+        return ("media_dead", (
+            "TikTok isn't serving the media for this video right now. "
+            "Please try again in a moment."
+        ))
     if is_unavailable_error(text):
         return ("unavailable", (
             "This TikTok isn't available - it may have been deleted, made "
@@ -380,6 +406,12 @@ def _base_opts(outtmpl: str) -> dict:
         # silence. h264 streams carry audio. yt-dlp #15642, closed as
         # not-a-bug; the selector is the fix.
         "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+        # TikTok serves some signed play URLs dead per-video (404 on the
+        # byte fetch, extraction fine). The "/" alternatives above only
+        # fall through on a no-match, never on a download failure, so
+        # without this a dead top-bitrate format fails the whole job
+        # while a working lower-bitrate one sits right below it.
+        "check_formats": "selected",
         "outtmpl": outtmpl,
         "quiet": True,
         "noplaylist": True,
