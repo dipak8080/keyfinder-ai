@@ -38,6 +38,12 @@ STEM_PLAN = {
     "other":  ("yourmt3",    80, "Other",  24, 108, False),
 }
 
+# "other" runs YourMT3 (GPU) and basic-pitch (CPU sidecar) side by side.
+# YourMT3 wins ties for its per-instrument tracks, but when it collapses
+# on synth timbres it returns a fraction of the notes basic-pitch finds,
+# so it must reach at least this share of the basic-pitch count to be kept.
+OTHER_KEEP_YOURMT3_RATIO = 0.5
+
 # Frames per read in _stem_dbfs. A whole 10-minute stereo stem read at
 # float32 is ~210MB resident, five of those on a 6GB box that is also
 # running Demucs is an OOM waiting to happen, and we only need one RMS
@@ -96,6 +102,15 @@ def _enforce_monophony(notes: list) -> list:
     return [n for n in out if n.end - n.start > 0.02]
 
 
+def _midi_note_count(path: str) -> int:
+    """Blocking: call via run_blocking."""
+    try:
+        m = pretty_midi.PrettyMIDI(path)
+        return sum(len(i.notes) for i in m.instruments if not i.is_drum)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def _run_stem(stem: str, path: str, job_id: str, tmp_dir: str,
                     min_pitch, max_pitch, min_note_ms) -> tuple[str, str | None, dict]:
     engine, _, _, lo, hi, _ = STEM_PLAN[stem]
@@ -109,10 +124,43 @@ async def _run_stem(stem: str, path: str, job_id: str, tmp_dir: str,
             stats = await piano_gpu.transcribe_to_midi(path, out, isolate=False, job_id=f"{job_id}-piano")
         elif engine == "yourmt3":
             import midi_hq_gpu
-            stats = await midi_hq_gpu.transcribe_to_midi(
-                path, out, min_pitch=lo, max_pitch=hi, min_note_ms=min_note_ms,
-                instrument="yourmt3", job_id=f"{job_id}-other",
-            )
+            bp_out = os.path.join(tmp_dir, f"{stem}_bp.mid")
+
+            async def _mt3():
+                return await midi_hq_gpu.transcribe_to_midi(
+                    path, out, min_pitch=lo, max_pitch=hi, min_note_ms=min_note_ms,
+                    instrument="yourmt3", job_id=f"{job_id}-other",
+                )
+
+            async def _bp():
+                await run_blocking(
+                    convert_to_midi, path, bp_out,
+                    onset_threshold=0.4, frame_threshold=0.3,
+                    minimum_note_length=float(min_note_ms) if min_note_ms else 80.0,
+                    minimum_frequency=_hz(lo) * 0.97, maximum_frequency=_hz(hi) * 1.03,
+                )
+
+            mt3_res, bp_res = await asyncio.gather(_mt3(), _bp(), return_exceptions=True)
+            mt3_ok = not isinstance(mt3_res, BaseException) and os.path.exists(out)
+            bp_ok = not isinstance(bp_res, BaseException) and os.path.exists(bp_out)
+            if not mt3_ok and not bp_ok:
+                raise mt3_res if isinstance(mt3_res, BaseException) else AudioToolError(
+                    "Transcription produced no output for this stem."
+                )
+            mt3_notes = await run_blocking(_midi_note_count, out) if mt3_ok else 0
+            bp_notes = await run_blocking(_midi_note_count, bp_out) if bp_ok else 0
+            if mt3_ok and mt3_notes >= OTHER_KEEP_YOURMT3_RATIO * bp_notes:
+                stats = dict(mt3_res or {})
+                stats["engine"] = "yourmt3"
+            else:
+                os.replace(bp_out, out)
+                stats = {"engine": "basic-pitch-fallback"}
+                logger.info(
+                    f"[MIDI_STEMS] other stem fell back to basic-pitch "
+                    f"(yourmt3={mt3_notes} notes, basic-pitch={bp_notes})"
+                )
+            stats["yourmt3_notes"] = mt3_notes
+            stats["basic_pitch_notes"] = bp_notes
         elif engine == "basic-pitch-guitar":
             stats = await run_blocking(
                 convert_guitar_to_midi, path, out,
