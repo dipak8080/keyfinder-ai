@@ -26,6 +26,7 @@ as its own process so a hang or crash is isolated and killable, and all
 calls here are blocking - they MUST be dispatched via utils.run_blocking()
 from the async route.
 """
+import json
 import os
 import subprocess
 from typing import Optional, Tuple
@@ -92,57 +93,142 @@ def validate_video_input_format(filename: Optional[str]) -> str:
     return ext
 
 
+_UNREADABLE_SIGNATURES = (
+    (
+        "moov atom not found",
+        "This video file looks incomplete. It was probably cut short while "
+        "downloading or exporting. Re-download the full file and try again.",
+    ),
+    (
+        "invalid data found",
+        "This file isn't a readable video. If it was downloaded, the download "
+        "may not have finished.",
+    ),
+    (
+        "end of file",
+        "This video file ends early, so it can't be read. Re-download or "
+        "re-export it and try again.",
+    ),
+    (
+        "no such file",
+        "The uploaded file went missing before it could be read. Please try again.",
+    ),
+    (
+        "permission denied",
+        "The uploaded file could not be opened. Please try again.",
+    ),
+)
+
+_UNREADABLE_FALLBACK = (
+    "Could not read this video file. It may be corrupt or in an unsupported format."
+)
+
+
+def _unreadable_message(stderr: str) -> str:
+    """Maps ffprobe's stderr to something a user can act on."""
+    low = (stderr or "").lower()
+    for signature, message in _UNREADABLE_SIGNATURES:
+        if signature in low:
+            return message
+    return _UNREADABLE_FALLBACK
+
+
+def _ffprobe(file_path: str, extra_args: list) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            FFPROBE_PATH, "-v", "error",
+            *extra_args,
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name:format=duration",
+            "-of", "json",
+            file_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
 def probe_audio_stream(file_path: str) -> Tuple[str, float]:
     """
     Returns (audio_codec_name, duration_seconds) for the file's FIRST
     audio stream.
 
-    Two failure modes handled explicitly here rather than being allowed
-    to surface later as a confusing ffmpeg error:
+    Failure modes handled explicitly:
 
-    1. No audio stream at all. Silent screen recordings and muted phone
-       clips are common, and "this video has no audio track" is a far
-       more useful message than whatever ffmpeg would say after being
-       asked to map a stream that doesn't exist.
-    2. Missing duration metadata. Some containers (particularly
-       partially-downloaded or stream-captured files) don't report it,
-       so a missing value is treated as unknown (0.0) and left to the
-       duration check to decide about, rather than crashing on a float
-       conversion.
+    1. Unreadable container. ffprobe exits non-zero and its stderr says
+       why - a truncated download ("moov atom not found") is a different
+       problem for the user than an unsupported container, and both are
+       logged in full so a failure is diagnosable after the fact.
+    2. No audio stream at all. Silent screen recordings and muted phone
+       clips are common. JSON output is used rather than positional
+       lines because with -select_streams the codec line is simply
+       absent when there is no audio, and the duration line then lands
+       in its place and reads as a codec name.
+    3. Audio that starts late in the file. The default probe window can
+       miss it, so a miss is retried once with a much larger window
+       before concluding there is no audio track.
+    4. Missing duration metadata, treated as unknown (0.0) and left to
+       the duration check rather than crashing a float conversion.
     """
     try:
-        result = subprocess.run(
-            [
-                FFPROBE_PATH, "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                file_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
+        size = os.path.getsize(file_path)
+    except OSError:
+        size = -1
+
+    try:
+        result = _ffprobe(file_path, [])
     except subprocess.TimeoutExpired:
         raise AudioToolError("Timed out while inspecting the video file.")
     except Exception as e:
-        logger.error(f"[VIDEO_TO_AUDIO] ffprobe failed for {file_path}: {e}")
-        raise AudioToolError("Could not read this video file. It may be corrupt or in an unsupported format.")
+        logger.error(f"[VIDEO_TO_AUDIO] ffprobe could not run for {file_path}: {e}")
+        raise AudioToolError(_UNREADABLE_FALLBACK)
 
-    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        logger.error(
+            f"[VIDEO_TO_AUDIO] ffprobe exit {result.returncode} for {file_path} "
+            f"({size} bytes on disk): {stderr[-800:] or 'no stderr'}"
+        )
+        raise AudioToolError(_unreadable_message(stderr))
 
-    if not lines:
+    codec, duration = _parse_probe(result.stdout)
+
+    if not codec:
+        try:
+            retry = _ffprobe(file_path, ["-probesize", "100M", "-analyzeduration", "100M"])
+        except Exception:
+            retry = None
+        if retry is not None and retry.returncode == 0:
+            codec, retry_duration = _parse_probe(retry.stdout)
+            duration = duration or retry_duration
+
+    if not codec:
+        logger.warning(
+            f"[VIDEO_TO_AUDIO] no audio stream in {file_path} ({size} bytes on disk)"
+        )
         raise AudioToolError("This video doesn't contain an audio track to extract.")
 
-    codec = lines[0].lower()
+    return codec, duration
+
+
+def _parse_probe(stdout: str) -> Tuple[str, float]:
+    try:
+        data = json.loads(stdout or "{}")
+    except ValueError:
+        return "", 0.0
+
+    streams = data.get("streams") or []
+    codec = ""
+    if streams:
+        codec = (streams[0].get("codec_name") or "").strip().lower()
 
     duration = 0.0
-    if len(lines) > 1:
+    raw = (data.get("format") or {}).get("duration")
+    if raw is not None:
         try:
-            duration = float(lines[1])
-        except ValueError:
+            duration = float(raw)
+        except (TypeError, ValueError):
             duration = 0.0
 
     return codec, duration
