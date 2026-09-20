@@ -19,8 +19,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from functools import partial
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
+
+from rate_limit import check_rate_limit
 
 from . import claims, fulfil, paywall
 from .config import get_settings
@@ -57,7 +61,10 @@ def paypal_config() -> dict:
     }
 
 
-@router.post("/order")
+@router.post(
+    "/order",
+    dependencies=[Depends(partial(check_rate_limit, max_requests=15, window_seconds=3600))],
+)
 def create_order(
     body: OrderRequest,
     identity: Identity = Depends(paywall.get_identity),
@@ -96,7 +103,10 @@ def create_order(
     return {"order_id": order_id}
 
 
-@router.post("/capture")
+@router.post(
+    "/capture",
+    dependencies=[Depends(partial(check_rate_limit, max_requests=30, window_seconds=3600))],
+)
 def capture_order(body: CaptureRequest) -> dict:
     _require_configured()
 
