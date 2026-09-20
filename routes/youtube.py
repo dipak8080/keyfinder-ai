@@ -343,6 +343,7 @@ from monitoring import record_result
 from download_progress import make_progress_hook
 from jobs import (
     create_job,
+    set_job_input,
     mark_complete,
     mark_stems_complete,
     mark_data_complete,
@@ -1316,6 +1317,14 @@ async def _run_youtube_separation(
     if hq:
         metering.record_input_duration_safe(job_id, file_path)
 
+    # A standard run keeps its input for the job's TTL (the sweeper in
+    # jobs.py reclaims input_path) so the Studio Quality upgrade can re-run
+    # the same file without another download. HQ runs have nothing above
+    # them to upgrade to, so they still clean up immediately.
+    keep_input = not hq
+    if keep_input:
+        set_job_input(job_id, file_path)
+
     if stems:
         # No run_blocking() - run_stem_separation()/run_separation() are
         # async (they await an HTTP call to the RunPod GPU worker), not
@@ -1347,7 +1356,7 @@ async def _run_youtube_separation(
         work=work,
         on_success=on_success,
         generic_error=generic_error,
-        cleanup_paths=[file_path],
+        cleanup_paths=[] if keep_input else [file_path],
         success_detail=success_detail,
         # False: see separation.py's _queue_separation equivalent comment
         # - the real billed figure is recorded inside separation.py.

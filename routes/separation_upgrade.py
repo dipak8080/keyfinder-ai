@@ -155,6 +155,10 @@ def _existing_upgrade(source_job_id: str):
     return row["upgrade_job_id"] if row else None
 
 
+_YOUTUBE_VARIANT = {"separation": "youtube_separate", "stems": "youtube_stems"}
+_YOUTUBE_RULE = {"youtube_separate": "youtube/separate-hq", "youtube_stems": "youtube/stems-hq"}
+
+
 def _eligibility(job_id: str, source_type: str, rule_key: str):
     """Shared by the info route and the upgrade route.
 
@@ -168,15 +172,21 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
     from credits.config import get_settings
 
     settings = get_settings()
-    rule = settings.rule_for(rule_key)
 
     job = get_job(job_id)
     if job is None:
         return ({}, {"reason": "job_not_found"})
-    if job["job_type"] != source_type:
+    # A chained YouTube job upgrades through the same route as its upload
+    # twin but is metered under its own rule key, so the free-run
+    # allowance and the admin dashboard attribute it correctly.
+    youtube_type = _YOUTUBE_VARIANT.get(source_type)
+    if job["job_type"] == youtube_type:
+        rule_key = _YOUTUBE_RULE[youtube_type]
+    elif job["job_type"] != source_type:
         return ({}, {"reason": "not_a_separation_job"})
 
-    state = {"job": job, "settings": settings, "rule": rule}
+    rule = settings.rule_for(rule_key)
+    state = {"job": job, "settings": settings, "rule": rule, "rule_key": rule_key}
 
     existing = _existing_upgrade(job_id)
     if existing:
@@ -207,8 +217,9 @@ async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, ru
     state, blocker = _eligibility(job_id, source_type, rule_key)
 
     if blocker is not None:
-        return {"eligible": False, "tool": rule_key, **blocker}
+        return {"eligible": False, "tool": state.get("rule_key", rule_key), **blocker}
 
+    rule_key = state["rule_key"]
     job = state["job"]
     input_path = job["input_path"]
 
@@ -269,9 +280,13 @@ async def _queue_upgrade(
             "message": _BLOCKER_MESSAGE.get(reason, "This job can't be upgraded."),
         })
 
+    rule_key = state["rule_key"]
     job = state["job"]
     input_path = job["input_path"]
     original_filename = job.get("title") or os.path.basename(input_path)
+    if job["job_type"] in _YOUTUBE_RULE:
+        tool = "YOUTUBE_" + tool
+        metric_label = "/youtube" + metric_label
 
     set_job_context(tool=tool.replace("_HQ", ""), tier="hq")
 
@@ -296,7 +311,9 @@ async def _queue_upgrade(
             "max_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
         })
 
-    new_job_id = create_job(job_type=source_type)
+    # Same type as the source, so a YouTube upgrade stays pollable and
+    # downloadable through the /youtube/separate* routes the page already uses.
+    new_job_id = create_job(job_type=job["job_type"])
 
     # Claim the source BEFORE charging. If two clicks race here, exactly
     # one wins the PRIMARY KEY and the loser returns the winner's job.
@@ -336,7 +353,7 @@ async def _queue_upgrade(
         remember_job_tags(new_job_id)
         set_job_input(new_job_id, input_path)
 
-        is_stems = source_type == "stems"
+        is_stems = job["job_type"] in ("stems", "youtube_stems")
         if is_stems:
             work = lambda: run_stem_separation(
                 input_path, new_job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
