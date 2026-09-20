@@ -30,35 +30,43 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from fastapi import APIRouter, HTTPException, Path, Request
 
-from . import claims, mailer
+from . import fulfil
 from .config import get_settings
 from .db import connect, now_iso, tx
-from .identity import get_or_create_account, link_subject_to_account
-from .ledger import grant
 from .providers import (
-    PaymentEvent,
     WebhookRejected,
     WebhookUnprocessable,
     get_adapter,
 )
-from .security import new_id
 
 log = logging.getLogger("credits.webhook")
 router = APIRouter(prefix="/credits", tags=["credits"])
+
+
+def _enabled_providers(settings) -> set[str]:
+    """PAYMENTS_ENABLED_PROVIDERS, comma separated. Defaults to the single
+    configured provider, so existing deployments are unchanged."""
+    raw = os.getenv("PAYMENTS_ENABLED_PROVIDERS", "").strip()
+    if not raw:
+        return {settings.payments_provider}
+    return {name.strip().lower() for name in raw.split(",") if name.strip()}
 
 
 @router.post("/webhook/{provider}")
 async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
     settings = get_settings()
 
-    # The URL names the provider, but only the CONFIGURED one is
-    # accepted. Otherwise a stale webhook still registered at an old
-    # provider could keep granting credits after a migration.
-    if provider != settings.payments_provider:
-        log.warning("webhook for %r but PAYMENTS_PROVIDER is %r", provider, settings.payments_provider)
+    # Only an ENABLED provider is accepted, so a stale webhook still
+    # registered at an old provider cannot keep granting credits after a
+    # migration. More than one may be live at a time: Ko-fi kept for
+    # donations while PayPal takes credit sales.
+    if provider not in _enabled_providers(settings):
+        log.warning("webhook for %r but enabled providers are %s",
+                    provider, sorted(_enabled_providers(settings)))
         raise HTTPException(status_code=404, detail={"error": "unknown_provider"})
 
     adapter = get_adapter(provider)
@@ -101,7 +109,7 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
         )
 
     try:
-        granted, balance = _apply_payment(event)
+        granted, balance = fulfil.apply_payment(event)
     except Exception as exc:  # noqa: BLE001
         log.exception("failed to apply %s payment %s", provider, event.provider_txid)
         with connect() as conn, tx(conn):
@@ -118,99 +126,6 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
     # and outside the transaction so a mail outage can't roll back
     # credits that were legitimately granted.
     if granted:
-        await _send_receipt(event, balance)
+        await fulfil.send_receipt(event, balance)
 
     return {"ok": True}
-
-
-def _apply_payment(event: PaymentEvent) -> tuple[bool, int]:
-    """Account, claim, order and ledger in one transaction.
-
-    Returns (was_newly_granted, balance). was_newly_granted is False
-    when the ledger's idempotency key already existed - i.e. the same
-    payment arriving under a different delivery id.
-    """
-    with connect() as conn, tx(conn):
-        account_id = get_or_create_account(conn, event.email)
-
-        # Match this payment back to the browser that started checkout,
-        # so credits appear in the tab they bought from. Best-effort:
-        # a miss just means they use the magic link in the receipt.
-        claim = claims.take_claim(conn, event.email)
-        subject_id = claim["subject_id"] if claim else None
-        if subject_id:
-            exists = conn.execute("SELECT id FROM subjects WHERE id=?", (subject_id,)).fetchone()
-            if exists is None:
-                conn.execute(
-                    "INSERT INTO subjects (id, account_id, first_ip_hash, last_ip_hash,"
-                    " created_at, last_seen_at) VALUES (?,?,NULL,NULL,?,?)",
-                    (subject_id, account_id, now_iso(), now_iso()),
-                )
-            else:
-                link_subject_to_account(conn, subject_id, account_id)
-
-        conn.execute(
-            """INSERT OR IGNORE INTO orders (id, provider, provider_order_id, provider_ref,
-               account_id, subject_id, email, pack, credits, amount_cents, currency,
-               status, test_mode, created_at, raw)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?, 'paid', ?, ?, ?)""",
-            (new_id("ord_"), event.provider, event.provider_txid,
-             str(event.raw.get("url") or ""), account_id, subject_id, event.email,
-             ",".join(event.pack_keys), event.credits, round(event.amount_usd * 100),
-             event.currency, 1 if get_settings().provider_test_mode else 0,
-             now_iso(), json.dumps(event.raw)[:20000]),
-        )
-
-        granted = grant(
-            conn, owner_type="account", owner_id=account_id, amount=event.credits,
-            kind="purchase",
-            # The payment id, not the delivery id - this is what makes a
-            # redelivered payment credit exactly once.
-            idempotency_key=f"{event.provider}:{event.provider_txid}",
-            order_id=event.provider_txid,
-            note=",".join(event.pack_keys) or f"{event.provider} order",
-        )
-
-        balance = conn.execute(
-            """SELECT COALESCE(SUM(delta),0) AS b FROM credit_ledger
-               WHERE (owner_type='account' AND owner_id=?)
-                  OR (owner_type='subject' AND owner_id IN
-                      (SELECT id FROM subjects WHERE account_id=?))""",
-            (account_id, account_id),
-        ).fetchone()["b"]
-
-    log.info("%s payment %s: %+d credits to %s (packs=%s, new=%s)",
-             event.provider, event.provider_txid, event.credits, event.email,
-             event.pack_keys, granted)
-    return granted, int(balance)
-
-
-async def _send_receipt(event: PaymentEvent, balance: int) -> None:
-    from .auth import issue_magic_link
-
-    with connect() as conn, tx(conn):
-        link = issue_magic_link(conn, email=event.email, subject_id=None, ip_hash=None)
-
-    subject, html, text = mailer.receipt_email(event.credits, balance, link)
-    error: str | None = None
-    try:
-        await mailer.send_email(event.email, subject, html, text)
-    except Exception as exc:  # noqa: BLE001
-        # Never re-raise: the credits are already granted and the
-        # payment is complete. A failed receipt is a support ticket,
-        # not a reason to make the provider redeliver a paid order.
-        error = str(exc)[:500]
-        log.exception("receipt email failed for %s - credits WERE granted", event.email)
-
-    # Recorded on the order so the admin can see it. A buyer whose claim
-    # missed AND whose receipt failed has no way in, and this is the only
-    # place that state becomes visible.
-    try:
-        with connect() as conn, tx(conn):
-            conn.execute(
-                """UPDATE orders SET receipt_sent_at=?, receipt_error=?
-                   WHERE provider=? AND provider_order_id=?""",
-                (None if error else now_iso(), error, event.provider, event.provider_txid),
-            )
-    except Exception:  # noqa: BLE001
-        log.exception("could not record receipt status for %s", event.provider_txid)

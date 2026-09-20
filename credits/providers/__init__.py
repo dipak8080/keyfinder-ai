@@ -84,9 +84,11 @@ class PaymentEvent:
 # PAYMENTS_PROVIDER fails at boot with the valid list, not at the first
 # payment with a 404.
 from . import kofi as _kofi  # noqa: E402  (circular-free: kofi imports nothing from here)
+from . import paypal as _paypal  # noqa: E402
 
 ADAPTERS = {
     _kofi.NAME: _kofi,
+    _paypal.NAME: _paypal,
 }
 
 SUPPORTED_PROVIDERS = tuple(ADAPTERS)
