@@ -269,7 +269,6 @@ import base64
 import hashlib
 import asyncio
 from typing import Optional
-from functools import partial
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Form
 from fastapi.responses import JSONResponse, FileResponse
@@ -333,7 +332,7 @@ from youtube import (
     ytdlp_alert_logger,
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 from separation_limits import shared_separation_limit
 from cache import get_cached_audio, put_cached_audio, get_cached_path, put_cached_file
 from youtube_source import (
@@ -492,8 +491,7 @@ def _url_payload(
 
 @router.post(
     "/download",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=DOWNLOAD_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=DOWNLOAD_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -1364,8 +1362,7 @@ async def _run_youtube_separation(
 
 @router.post(
     "/youtube/analyze",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
     ))],

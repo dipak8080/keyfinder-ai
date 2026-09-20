@@ -73,7 +73,6 @@ import time
 import uuid
 import asyncio
 from typing import List
-from functools import partial
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
 from fastapi.responses import JSONResponse, FileResponse
@@ -114,7 +113,7 @@ from utils import (
     _audio_tools_semaphore,
 )
 from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, trim_audio_for_analysis
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 from monitoring import record_result
 from jobs import create_job, mark_failed, mark_tool_complete, mark_stems_complete, get_job
 from audio_common import AudioToolError, build_output_path, get_audio_mime_type
@@ -154,8 +153,7 @@ router = APIRouter()
 
 @router.post(
     "/analyze",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=ANALYZE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -255,8 +253,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 @router.post(
     "/video-to-audio",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=VIDEO_TO_AUDIO_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=VIDEO_TO_AUDIO_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -351,8 +348,7 @@ async def video_to_audio_download(job_id: str):
 
 @router.post(
     "/join",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=JOIN_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=JOIN_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -467,8 +463,7 @@ async def join_download(job_id: str):
 
 @router.post(
     "/silence-split",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=SILENCE_SPLIT_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=SILENCE_SPLIT_RATE_LIMIT_WINDOW_SECONDS,
     ))],

@@ -26,7 +26,6 @@ import os
 import time
 import uuid
 import base64
-from functools import partial
 
 from fastapi import APIRouter, HTTPException, Depends, Form
 from fastapi.responses import JSONResponse
@@ -45,7 +44,7 @@ from utils import (
     acquire_slot_or_503,
     _download_semaphore,
 )
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 from cache import get_cached_audio, put_cached_audio
 from monitoring import record_result
 from log_stream import set_job_context, get_current_request_id
@@ -131,8 +130,7 @@ _CACHE_FORMAT = "tiktok_mp3"
     # YouTube download can cost paid proxy bandwidth; TikTok has no
     # proxy tier at all and files are ~400 KB, so the only real cost
     # here is a semaphore slot. See config.py for the full reasoning.
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=TIKTOK_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=TIKTOK_RATE_LIMIT_WINDOW_SECONDS,
     ))],

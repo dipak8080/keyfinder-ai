@@ -324,10 +324,10 @@ def check_rate_limit(
     Use as a FastAPI dependency on rate-limited routes:
         @router.post("/download", dependencies=[Depends(check_rate_limit)])
 
-        from functools import partial
         @router.post("/separate", dependencies=[
-            Depends(partial(check_rate_limit, max_requests=1, window_seconds=3600))
+            Depends(rate_limited(max_requests=1, window_seconds=3600))
         ])
+    Never partial(check_rate_limit, ...) - see rate_limited() below for why.
 
     Raises a clean 429 if the caller has exceeded max_requests within
     window_seconds on this path.
@@ -356,3 +356,19 @@ def check_rate_limit(
 
     _check_and_record(subject, specs, ip, key_override, tier,
                       request.url.path, now)
+
+def rate_limited(max_requests: int, window_seconds: int):
+    """Route dependency with the limit closed over, NOT partial(check_rate_limit, ...).
+
+    A partial keeps every unbound parameter of check_rate_limit in the
+    signature FastAPI inspects, and FastAPI exposes each one as an optional
+    query parameter. That made ?max_requests=999999 or ?bucket_key=anything
+    a working bypass on every route that used the partial form. Only
+    `request` is visible here.
+
+        @router.post("/download", dependencies=[Depends(rate_limited(30, 3600))])
+    """
+    def dependency(request: Request) -> None:
+        check_rate_limit(request, max_requests=max_requests, window_seconds=window_seconds)
+    dependency.__name__ = f"rate_limited_{max_requests}_per_{window_seconds}s"
+    return dependency

@@ -32,6 +32,7 @@ jobs.mark_failed(). The underlying classifier functions
 from youtube.py - only the "what do we DO with the classification" logic
 differs.
 """
+import asyncio
 import os
 import uuid
 from typing import Tuple
@@ -58,7 +59,7 @@ from youtube import (
     ytdlp_alert_logger,
     extract_video_id,
 )
-from cache import get_cached_audio, put_cached_audio
+from cache import get_cached_audio, get_cached_path, put_cached_audio
 
 
 class ChainDownloadError(Exception):
@@ -138,6 +139,60 @@ def classify_download_error(error_text: str) -> str:
             "or try a different video.")
 
 
+_SOURCE_CACHE_FORMATS = ("webm", "m4a", "mp3")
+_TRANSCODE_TIMEOUT_SECONDS = 300
+
+
+async def _wav_from_cached_source(video_id: str, output_file: str, job_id: str):
+    """Returns (output_file, title) after transcoding a cached compressed
+    source to WAV, or None when no source is cached or ffmpeg fails.
+    Never raises: a miss or a failure just falls through to yt-dlp."""
+    for fmt in _SOURCE_CACHE_FORMATS:
+        try:
+            src_path, src_title = get_cached_path(video_id, fmt)
+        except Exception as cache_err:
+            logger.warning(f"[YOUTUBE_CHAIN] Job {job_id}: {fmt} cache lookup failed (non-fatal): {cache_err}")
+            continue
+        if not src_path:
+            continue
+
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/usr/bin/ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src_path, "-vn", "-acodec", "pcm_s16le", output_file,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TRANSCODE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                proc.kill()
+            logger.warning(f"[YOUTUBE_CHAIN] Job {job_id}: transcode of cached {fmt} timed out")
+            return None
+        except Exception as e:
+            logger.warning(f"[YOUTUBE_CHAIN] Job {job_id}: transcode of cached {fmt} failed: {e}")
+            return None
+
+        if proc.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            logger.info(
+                f"[YOUTUBE_CHAIN] Job {job_id}: source cache HIT for {video_id} ({fmt}) "
+                f"- transcoded locally, skipped download entirely"
+            )
+            return output_file, src_title or "Unknown"
+
+        logger.warning(
+            f"[YOUTUBE_CHAIN] Job {job_id}: ffmpeg could not transcode cached {fmt}: "
+            f"{(stderr or b'').decode(errors='replace')[:300]}"
+        )
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except OSError:
+            pass
+        return None
+    return None
+
+
 async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
     """
     Downloads url as WAV to a local file and returns (file_path, title).
@@ -199,6 +254,16 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
                     f"[YOUTUBE_CHAIN] Job {job_id}: failed to write cached audio to disk, "
                     f"falling back to a real download: {e}"
                 )
+
+        # SOURCE-CACHE HIT (added 2026-09-20). Since the WAV page builds its
+        # WAV in the browser, /download caches YouTube's compressed stream
+        # (webm/m4a) or an MP3, not a WAV - so the check above missed for
+        # nearly every track a visitor had just converted. Transcoding that
+        # cached source locally costs a few seconds of CPU instead of a
+        # full proxy download of the same bytes.
+        transcoded = await _wav_from_cached_source(video_id, output_file, job_id)
+        if transcoded is not None:
+            return transcoded
 
     ydl_opts = {
         'format': 'bestaudio/best',

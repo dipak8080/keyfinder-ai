@@ -85,7 +85,6 @@ the full writeup.
 import os
 import math
 import asyncio
-from functools import partial
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse, FileResponse
@@ -146,7 +145,7 @@ from config import (
     RINGTONE_RATE_LIMIT_WINDOW_SECONDS,
 )
 from utils import run_blocking, cleanup_file, _audio_tools_semaphore
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 from jobs import create_job, mark_failed, mark_tool_complete, get_job
 from audio_common import (
     AudioToolError,
@@ -189,8 +188,7 @@ router = APIRouter()
 
 @router.post(
     "/convert",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_CONVERT_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_CONVERT_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -243,8 +241,7 @@ async def convert_download(job_id: str):
 
 @router.post(
     "/trim",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_TRIM_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_TRIM_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -383,8 +380,7 @@ async def trim_download(job_id: str):
 
 @router.post(
     "/volume",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_VOLUME_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_VOLUME_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -426,8 +422,7 @@ async def volume_download(job_id: str):
 
 @router.post(
     "/pitch",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_PITCH_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_PITCH_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -472,8 +467,7 @@ async def pitch_download(job_id: str):
 
 @router.post(
     "/tempo",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_TEMPO_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_TEMPO_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -515,8 +509,7 @@ async def tempo_download(job_id: str):
 
 @router.post(
     "/reverse",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_REVERSE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_REVERSE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -554,8 +547,7 @@ async def reverse_download(job_id: str):
 
 @router.post(
     "/noise-remove",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_NOISE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_NOISE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -600,8 +592,7 @@ async def noise_remove_download(job_id: str):
 
 @router.post(
     "/voice-clean",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_VOICE_CLEAN_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_VOICE_CLEAN_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -646,8 +637,7 @@ async def voice_clean_download(job_id: str):
 
 @router.post(
     "/echo-remove",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_ECHO_REMOVE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_ECHO_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -685,8 +675,7 @@ async def echo_remove_download(job_id: str):
 
 @router.post(
     "/silence-remove",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=AUDIO_SILENCE_REMOVE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=AUDIO_SILENCE_REMOVE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -748,8 +737,7 @@ async def silence_remove_download(job_id: str):
 
 @router.post(
     "/loudnorm",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=LOUDNORM_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=LOUDNORM_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -797,8 +785,7 @@ async def loudnorm_download(job_id: str):
 
 @router.post(
     "/fade",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=FADE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=FADE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -852,8 +839,7 @@ async def fade_download(job_id: str):
 
 @router.post(
     "/channels",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=CHANNELS_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=CHANNELS_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -900,8 +886,7 @@ async def channels_download(job_id: str):
 
 @router.post(
     "/resample",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=RESAMPLE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=RESAMPLE_RATE_LIMIT_WINDOW_SECONDS,
     ))],
@@ -961,8 +946,7 @@ async def resample_download(job_id: str):
 
 @router.post(
     "/ringtone",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=RINGTONE_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=RINGTONE_RATE_LIMIT_WINDOW_SECONDS,
     ))],

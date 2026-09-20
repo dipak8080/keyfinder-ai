@@ -16,7 +16,6 @@ option that added zero risk to the existing product.
 """
 import logging
 import os
-from functools import partial
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import FileResponse
@@ -29,7 +28,7 @@ from config import (
     MIDI_INPUT_FORMATS,
 )
 from utils import run_blocking, _midi_semaphore
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 from jobs import get_job
 from audio_common import get_audio_mime_type
 from audio_to_midi import convert_to_midi
@@ -59,8 +58,7 @@ async def _convert_and_enrich(inp, out, onset, frame, min_len, min_f, max_f):
 
 @router.post(
     "/audio-to-midi",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=MIDI_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=MIDI_RATE_LIMIT_WINDOW_SECONDS,
     ))],

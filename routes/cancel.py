@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 
-from functools import partial
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 
@@ -37,7 +36,7 @@ from config import (
     CANCEL_RATE_LIMIT_WINDOW_SECONDS,
 )
 from jobs import get_job
-from rate_limit import check_rate_limit
+from rate_limit import rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +45,7 @@ router = APIRouter()
 
 @router.post(
     "/jobs/{job_id}/cancel",
-    dependencies=[Depends(partial(
-        check_rate_limit,
+    dependencies=[Depends(rate_limited(
         max_requests=CANCEL_RATE_LIMIT_MAX_REQUESTS,
         window_seconds=CANCEL_RATE_LIMIT_WINDOW_SECONDS,
     ))],
