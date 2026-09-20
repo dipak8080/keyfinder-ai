@@ -233,6 +233,15 @@ def _build_event(capture_id: str, pack_key: str, email: str, amount: dict | None
     except (TypeError, ValueError):
         paid = 0.0
 
+    # The amount guard below compares numbers, so the currency must be
+    # ours first: 20.00 IDR would otherwise pass for the $20 pack. An
+    # order forged with the public client id controls its own currency.
+    paid_currency = str(amount.get("currency_code") or "").upper()
+    if paid_currency != currency():
+        raise WebhookUnprocessable(
+            f"capture {capture_id} paid in {paid_currency or 'unknown currency'}, expected {currency()}"
+        )
+
     pack = settings.pack(pack_key) if pack_key else None
     if pack is None:
         pack = settings.pack_by_amount(paid)

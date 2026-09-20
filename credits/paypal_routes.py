@@ -19,9 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from functools import partial
-
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
 from rate_limit import check_rate_limit
@@ -34,6 +32,20 @@ from .providers import paypal as pp
 
 log = logging.getLogger("credits.paypal")
 router = APIRouter(prefix="/credits/paypal", tags=["credits"])
+
+
+def _rate_limited(max_requests: int, window_seconds: int):
+    """A closed dependency, NOT partial(check_rate_limit, ...).
+
+    A partial keeps check_rate_limit's remaining parameters in its
+    signature, and FastAPI turns every one of them into an optional
+    query parameter - so ?max_requests=999999 or ?bucket_key=anything
+    would let a caller rewrite their own rate limit. Closing over the
+    numbers leaves only `request` visible to FastAPI.
+    """
+    def dep(request: Request) -> None:
+        check_rate_limit(request, max_requests=max_requests, window_seconds=window_seconds)
+    return dep
 
 
 class OrderRequest(BaseModel):
@@ -63,7 +75,7 @@ def paypal_config() -> dict:
 
 @router.post(
     "/order",
-    dependencies=[Depends(partial(check_rate_limit, max_requests=15, window_seconds=3600))],
+    dependencies=[Depends(_rate_limited(max_requests=15, window_seconds=3600))],
 )
 def create_order(
     body: OrderRequest,
@@ -105,7 +117,7 @@ def create_order(
 
 @router.post(
     "/capture",
-    dependencies=[Depends(partial(check_rate_limit, max_requests=30, window_seconds=3600))],
+    dependencies=[Depends(_rate_limited(max_requests=30, window_seconds=3600))],
 )
 def capture_order(body: CaptureRequest) -> dict:
     _require_configured()
