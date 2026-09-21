@@ -88,6 +88,14 @@ def download_error_is_client_side(error_text: str) -> bool:
     )
 
 
+def _is_incomplete_read_error(error_text: str) -> bool:
+    # http.client.IncompleteRead - googlevideo closed the connection
+    # mid-transfer ("6576 bytes read, 10444010 more expected"). A
+    # transient CDN drop, not the video's fault, and retryable.
+    t = error_text.lower()
+    return "more expected" in t or "incompleteread" in t
+
+
 def classify_download_error(error_text: str) -> str:
     """
     Maps a raw yt-dlp error string to the same user-facing messages
@@ -116,7 +124,11 @@ def classify_download_error(error_text: str) -> str:
     if is_bot_check_error(error_text):
         return ("YouTube is currently requiring bot verification or restricting available "
                 "formats for this video. Please try again in a few minutes.")
-    if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text):
+    if (
+        is_cdn_connect_timeout_error(error_text)
+        or is_cdn_read_timeout_error(error_text)
+        or _is_incomplete_read_error(error_text)
+    ):
         return ("Couldn't reach YouTube's servers for this video. Please try again in a moment.")
     if (
         is_page_reload_error(error_text)
@@ -271,6 +283,11 @@ async def download_audio_to_file(url: str, job_id: str) -> Tuple[str, str]:
         'quiet': False,
         'verbose': True,
         'noplaylist': True,
+        # Retry a dropped/truncated transfer (googlevideo IncompleteRead)
+        # instead of failing the job on the first one; socket_timeout bounds a stalled read.
+        'socket_timeout': 20,
+        'retries': 3,
+        'fragment_retries': 5,
         'ffmpeg_location': '/usr/bin/ffmpeg',
         # Equivalent of yt-dlp's --force-ipv4 CLI flag. Same reasoning as
         # routes.py's /download route: the VPS HOST has real IPv6 now
