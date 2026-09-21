@@ -654,6 +654,10 @@ async def download_audio(
         # connection; it is not so low that it risks false-failing normal
         # requests under typical latency.
         'socket_timeout': 20,
+        # Retry a dropped/truncated transfer (googlevideo IncompleteRead)
+        # instead of failing on the first one; mirrors youtube_chain.py.
+        'retries': 3,
+        'fragment_retries': 5,
         'extractor_args': {
             'youtubepot-bgutilscript': {
                 'script_path': ['/root/bgutil-ytdlp-pot-provider/server/build/generate_once.js']
@@ -794,7 +798,11 @@ async def download_audio(
                     "Please try again in a few minutes."
                 )
 
-            if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text):
+            incomplete_read = (
+                "more expected" in error_text.lower()
+                or "incompleteread" in error_text.lower()
+            )
+            if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text) or incomplete_read:
                 # A connect-timeout to a specific googlevideo media edge.
                 # should_use_proxy() DOES escalate this to the proxy tier
                 # (see its docstring in youtube.py for the back-and-forth
