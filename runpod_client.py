@@ -43,6 +43,16 @@ PRODUCTION HARDENING (2026-08-11) - three real money/reliability fixes
    that IS running and IS billing. Only the submit is retried, and only
    on network-level errors, never on a 4xx (which would just fail
    identically).
+
+4. TRANSIENT POLL FAILURES NO LONGER KILL A RUNNING JOB (2026-09-21).
+   poll_job() used to cancel-and-fail on ANY non-200 status read. But
+   RunPod's control plane returns intermittent 5xx/429 while the GPU
+   keeps working fine - a single blip 13s into a job was failing the
+   whole thing. Re-reading /status is idempotent and bills nothing, so
+   network errors and 5xx/429 are now tolerated up to a consecutive cap
+   (a good read resets it), still bounded by the job deadline. The
+   give-up-and-cancel path from note 1 only fires once contact is truly
+   lost. Non-retryable HTTP (bad key, job not found) still fails fast.
 --------------------------------------------------------------------------
 """
 import time
@@ -91,6 +101,14 @@ _HTTP_CALL_TIMEOUT_SECONDS = 30
 _SUBMIT_MAX_ATTEMPTS = 3
 _SUBMIT_BACKOFF_SECONDS = 1.5
 
+# Transient poll-failure tolerance. See hardening note 4. A single failed
+# status read (network blip, or 5xx/429 from RunPod's control plane) is
+# not the job failing, so it is tolerated this many times IN A ROW - a
+# good read resets the count - before we conclude contact is lost.
+_POLL_MAX_CONSECUTIVE_ERRORS = 8
+_POLL_ERROR_BACKOFF_SECONDS = 3.0
+_POLL_ERROR_BACKOFF_CAP_SECONDS = 15.0
+
 
 def _post(url: str, headers: dict, json_body: Optional[dict], timeout: int):
     return requests.post(url, headers=headers, json=json_body, timeout=timeout)
@@ -102,6 +120,13 @@ def _get(url: str, headers: dict, timeout: int):
 
 def _auth_headers(api_key: str) -> dict:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+
+def _is_retryable_poll_status(status_code: int) -> bool:
+    # 429 = throttled, 5xx = RunPod control-plane fault. Both leave the
+    # job itself untouched, so re-reading status is the right move. Any
+    # other 4xx (bad key, job not found) would just repeat identically.
+    return status_code == 429 or 500 <= status_code < 600
 
 
 async def cancel_job(endpoint_id: str, api_key: str, job_id: str) -> bool:
@@ -206,61 +231,98 @@ async def poll_job(
 
     Returns the job's "output" dict on a clean COMPLETED.
 
-    EVERY give-up path cancels the job first - see hardening note 1.
-    Without that, this function's own timeout was a pure money leak:
-    we stop waiting, the GPU keeps working, RunPod keeps billing.
+    A transient status read (network blip, 5xx, 429) does NOT stop the
+    job - the GPU keeps working while RunPod's control plane hiccups, so
+    these are retried up to _POLL_MAX_CONSECUTIVE_ERRORS in a row (a good
+    read resets the count) before giving up. See hardening note 4.
+
+    EVERY genuine give-up path still cancels the job first - see
+    hardening note 1. Without that, this function's own timeout was a
+    pure money leak: we stop waiting, the GPU keeps working, RunPod keeps
+    billing.
     """
     url = f"{_RUNPOD_API_BASE}/{endpoint_id}/status/{job_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
 
     deadline = time.monotonic() + timeout_seconds
+    consecutive_errors = 0
+
     while True:
+        transient_error = None
+
         try:
             res = await run_blocking(_get, url, headers, _HTTP_CALL_TIMEOUT_SECONDS)
         except Exception as e:
-            # A poll failure is NOT proof the job stopped - it may well
-            # still be running and billing, so cancel before giving up.
-            await cancel_job(endpoint_id, api_key, job_id)
-            raise RunPodJobError(f"Failed to reach RunPod while polling job {job_id}: {e}")
+            # A network-level failure is NOT proof the job stopped - it
+            # is probably still running and billing. Treat as a blip.
+            transient_error = f"could not reach RunPod ({e})"
+        else:
+            if res.status_code == 200:
+                consecutive_errors = 0
+                data = res.json()
+                status = data.get("status")
 
-        if res.status_code != 200:
-            await cancel_job(endpoint_id, api_key, job_id)
-            raise RunPodJobError(f"RunPod status check failed ({res.status_code}): {res.text[:500]}")
+                if status == "COMPLETED":
+                    output = data.get("output")
+                    if isinstance(output, dict) and output.get("error"):
+                        # A worker-reported error - the job is already
+                        # finished, so there is nothing to cancel.
+                        raise RunPodJobError(str(output["error"]), worker_error=str(output["error"]))
+                    if not isinstance(output, dict):
+                        raise RunPodJobError(
+                            f"RunPod job {job_id} completed with an unexpected output shape: {output!r}"
+                        )
+                    return output
 
-        data = res.json()
-        status = data.get("status")
+                if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    # Already terminal - no cancel needed, nothing is billing.
+                    raise RunPodJobError(
+                        f"RunPod job {job_id} ended with status={status}: "
+                        f"{data.get('error') or 'no error detail returned'}",
+                        worker_error=data.get("error"),
+                    )
+                # Any other status (IN_QUEUE, IN_PROGRESS) = still working.
 
-        if status == "COMPLETED":
-            output = data.get("output")
-            if isinstance(output, dict) and output.get("error"):
-                # A worker-reported error - the job is already finished,
-                # so there is nothing to cancel.
-                raise RunPodJobError(str(output["error"]), worker_error=str(output["error"]))
-            if not isinstance(output, dict):
+            elif _is_retryable_poll_status(res.status_code):
+                # RunPod's API layer faulting or throttling us - the job
+                # is unaffected, so re-read rather than kill it.
+                transient_error = f"status check returned {res.status_code}: {res.text[:200]}"
+            else:
+                # Non-retryable HTTP (bad key, job not found, bad request)
+                # repeats identically - fail fast, cancelling first in
+                # case the job is somehow still billing.
+                await cancel_job(endpoint_id, api_key, job_id)
+                raise RunPodJobError(f"RunPod status check failed ({res.status_code}): {res.text[:500]}")
+
+        if transient_error is not None:
+            consecutive_errors += 1
+            if consecutive_errors >= _POLL_MAX_CONSECUTIVE_ERRORS:
+                # Contact is genuinely lost - now the give-up-and-cancel
+                # path applies, exactly as it did before this retry.
+                await cancel_job(endpoint_id, api_key, job_id)
                 raise RunPodJobError(
-                    f"RunPod job {job_id} completed with an unexpected output shape: {output!r}"
+                    f"RunPod status check for job {job_id} failed {consecutive_errors} "
+                    f"times in a row ({transient_error}) - job cancelled to stop billing."
                 )
-            return output
-
-        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-            # Already terminal - no cancel needed, nothing is billing.
-            raise RunPodJobError(
-                f"RunPod job {job_id} ended with status={status}: "
-                f"{data.get('error') or 'no error detail returned'}",
-                worker_error=data.get("error"),
+            logger.warning(
+                f"[RUNPOD] Transient poll failure {consecutive_errors}/"
+                f"{_POLL_MAX_CONSECUTIVE_ERRORS} for job {job_id}: {transient_error} - retrying."
             )
 
         if time.monotonic() >= deadline:
-            # THE case this hardening exists for: we are out of patience
-            # but the job is, as far as we know, still running on a
-            # billed GPU.
+            # Out of patience but the job is, as far as we know, still
+            # running on a billed GPU.
+            last_status = status if transient_error is None else "unknown"
             await cancel_job(endpoint_id, api_key, job_id)
             raise RunPodJobError(
                 f"RunPod job {job_id} did not finish within {timeout_seconds}s "
-                f"(last known status: {status}) - job cancelled to stop billing."
+                f"(last known status: {last_status}) - job cancelled to stop billing."
             )
 
-        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+        if transient_error is not None:
+            await asyncio.sleep(min(_POLL_ERROR_BACKOFF_SECONDS * consecutive_errors, _POLL_ERROR_BACKOFF_CAP_SECONDS))
+        else:
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 
 async def run_worker_job(
