@@ -43,7 +43,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import ledger, metering, settings_store
+from . import ledger, metering, runpod_billing, settings_store
 from .config import get_settings, reload_settings
 from .db import connect, healthcheck, now_iso, tx
 
@@ -209,7 +209,7 @@ def overview(days: int = Query(default=30, ge=1, le=365)) -> dict:
         "holds_open": holds,
         "jobs_refunded": refunded,
         "webhooks_unprocessed": stuck_webhooks,
-        "usage": metering.totals(days),
+        "usage": runpod_billing.real_totals(metering.totals(days), days),
         "gate": gate_funnel(days),
         "db": healthcheck(),
         "slot": slot_info(),
@@ -229,11 +229,9 @@ def costs(
 ) -> dict:
     """Day by day, tool by tool. This is the data that decides the price.
 
-    est_cost_usd is a FLOOR - it counts the worker's reported run time
-    and not RunPod's cold start or transfers. See metering.py. Measured
-    2026-08-29: metering reported ~$0.30 over a window in which the
-    RunPod balance moved ~$2.90, and the entire gap is cold starts. Read
-    these numbers as a lower bound, never as the invoice.
+    est_cost_usd is RunPod's real billed spend (runpod_billing.py), split
+    across tools by gpu_seconds; metered_est_cost_usd keeps the old floor.
+    Falls back to the metered floor if the billing API is unreachable.
 
     `tool` filters the daily rows only; `totals` deliberately stays
     unfiltered, because the question it answers - "what am I spending
@@ -244,27 +242,32 @@ def costs(
     if date_from and date_to:
         clauses = ["day >= ?", "day <= ?"]
         params: list = [date_from, date_to]
-        if tool:
-            clauses.append("tool = ?")
-            params.append(tool)
         with connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM gpu_cost_daily WHERE {' AND '.join(clauses)}"
                 " ORDER BY day DESC, tool",
                 tuple(params),
             ).fetchall()
+        billing = runpod_billing.daily_spend(date_from, date_to)
+        daily = runpod_billing.apply_real_costs([dict(r) for r in rows], billing)
+        if tool:
+            daily = [r for r in daily if r.get("tool") == tool]
         return {
-            "daily": [dict(r) for r in rows],
-            "totals": metering.totals(days),
+            "daily": daily,
+            "totals": runpod_billing.real_totals(metering.totals(days), days),
+            "runpod": {k: billing.get(k) for k in ("available", "error", "total_usd", "by_group", "fetched_at")},
             "tool": tool,
             "date_from": date_from,
             "date_to": date_to,
         }
 
     daily = metering.daily_costs(days)
+    if daily:
+        billing = runpod_billing.daily_spend(min(r["day"] for r in daily), max(r["day"] for r in daily))
+        daily = runpod_billing.apply_real_costs(daily, billing)
     if tool:
         daily = [row for row in daily if row.get("tool") == tool]
-    return {"daily": daily, "totals": metering.totals(days), "tool": tool}
+    return {"daily": daily, "totals": runpod_billing.real_totals(metering.totals(days), days), "tool": tool}
 
 
 @router.get("/jobs", dependencies=ADMIN)

@@ -1458,6 +1458,7 @@ async def youtube_separate_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_separate")
 
     remember_job_tags(job_id)
+    metering.record_job_created(job_id=job_id, tool="youtube/separate", charge_type="none")
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -1630,6 +1631,7 @@ async def youtube_stems_route(url: str = Form(...)):
     job_id = create_job(job_type="youtube_stems")
 
     remember_job_tags(job_id)
+    metering.record_job_created(job_id=job_id, tool="youtube/stems", charge_type="none")
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=True,
