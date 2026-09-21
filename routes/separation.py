@@ -130,7 +130,7 @@ from credits import metering, paywall
 from credits.identity import Identity
 from credits.limits import tiered_rate_limit
 
-from ._shared import spawn_background_task, _accept_upload, _log_queued, _reject_if_separation_queue_full, _run_tool_job
+from ._shared import stem_download_response, spawn_background_task, _accept_upload, _log_queued, _reject_if_separation_queue_full, _run_tool_job
 
 router = APIRouter()
 
@@ -472,10 +472,15 @@ async def separation_preview(job_id: str, stem: str = Query(...)):
 
 
 @router.get("/separate/download/{job_id}")
-async def separation_download(job_id: str, stem: str = Query(...)):
-    """Same file as /preview, served as a downloadable attachment."""
+async def separation_download(
+    job_id: str,
+    stem: str = Query(...),
+    format: str = Query("wav", pattern="^(wav|mp3)$"),
+):
+    """Same file as /preview, served as a downloadable attachment.
+    format=mp3 encodes a 320 kbps copy on first request (stem_mp3.py)."""
     path = _resolve_stem_path(job_id, stem)
-    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+    return await stem_download_response(path, stem, format)
 
 
 @router.post(
@@ -594,6 +599,10 @@ async def stems_preview(job_id: str, stem: str = Query(...)):
 
 
 @router.get("/stems/download/{job_id}")
-async def stems_download(job_id: str, stem: str = Query(...)):
+async def stems_download(
+    job_id: str,
+    stem: str = Query(...),
+    format: str = Query("wav", pattern="^(wav|mp3)$"),
+):
     path = _resolve_stems_file(job_id, stem)
-    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+    return await stem_download_response(path, stem, format)

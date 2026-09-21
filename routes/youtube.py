@@ -368,7 +368,7 @@ from credits.identity import Identity
 from credits.ledger import settle_or_refund
 from credits.limits import tiered_rate_limit
 
-from ._shared import spawn_background_task, _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
+from ._shared import stem_download_response, spawn_background_task, _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
 
 router = APIRouter()
 
@@ -1597,9 +1597,13 @@ async def youtube_separate_preview(job_id: str, stem: str = Query(...)):
 
 
 @router.get("/youtube/separate/download/{job_id}")
-async def youtube_separate_download(job_id: str, stem: str = Query(...)):
+async def youtube_separate_download(
+    job_id: str,
+    stem: str = Query(...),
+    format: str = Query("wav", pattern="^(wav|mp3)$"),
+):
     path = _resolve_youtube_separate_path(job_id, stem)
-    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+    return await stem_download_response(path, stem, format)
 
 
 @router.post(
@@ -1757,6 +1761,10 @@ async def youtube_stems_preview(job_id: str, stem: str = Query(...)):
 
 
 @router.get("/youtube/stems/download/{job_id}")
-async def youtube_stems_download(job_id: str, stem: str = Query(...)):
+async def youtube_stems_download(
+    job_id: str,
+    stem: str = Query(...),
+    format: str = Query("wav", pattern="^(wav|mp3)$"),
+):
     path = _resolve_youtube_stems_file(job_id, stem)
-    return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+    return await stem_download_response(path, stem, format)

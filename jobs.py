@@ -33,6 +33,7 @@ from typing import Iterable, Optional
 
 from config import logger, SEPARATION_JOB_TTL_SECONDS, AUDIO_TOOL_JOB_TTL_SECONDS
 from redis_store import client as _r
+from stem_mp3 import mp3_sibling
 
 _KEY_PREFIX = "af:job:"
 _INDEX_KEY = "af:jobs:index"
@@ -390,6 +391,9 @@ def cleanup_expired_jobs() -> int:
         stems = job.get("stems")
         if isinstance(stems, dict):
             paths_to_delete.extend(p for p in stems.values() if p)
+
+    # Stems downloaded as MP3 leave an encoded copy next to the WAV.
+    paths_to_delete.extend([mp3_sibling(p) for p in paths_to_delete])
 
     deleted_files = 0
     for path in paths_to_delete:

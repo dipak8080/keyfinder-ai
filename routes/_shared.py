@@ -191,7 +191,7 @@ import asyncio
 from typing import Callable, Optional, Sequence
 
 from fastapi import HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
     logger,
@@ -1184,3 +1184,19 @@ async def _submit_audio_tool(
 
     _log_queued(tool, job_id, original_filename, size, log_detail)
     return JSONResponse({"job_id": job_id, "status": "processing"})
+
+
+async def stem_download_response(path: str, stem: str, fmt: str = "wav") -> FileResponse:
+    """One download response for all four separation tools. WAV is the file
+    the worker wrote. MP3 is encoded once on the VPS and reused after that
+    (stem_mp3.py); the GPU workers are not involved."""
+    if fmt != "mp3":
+        return FileResponse(path, media_type="audio/wav", filename=f"{stem}.wav")
+
+    from stem_mp3 import ensure_stem_mp3
+
+    try:
+        mp3_path = await run_blocking(ensure_stem_mp3, path)
+    except AudioToolError:
+        raise HTTPException(500, "Could not make the MP3. The WAV download still works.")
+    return FileResponse(mp3_path, media_type="audio/mpeg", filename=f"{stem}.mp3")

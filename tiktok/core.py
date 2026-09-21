@@ -287,6 +287,8 @@ TRANSIENT_MARKERS = (
     "unable to download webpage",
     "read timed out",
     "connection reset",
+    "reset by server",
+    "protocol_error",
     "temporary failure",
     "timed out",
 )
@@ -425,6 +427,10 @@ def _base_opts(outtmpl: str) -> dict:
         # so pinning to IPv4 avoids a dead path on any IPv6-only host.
         "source_address": "0.0.0.0",
         "socket_timeout": 20,
+        # Retry a dropped/reset transfer (HTTP/2 stream reset, curl 92)
+        # instead of failing on the first one; mirrors youtube_chain.py.
+        "retries": 3,
+        "fragment_retries": 5,
         # No proxy key at all, by design - see module docstring.
         # No cookiefile - public posts need none, and the one case that
         # would need it (age-gated) is deliberately unsupported.
