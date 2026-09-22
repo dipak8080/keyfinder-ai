@@ -236,7 +236,7 @@ def free_gpu_spend_today() -> dict:
                       SUM(CASE WHEN status IN ('created','running') THEN 0 ELSE 1 END) AS finished,
                       SUM(CASE WHEN status IN ('created','running') THEN 1 ELSE 0 END) AS running
                FROM gpu_job_metrics
-               WHERE charge_type != 'credit'
+               WHERE COALESCE(charge_type, 'none') != 'credit'
                  AND created_at >= strftime('%Y-%m-%dT00:00:00', 'now')""",
         ).fetchone()
     spent = float(row["spent"] or 0.0)

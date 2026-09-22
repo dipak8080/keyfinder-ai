@@ -680,6 +680,14 @@ def _test_emails() -> list[str]:
     return sorted({e.strip().lower() for e in raw.split(",") if e.strip()})
 
 
+def _enforced_daily_cap() -> int | None:
+    try:
+        from separation_limits import current_limits
+        return int(current_limits()["daily_max"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @router.get("/abuse", dependencies=ADMIN)
 def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
     """Is free GPU spend spread across many people or farmed by a few?
@@ -694,7 +702,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
             """SELECT COUNT(*) AS runs, COUNT(DISTINCT ip_hash) AS ips,
                       COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
                FROM gpu_job_metrics
-               WHERE charge_type != 'credit'
+               WHERE COALESCE(charge_type, 'none') != 'credit'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
             (window,),
         ).fetchone()
@@ -706,7 +714,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
                       MAX(created_at) AS last_at,
                       SUM(CASE WHEN status IN ('failed','timeout','cancelled') THEN 1 ELSE 0 END) AS failed
                FROM gpu_job_metrics
-               WHERE charge_type != 'credit'
+               WHERE COALESCE(charge_type, 'none') != 'credit'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                GROUP BY ip_hash ORDER BY runs DESC LIMIT 20""",
             (window,),
@@ -716,7 +724,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
                       COUNT(DISTINCT ip_hash) AS ips,
                       COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
                FROM gpu_job_metrics
-               WHERE charge_type != 'credit'
+               WHERE COALESCE(charge_type, 'none') != 'credit'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                GROUP BY 1 ORDER BY 1 DESC""",
             (window,),
@@ -737,7 +745,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
         },
         "limits": {
             "free_runs_before_challenge": settings.turnstile_free_runs_before_challenge,
-            "daily_separation_cap": settings_store.resolve("SEPARATION_SHARED_DAILY_MAX_REQUESTS"),
+            "daily_separation_cap": _enforced_daily_cap(),
         },
         "turnstile": turnstile.stats(days),
     }

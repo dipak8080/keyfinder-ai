@@ -1436,7 +1436,10 @@ async def youtube_analyze_result(job_id: str):
     "/youtube/separate",
     dependencies=[Depends(shared_separation_limit)],
 )
-async def youtube_separate_route(url: str = Form(...)):
+async def youtube_separate_route(
+    url: str = Form(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """Downloads then runs standard-tier vocal/instrumental separation.
     Stem paths are stored the same way /separate stores them.
 
@@ -1455,10 +1458,15 @@ async def youtube_separate_route(url: str = Form(...)):
 
     _reject_if_separation_queue_full()
 
+    await paywall.free_gate(identity, tool="youtube/separate")
+
     job_id = create_job(job_type="youtube_separate")
 
     remember_job_tags(job_id)
-    metering.record_job_created(job_id=job_id, tool="youtube/separate", charge_type="none")
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/separate", charge_type="none",
+        subject_id=identity.subject_id, account_id=identity.account_id, ip_hash=identity.ip_hash,
+    )
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -1611,7 +1619,10 @@ async def youtube_separate_download(
     "/youtube/stems",
     dependencies=[Depends(shared_separation_limit)],
 )
-async def youtube_stems_route(url: str = Form(...)):
+async def youtube_stems_route(
+    url: str = Form(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """Downloads then runs standard-tier full 4-stem separation.
 
     Same Demucs cost as /youtube/separate (same model, same run - only
@@ -1628,10 +1639,15 @@ async def youtube_stems_route(url: str = Form(...)):
 
     _reject_if_separation_queue_full()
 
+    await paywall.free_gate(identity, tool="youtube/stems")
+
     job_id = create_job(job_type="youtube_stems")
 
     remember_job_tags(job_id)
-    metering.record_job_created(job_id=job_id, tool="youtube/stems", charge_type="none")
+    metering.record_job_created(
+        job_id=job_id, tool="youtube/stems", charge_type="none",
+        subject_id=identity.subject_id, account_id=identity.account_id, ip_hash=identity.ip_hash,
+    )
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=True,

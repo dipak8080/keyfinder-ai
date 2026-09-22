@@ -184,6 +184,9 @@ async def _queue_separation(
 
     _reject_if_separation_queue_full()
 
+    if rule_key is None and identity is not None:
+        await paywall.free_gate(identity, tool=metric_label.lstrip("/"))
+
     original_filename = file.filename
 
     job_id = create_job(job_type=job_type)
@@ -351,7 +354,10 @@ async def _queue_separation(
     "/separate",
     dependencies=[Depends(shared_separation_limit)],
 )
-async def separate_audio(file: UploadFile = File(...)):
+async def separate_audio(
+    file: UploadFile = File(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """
     Accepts an audio file, returns a job_id immediately, and runs Demucs
     vocal/instrumental separation in the background on the RunPod GPU
@@ -376,6 +382,7 @@ async def separate_audio(file: UploadFile = File(...)):
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
         metric_label="/separate",
         hq=False,
+        identity=identity,
     )
 
 
@@ -487,7 +494,10 @@ async def separation_download(
     "/stems",
     dependencies=[Depends(shared_separation_limit)],
 )
-async def stems_route(file: UploadFile = File(...)):
+async def stems_route(
+    file: UploadFile = File(...),
+    identity: Identity = Depends(paywall.get_identity),
+):
     """
     Full 4-stem separation (vocals/drums/bass/other). Same model, same
     semaphore and the same compute cost as /separate - the only
@@ -511,6 +521,7 @@ async def stems_route(file: UploadFile = File(...)):
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
         metric_label="/stems",
         hq=False,
+        identity=identity,
     )
 
 

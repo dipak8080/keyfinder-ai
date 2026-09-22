@@ -164,6 +164,28 @@ def insufficient_credits_response(exc: InsufficientCredits) -> HTTPException:
 
 
 @asynccontextmanager
+async def free_gate(identity: Identity, *, tool: str) -> None:
+    """Budget and human check for free-forever GPU routes, which never touch
+    the ledger. Raised before any job exists, so there is nothing to refund."""
+    budget = get_settings().free_gpu_daily_budget_usd
+    if budget > 0:
+        spend = await asyncio.to_thread(metering_mod.free_gpu_spend_today)
+        if spend["projected_usd"] >= budget:
+            await _record_gate_event_async(
+                identity, event="budget_paused", tool=tool,
+                credits_needed=0, balance=0, free_remaining=0, input_seconds=None,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Free runs of this tool are paused for the rest of today to keep the servers funded. They come back at midnight UTC. Credits keep working right now.",
+            )
+    if await asyncio.to_thread(turnstile_mod.needs_challenge, identity.ip_hash):
+        raise HTTPException(
+            status_code=428,
+            detail={"error": "turnstile_required", "message": "Quick check that you're human, then this runs."},
+        )
+
+
 async def guard(identity: Identity, *, job_id: str, tool: str,
                 input_seconds: float | None) -> AsyncIterator[Charge]:
     """Charge, run the body, auto-refund if the body raises.
