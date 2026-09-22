@@ -680,6 +680,45 @@ def _test_emails() -> list[str]:
     return sorted({e.strip().lower() for e in raw.split(",") if e.strip()})
 
 
+@router.get("/sources", dependencies=ADMIN)
+def order_sources(days: int = Query(default=90, ge=1, le=365)) -> dict:
+    """Paid orders grouped by where they came from. Answers whether the
+    YouTube funnel, a campaign link, or a tool gate produced the sale.
+    Orders placed before attribution existed show as source NULL."""
+    window = f"-{days} days"
+    excl = _test_emails()
+    excl_sql = f" AND LOWER(o.email) NOT IN ({','.join('?' * len(excl))})" if excl else ""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT COALESCE(os.source, '(none)') AS source,
+                      COALESCE(os.tool, '(unknown)') AS tool,
+                      COUNT(*) AS orders,
+                      COALESCE(SUM(o.amount_cents), 0) AS amount_cents,
+                      COALESCE(SUM(o.credits), 0) AS credits,
+                      MAX(o.created_at) AS last_at
+               FROM orders o
+               LEFT JOIN order_sources os ON os.provider_order_id=o.provider_order_id
+               WHERE o.test_mode=0 AND o.status='paid'
+                 AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
+            + excl_sql
+            + """ GROUP BY 1, 2 ORDER BY orders DESC, amount_cents DESC""",
+            (window, *excl),
+        ).fetchall()
+        started = conn.execute(
+            """SELECT COALESCE(source, '(none)') AS source, COALESCE(tool, '(unknown)') AS tool,
+                      COUNT(*) AS checkouts
+               FROM order_sources
+               WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               GROUP BY 1, 2""",
+            (window,),
+        ).fetchall()
+    return {
+        "days": days,
+        "paid": [dict(r) for r in rows],
+        "checkouts_started": [dict(r) for r in started],
+    }
+
+
 @router.get("/orders", dependencies=ADMIN)
 def orders(
     days: int = Query(default=90, ge=1, le=365),
@@ -704,6 +743,7 @@ def orders(
             """SELECT o.id, o.email, o.pack, o.credits, o.amount_cents, o.currency,
                       o.created_at, o.subject_id, o.account_id, o.provider,
                       o.provider_order_id, o.receipt_sent_at, o.receipt_error,
+                      os.source AS source, os.tool AS source_tool, os.page AS source_page,
                       a.last_login_at,
                       (SELECT MIN(s.created_at) FROM sessions s
                         WHERE s.account_id=o.account_id AND s.created_at >= o.created_at)
@@ -731,6 +771,7 @@ def orders(
                         AS balance
                FROM orders o
                LEFT JOIN accounts a ON a.id=o.account_id
+               LEFT JOIN order_sources os ON os.provider_order_id=o.provider_order_id
                WHERE o.test_mode=0 AND o.status='paid'
                  AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
             + excl_sql.format(col="o.email")

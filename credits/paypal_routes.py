@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
@@ -26,6 +27,7 @@ from rate_limit import check_rate_limit
 
 from . import claims, fulfil, paywall
 from .config import get_settings
+from .db import connect, now_iso, tx
 from .identity import Identity
 from .providers import WebhookUnprocessable
 from .providers import paypal as pp
@@ -51,6 +53,34 @@ def _rate_limited(max_requests: int, window_seconds: int):
 class OrderRequest(BaseModel):
     pack: str = Field(..., max_length=32)
     email: EmailStr
+    source: str | None = Field(default=None, max_length=64)
+    tool: str | None = Field(default=None, max_length=64)
+    page: str | None = Field(default=None, max_length=128)
+
+
+_TAG_RE = re.compile(r"[^a-z0-9_\-/:.]")
+
+
+def _tag(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = _TAG_RE.sub("", value.strip().lower())[:64]
+    return cleaned or None
+
+
+def _record_source(order_id: str, body: OrderRequest, identity: Identity) -> None:
+    """Best effort. A failed attribution row must never block a sale."""
+    try:
+        with connect() as conn, tx(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO order_sources
+                   (provider, provider_order_id, source, tool, page, subject_id, created_at)
+                   VALUES ('paypal', ?, ?, ?, ?, ?, ?)""",
+                (order_id, _tag(body.source), _tag(body.tool),
+                 (body.page or "").strip()[:128] or None, identity.subject_id, now_iso()),
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("could not record order source for %s", order_id)
 
 
 class CaptureRequest(BaseModel):
@@ -110,8 +140,10 @@ def create_order(
     if not order_id:
         raise HTTPException(status_code=502, detail={"error": "paypal_no_order_id"})
 
-    log.info("paypal order %s created: pack=%s %.2f %s", order_id, pack.key,
-             pack.price_usd, pp.currency())
+    _record_source(order_id, body, identity)
+
+    log.info("paypal order %s created: pack=%s %.2f %s source=%s tool=%s", order_id, pack.key,
+             pack.price_usd, pp.currency(), _tag(body.source), _tag(body.tool))
     return {"order_id": order_id}
 
 
