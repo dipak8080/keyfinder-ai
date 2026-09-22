@@ -163,7 +163,6 @@ def insufficient_credits_response(exc: InsufficientCredits) -> HTTPException:
     return HTTPException(status_code=402, detail=exc.to_payload())
 
 
-@asynccontextmanager
 async def free_gate(identity: Identity, *, tool: str) -> None:
     """Budget and human check for free-forever GPU routes, which never touch
     the ledger. Raised before any job exists, so there is nothing to refund."""
@@ -186,6 +185,7 @@ async def free_gate(identity: Identity, *, tool: str) -> None:
         )
 
 
+@asynccontextmanager
 async def guard(identity: Identity, *, job_id: str, tool: str,
                 input_seconds: float | None) -> AsyncIterator[Charge]:
     """Charge, run the body, auto-refund if the body raises.
