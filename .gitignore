@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 uploads/*
+audio_tools_output/
+separated/
 *.mp3
 *.wav
 *.mp4
@@ -15,11 +17,11 @@ data/
 .env.*
 run_container.sh
 
-.env
-.env.*
-run_container.sh
-
 ref/
 *.csv
 *_results.json
 eval_results.json
+
+h2h_*.json
+localdata/
+run_local.sh

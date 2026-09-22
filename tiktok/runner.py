@@ -14,11 +14,30 @@ with no swap. Confirmed necessary on the YouTube path in production.
 """
 import os
 import sys
+import glob
 import json
 import signal
 import asyncio
 
 from config import logger
+
+# A normal conversion takes ~10s. A stalled TikTok CDN transfer hangs
+# silently, so the budget is split and a stalled attempt is killed and
+# retried instead of eating the whole wall clock.
+STALL_ATTEMPTS = 2
+_TIMEOUT_RESULT = {
+    "ok": False,
+    "kind": "unknown",
+    "error": "This conversion is taking too long. Please try again.",
+}
+
+
+def _clear_partials(out_dir: str, job_id: str) -> None:
+    for p in glob.glob(os.path.join(out_dir, f"{job_id}_tiktok.*")):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 async def run_tiktok_in_subprocess(
@@ -33,6 +52,26 @@ async def run_tiktok_in_subprocess(
     failure - a failure comes back as {"ok": False, "kind": ..., "error": ...}
     so the route layer has exactly one shape to handle.
     """
+    per_attempt = max(45, timeout_seconds // STALL_ATTEMPTS)
+    for attempt in range(1, STALL_ATTEMPTS + 1):
+        result = await _run_once(url, out_dir, job_id, per_attempt, request_id, attempt)
+        if result is not None:
+            return result
+        _clear_partials(out_dir, job_id)
+        if attempt < STALL_ATTEMPTS:
+            logger.warning(f"[TIKTOK] job={job_id} attempt {attempt} stalled, retrying")
+    return dict(_TIMEOUT_RESULT)
+
+
+async def _run_once(
+    url: str,
+    out_dir: str,
+    job_id: str,
+    timeout_seconds: int,
+    request_id: str,
+    attempt: int,
+) -> dict | None:
+    """One worker run. Returns None on a wall-clock stall so the caller can retry."""
     in_path = os.path.join(out_dir, f"{job_id}_tt_in.json")
     out_path = os.path.join(out_dir, f"{job_id}_tt_out.json")
 
@@ -64,15 +103,15 @@ async def run_tiktok_in_subprocess(
             await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             logger.warning(
-                f"[TIKTOK] job={job_id} wall-clock timeout ({timeout_seconds}s) - "
-                f"killing process group"
+                f"[TIKTOK] job={job_id} attempt {attempt} wall-clock timeout "
+                f"({timeout_seconds}s) - killing process group"
             )
             _kill_group(proc, job_id)
-            return {
-                "ok": False,
-                "kind": "unknown",
-                "error": "This conversion is taking too long. Please try again.",
-            }
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            return None
 
         if not os.path.exists(out_path):
             # Worker died without writing a result - OOM killer, segfault,
