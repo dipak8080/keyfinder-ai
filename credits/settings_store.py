@@ -141,7 +141,7 @@ KNOWN_KEYS: dict[str, dict] = {
 
 _TOOLS = (
     "separate-hq", "stems-hq", "youtube/separate-hq", "youtube/stems-hq",
-    "transcribe", "audio-to-midi-hq", "audio-to-midi-hq-mix", "audio-to-sheet",
+    "audio-to-midi-hq", "audio-to-midi-hq-mix", "audio-to-sheet",
 )
 _TOOL_FIELDS = (
     ("ENABLED", "bool"), ("CREDITS", "int"), ("FREE_UNDER_SECONDS", "float"),

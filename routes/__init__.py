@@ -31,9 +31,6 @@ Target structure:
       midi.py                   # /audio-to-midi
       midi_hq.py                 # /audio-to-midi-hq
       sheet_music.py              # /audio-to-sheet
-      transcribe.py                # /speech-to-text
-      video_transcribe.py           # /video-to-text
-      youtube_transcribe.py          # /youtube/transcribe
       media.py                        # /analyze, /video-to-audio, /join, /silence-split, /loudnorm, /trim
       admin.py                         # /admin/*, /limits, /health, /
 
@@ -165,12 +162,9 @@ from .audio_tools import router as _audio_tools_router
 from .midi import router as _midi_router
 from .midi_hq import router as _midi_hq_router
 from .sheet_music import router as _sheet_music_router
-from .transcribe import router as _transcribe_router
 from .media import router as _media_router
 from .admin import router as _admin_router
 from .cancel import router as _cancel_router
-from . import youtube_transcribe
-from . import video_transcribe
 
 router = APIRouter()
 
@@ -186,9 +180,6 @@ router.include_router(_audio_tools_router)
 router.include_router(_midi_router)
 router.include_router(_midi_hq_router)
 router.include_router(_sheet_music_router)
-router.include_router(_transcribe_router)
 router.include_router(_media_router)
 router.include_router(_admin_router)
 router.include_router(_cancel_router)
-router.include_router(youtube_transcribe.router)
-router.include_router(video_transcribe.router)

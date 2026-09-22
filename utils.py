@@ -45,7 +45,6 @@ from config import (
     MAX_CONCURRENT_DOWNLOADS,
     MAX_CONCURRENT_SEPARATIONS,
     MAX_CONCURRENT_AUDIO_TOOLS,
-    MAX_CONCURRENT_TRANSCRIPTIONS,
     MAX_CONCURRENT_MIDI,
     MAX_CONCURRENT_MIDI_HQ,
     QUEUE_WAIT_TIMEOUT_SECONDS,
@@ -241,7 +240,7 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 # above (that's about not freezing the event loop; this is about not
 # loading many audio files into RAM simultaneously).
 #
-# All seven of the app's concurrency pools are declared here, together:
+# All six of the app's concurrency pools are declared here, together:
 #   _analysis_semaphore       - /analyze, and the analyze half of
 #                                /youtube/analyze
 #   _download_semaphore       - /download, and the download half of every
@@ -257,14 +256,10 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 #                                silence-remove, loudnorm, fade, channels,
 #                                resample, ringtone, video-to-audio, join,
 #                                silence-split) (moved here, same as above)
-#   _transcription_semaphore  - Whisper /speech-to-text, on its own pool
-#                                so a slow transcription can't starve
-#                                cheap ffmpeg tools of their slots (moved
-#                                here, same as above)
 #   _midi_semaphore           - /audio-to-midi's HTTP call to the
-#                                midi-worker sidecar, on its own pool for
-#                                the same reason as transcription (moved
-#                                here, same as above)
+#                                midi-worker sidecar, on its own pool so a
+#                                slow job can't starve the ffmpeg tools
+#                                (moved here, same as above)
 #   _midi_hq_semaphore        - /audio-to-midi-hq's call to the RunPod
 #                                MT3 worker (added 2026-08-28)
 #
@@ -280,14 +275,13 @@ def build_safe_upload_path(directory: str, job_id: str, filename: str, suffix: s
 # MAX_CONCURRENT_SEPARATIONS documents at length after that exact bug).
 #
 # Sharing one semaphore would mean a busy midi-worker could block a paid
-# HQ job that never touches it, and vice versa - one free user's
-# transcription delaying someone who paid, for no resource reason at
-# all. Two pools, two constants, two numbers that move independently.
+# HQ job that never touches it, and vice versa - a free user's job
+# delaying someone who paid, for no resource reason at all. Two pools,
+# two constants, two numbers that move independently.
 _analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSIS)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _separation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SEPARATIONS)
 _audio_tools_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO_TOOLS)
-_transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
 _midi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI)
 _midi_hq_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MIDI_HQ)
 

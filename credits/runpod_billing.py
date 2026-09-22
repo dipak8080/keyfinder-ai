@@ -24,7 +24,6 @@ IDLE_TOOL = "idle-or-unlogged"
 
 _ENDPOINT_ENV = {
     "RUNPOD_DEMUCS_ENDPOINT_ID": "separation",
-    "RUNPOD_WHISPER_ENDPOINT_ID": "transcription",
     "RUNPOD_MT3_ENDPOINT_ID": "mt3",
     "RUNPOD_PIANO_ENDPOINT_ID": "piano",
 }
@@ -45,8 +44,6 @@ def _groups_by_endpoint() -> dict[str, str]:
 def serves(group: str, tool: str) -> bool:
     if group == "separation":
         return tool.startswith(("separate", "stems", "youtube/")) or tool == "audio-to-midi-hq-mix"
-    if group == "transcription":
-        return tool == "transcribe"
     if group in ("mt3", "piano"):
         return tool.startswith("audio-to-midi-hq") or tool == "audio-to-sheet"
     return False

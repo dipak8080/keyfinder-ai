@@ -169,7 +169,6 @@ from config import (
     NOISE_PATH_MARKERS,
     MAX_UPLOAD_BYTES,
     MAX_VIDEO_UPLOAD_BYTES,
-    MAX_VIDEO_TRANSCRIBE_BYTES,
     JOIN_MAX_FILES,
     JOIN_MAX_TOTAL_BYTES,
     ALLOWED_AUDIO_INPUT_FORMATS,
@@ -186,10 +185,6 @@ from config import (
     YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_STEMS_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
-    AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-    VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-    YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-    MAX_TRANSCRIPTION_DURATION_SECONDS,
     MIDI_RATE_LIMIT_MAX_REQUESTS,
     MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
     MIDI_HQ_ENABLED,
@@ -218,9 +213,6 @@ from config import (
     YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_STEMS_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
-    AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
-    VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
-    YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
     MIDI_RATE_LIMIT_WINDOW_SECONDS,
     MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
@@ -233,7 +225,6 @@ from config import (
     # in limits() for the wrong-claim incident that prompted it.
     SEPARATION_JOB_TTL_SECONDS,
     AUDIO_TOOL_JOB_TTL_SECONDS,
-    TRANSCRIPTION_JOB_TTL_SECONDS,
     # Durations and the two format sets the audio list does not cover
     # (added 2026-08-30). See the `durations` block in limits() for why
     # ~18 pages stating no length limit at all was the more urgent half
@@ -953,14 +944,6 @@ def limits():
         "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         "max_video_upload_bytes": MAX_VIDEO_UPLOAD_BYTES,
         "max_video_upload_mb": MAX_VIDEO_UPLOAD_BYTES // (1024 * 1024),
-        # /video-to-text has its OWN byte cap, lower than /video-to-audio's
-        # 200MB. config.py's reasoning: a 200MB video is almost certainly
-        # longer than the transcription duration cap, so accepting the
-        # upload only to reject it on duration wastes the entire transfer.
-        # The frontend needs the number that will actually be enforced on
-        # the route being used, not the larger one for a different tool.
-        "max_video_transcribe_bytes": MAX_VIDEO_TRANSCRIBE_BYTES,
-        "max_video_transcribe_mb": MAX_VIDEO_TRANSCRIBE_BYTES // (1024 * 1024),
         "join": {
             "max_files": JOIN_MAX_FILES,
             "max_total_bytes": JOIN_MAX_TOTAL_BYTES,
@@ -976,7 +959,7 @@ def limits():
         # /stems came to omit AIFF while the tool accepted it.
         #
         # Video is deliberately its own set rather than folded into the
-        # audio one: /video-to-audio and /video-to-text accept these, no
+        # audio one: /video-to-audio accepts these, no
         # other endpoint should, and no endpoint anywhere outputs one.
         # Merging them would make every audio tool advertise mp4.
         "allowed_video_formats": sorted(ALLOWED_VIDEO_INPUT_FORMATS),
@@ -1119,12 +1102,6 @@ def limits():
                 "output_seconds": AUDIO_TOOL_JOB_TTL_SECONDS,
                 "output_kind": "file",
             },
-            "transcription": {
-                "input_deleted_when": "job_end",
-                "input_seconds": None,
-                "output_seconds": TRANSCRIPTION_JOB_TTL_SECONDS,
-                "output_kind": "text",
-            },
             # FOURTH SHAPE (added 2026-08-30), and the one that does not
             # fit the input/output pair above - deliberately given its
             # own fields rather than forced into that mould.
@@ -1178,13 +1155,6 @@ def limits():
             "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_MAX_REQUESTS,
             "youtube_stems": _shared_sep["hourly_max"],
             "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
-            # ADDED 2026-08-27, now that all three transcription routes
-            # are metered. They share one credits rule and one GPU
-            # endpoint but have SEPARATE per-IP rate-limit buckets, since
-            # rate_limit.py keys on (ip, path) - so three keys, not one.
-            "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-            "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-            "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
             # ADDED 2026-08-28. Both MIDI tools, because they are two
             # products rather than two qualities of one - see
             # credits/config.py's rule note. The frontend needs both
@@ -1243,9 +1213,6 @@ def limits():
                 "youtube_separate_hq": YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
                 "youtube_stems": _shared_sep["hourly_window"],
                 "youtube_stems_hq": YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
-                "speech_to_text": AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
-                "video_to_text": VIDEO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
-                "youtube_transcribe": YOUTUBE_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_midi": MIDI_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_midi_hq": MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
                 "audio_to_sheet": SHEET_MUSIC_RATE_LIMIT_WINDOW_SECONDS,
@@ -1290,17 +1257,6 @@ def limits():
             # endpoint: the backend knows, so the frontend should read
             # rather than repeat.
             "separation_hq_max_duration_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
-            # ADDED 2026-08-27, same argument one tool over. All three
-            # transcription routes enforce this cap and reject past it
-            # with a 400 - after the upload has already been sent, which
-            # for a 100MB video is a genuinely expensive way to learn a
-            # limit. The frontend can now check duration client-side
-            # (HTMLMediaElement.duration) and say so before the transfer.
-            #
-            # Applies to EVERY caller, free or paid - it is a hard
-            # rejection line, not a tier. The tiering is entirely in the
-            # credits: 2 free ops a month, then 1 credit per job.
-            "transcription_max_duration_seconds": MAX_TRANSCRIPTION_DURATION_SECONDS,
             # ADDED 2026-08-28. midi_hq_enabled mirrors
             # separation_hq_enabled exactly: a kill switch the frontend
             # reads so it can hide the HQ option rather than letting

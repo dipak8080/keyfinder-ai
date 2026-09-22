@@ -225,8 +225,6 @@ def _free_route_limits() -> dict:
             YOUTUBE_SEPARATE_HQ_RATE_LIMIT_WINDOW_SECONDS,
             YOUTUBE_STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
             YOUTUBE_STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
-            AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS,
-            AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS,
             MIDI_HQ_RATE_LIMIT_MAX_REQUESTS,
             MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
         )
@@ -250,16 +248,6 @@ def _free_route_limits() -> dict:
         # a UI that lies, and this one lied specifically to the people
         # who had paid.
         #
-        # "transcribe" is ONE key for three routes - /speech-to-text,
-        # /youtube/transcribe and /video-to-text - because they share one
-        # credits rule, one RunPod endpoint and one semaphore. But
-        # rate_limit.py keys its window on (ip, path), so those three
-        # have SEPARATE per-IP buckets at the same number. The value
-        # below is /speech-to-text's; all three are 2/hour today, and if
-        # they ever diverge this line reports whichever one it names
-        # rather than being wrong about all of them. The per-route
-        # numbers stay available in /limits.
-        "transcribe": (AUDIO_TRANSCRIBE_RATE_LIMIT_MAX_REQUESTS, AUDIO_TRANSCRIBE_RATE_LIMIT_WINDOW_SECONDS),
         "audio-to-midi-hq": (MIDI_HQ_RATE_LIMIT_MAX_REQUESTS, MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS),
     }
 

@@ -197,7 +197,6 @@ from config import (
     logger,
     MAX_UPLOAD_BYTES,
     MAX_QUEUED_SEPARATIONS,
-    MAX_QUEUED_TRANSCRIPTIONS,
     MAX_QUEUED_AUDIO_TOOLS,
     MAX_QUEUED_MIDI_HQ,
     MAX_QUEUED_MIDI,
@@ -224,7 +223,6 @@ from jobs import (
     get_job,
     count_processing,
     SEPARATION_JOB_TYPES,
-    TRANSCRIPTION_JOB_TYPES,
     MIDI_HQ_JOB_TYPES,
     MIDI_JOB_TYPES,
 )
@@ -745,54 +743,6 @@ def _reject_if_separation_queue_full():
             503,
             "The separation queue is full right now - each job takes several "
             "minutes and only one runs at a time. Please try again in a few minutes.",
-        )
-
-
-def _reject_if_transcription_queue_full():
-    """
-    The bounded queue for all three transcription routes.
-
-    IMPORTED BY routes/transcribe.py, routes/youtube_transcribe.py AND
-    routes/video_transcribe.py. Same deletion hazard as the separation
-    guard above.
-
-    Same mechanism and same reasoning as
-    _reject_if_separation_queue_full() above - see that docstring for the
-    full argument. Two things differ and both matter:
-
-    COUNTS ALL THREE ENDPOINTS TOGETHER. /speech-to-text,
-    /youtube/transcribe and /video-to-text share a single semaphore, so
-    counting one in isolation would let the others fill the queue
-    unnoticed. A user uploading a file genuinely is behind everyone who
-    pasted a YouTube link, and the guard has to reflect that.
-
-    It is the same argument that made all three share ONE credits rule
-    key ("transcribe") rather than three: one resource, one bucket. A
-    caller who got three independent budgets for one GPU endpoint would
-    be exactly the drift config.py already complains about in its note
-    on the per-path separation limits.
-
-    THE RATE LIMITER DOES NOT ALREADY COVER THIS. That limit is per-IP;
-    this is a whole-server capacity bound. Ten visitors each submitting
-    their permitted two requests is twenty queued jobs and zero rate-limit
-    violations - which is exactly the case that makes the site look broken
-    while every individual limit is being respected.
-
-    503, not 429, for the same reason as separation: this is the server
-    being at capacity, not the caller misbehaving, and the two mean
-    different things to a client deciding whether to retry.
-    """
-    depth = count_processing(TRANSCRIPTION_JOB_TYPES)
-    if depth >= MAX_QUEUED_TRANSCRIPTIONS:
-        logger.warning(
-            f"[TRANSCRIPTION] Rejected submission - queue full "
-            f"({depth}/{MAX_QUEUED_TRANSCRIPTIONS} jobs in flight)"
-        )
-        raise HTTPException(
-            503,
-            "The transcription queue is full right now - only one file is "
-            "processed at a time and each takes several minutes. Please try "
-            "again shortly.",
         )
 
 

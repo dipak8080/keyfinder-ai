@@ -68,30 +68,6 @@ bgutil-ytdlp-pot-provider==2.0.0
 # (separate, stems, MIDI stems, piano isolation) runs on the RunPod GPU
 # worker via separation.py; nothing on the VPS imported them.
 
-# ---------- SPEECH TO TEXT (faster-whisper) ----------
-# Pinned like everything else in this file. Two reasons beyond general
-# reproducibility:
-#
-#   1. speech_to_text.py reads faster_whisper.tokenizer's PRIVATE
-#      _LANGUAGE_CODES to build the language list served by
-#      GET /speech-to-text/languages. That import is wrapped in a
-#      try/except so an upstream rename degrades gracefully rather than
-#      breaking the module - but it degrades to a hardcoded 35-code
-#      subset, silently dropping ~64 languages from the UI. Pinning is
-#      what stops that happening on an unrelated deploy.
-#
-#   2. The deploy workflow runs `docker builder prune -af` before every
-#      build, so there is no layer cache and pip re-resolves from
-#      scratch each time. Unpinned, two deploys of byte-identical source
-#      could produce materially different images.
-faster-whisper==1.2.1
-
-# The inference engine underneath faster-whisper, and where int8
-# quantization actually happens. Pinned explicitly rather than left
-# transitive because it versions independently of faster-whisper, and a
-# mismatch surfaces as a model-load failure at container STARTUP - not a
-# dependency-resolution error at build time, where it would be obvious.
-ctranslate2==4.8.1
 
 # Required for vad_filter=True. Arrives transitively today, but pinning
 # makes VAD a declared dependency rather than a lucky one. If this ever

@@ -13,7 +13,7 @@ FOUR JOB SHAPES, ONE TABLE:
 - Stems-shaped ("stems", "silence_split", "youtube_stems"): a {name: path}
   dict, so the entry count is not baked into the schema.
 - Audio-tool jobs: a single output_path.
-- Data jobs ("transcribe", "youtube_analyze"): inline result_data, no file.
+- Data jobs ("youtube_analyze"): inline result_data, no file.
 
 EXPIRY IS NOT REDIS TTL. Each key carries a long safety TTL only.
 cleanup_expired_jobs() is still the real sweep, because output files must be
@@ -46,7 +46,6 @@ _LONG_TTL_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems
 
 SEPARATION_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
 
-TRANSCRIPTION_JOB_TYPES = ("transcribe", "youtube_transcribe", "video_transcribe")
 
 MIDI_HQ_JOB_TYPES = ("audio_to_midi_hq",)
 
