@@ -30,6 +30,7 @@ from fastapi import Depends, HTTPException, Request, Response
 
 from . import ledger as ledger_mod
 from . import metering as metering_mod
+from . import turnstile as turnstile_mod
 from .config import get_settings
 from .identity import Identity, resolve_identity
 from .ledger import Charge, InsufficientCredits
@@ -219,6 +220,21 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
                     status_code=503,
                     detail="Free runs of this tool are paused for the rest of today to keep the servers funded. They come back at midnight UTC. Credits keep working right now.",
                 )
+
+    # Turnstile: free and unmetered runs past the daily threshold need a
+    # solved challenge for this IP. Credit-paid runs never see it.
+    if charge.charge_type != "credit" and await asyncio.to_thread(turnstile_mod.needs_challenge, identity.ip_hash):
+        try:
+            await asyncio.to_thread(ledger_mod.refund_job, job_id, reason="turnstile_required")
+        except Exception:
+            log.error("refund failed for job %s", job_id, exc_info=True)
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "error": "turnstile_required",
+                "message": "Quick check that you're human, then this runs.",
+            },
+        )
 
     try:
         yield charge

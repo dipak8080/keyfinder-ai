@@ -74,6 +74,7 @@ LOCKED_KEYS = frozenset({
     "PAYMENTS_WEBHOOK_SECRET",
     "PAYMENTS_API_KEY",
     "RESEND_API_KEY",
+    "TURNSTILE_SECRET_KEY",
     "SMTP_USER",
     "SMTP_PASSWORD",
     # NOT a secret, but auth.py builds RedirectResponse from it on the
@@ -110,6 +111,9 @@ KNOWN_KEYS: dict[str, dict] = {
     "CREDIT_HOLD_TIMEOUT_MINUTES": {"type": "int", "group": "paywall"},
     "RUNPOD_USD_PER_GPU_SECOND": {"type": "float", "group": "metering"},
     "FREE_GPU_DAILY_BUDGET_USD": {"type": "float", "group": "gpu budget", "min": 0, "max": 1000},
+    "TURNSTILE_FREE_RUNS_BEFORE_CHALLENGE": {"type": "int", "group": "abuse", "min": 0, "max": 100},
+    "TURNSTILE_PASS_HOURS": {"type": "int", "group": "abuse", "min": 1, "max": 168},
+    "MONTHLY_FIXED_COST_USD": {"type": "float", "group": "reporting", "min": 0, "max": 10000},
     "MAGIC_LINK_TTL_MINUTES": {"type": "int", "group": "auth"},
     "DEVICE_LINK_TTL_MINUTES": {"type": "int", "group": "auth"},
     "SESSION_TTL_DAYS": {"type": "int", "group": "auth"},

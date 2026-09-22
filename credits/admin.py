@@ -43,7 +43,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import ledger, metering, runpod_billing, settings_store
+from . import ledger, metering, runpod_billing, settings_store, turnstile
 from .config import get_settings, reload_settings
 from .db import connect, healthcheck, now_iso, tx
 
@@ -678,6 +678,143 @@ def _test_emails() -> list[str]:
     while building the flow."""
     raw = os.getenv("CREDITS_TEST_EMAILS", "")
     return sorted({e.strip().lower() for e in raw.split(",") if e.strip()})
+
+
+@router.get("/abuse", dependencies=ADMIN)
+def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
+    """Is free GPU spend spread across many people or farmed by a few?
+
+    IP hashes only; raw addresses are never stored. `share_top10` is the
+    fraction of non-credit runs made by the ten heaviest hashes. Above
+    ~0.5 means a handful of people are eating the free tier."""
+    window = f"-{days} days"
+    settings = get_settings()
+    with connect() as conn:
+        totals = conn.execute(
+            """SELECT COUNT(*) AS runs, COUNT(DISTINCT ip_hash) AS ips,
+                      COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
+               FROM gpu_job_metrics
+               WHERE charge_type != 'credit'
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+            (window,),
+        ).fetchone()
+        top = conn.execute(
+            """SELECT ip_hash, COUNT(*) AS runs,
+                      COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd,
+                      COUNT(DISTINCT substr(created_at, 1, 10)) AS active_days,
+                      GROUP_CONCAT(DISTINCT tool) AS tools,
+                      MAX(created_at) AS last_at,
+                      SUM(CASE WHEN status IN ('failed','timeout','cancelled') THEN 1 ELSE 0 END) AS failed
+               FROM gpu_job_metrics
+               WHERE charge_type != 'credit'
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               GROUP BY ip_hash ORDER BY runs DESC LIMIT 20""",
+            (window,),
+        ).fetchall()
+        daily = conn.execute(
+            """SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS runs,
+                      COUNT(DISTINCT ip_hash) AS ips,
+                      COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
+               FROM gpu_job_metrics
+               WHERE charge_type != 'credit'
+                 AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               GROUP BY 1 ORDER BY 1 DESC""",
+            (window,),
+        ).fetchall()
+    runs = int(totals["runs"] or 0)
+    top10 = sum(int(r["runs"]) for r in top[:10])
+    return {
+        "days": days,
+        "runs": runs,
+        "ips": int(totals["ips"] or 0),
+        "est_cost_usd": round(float(totals["est_cost_usd"] or 0), 4),
+        "share_top10": round(top10 / runs, 3) if runs else 0.0,
+        "top": [dict(r) for r in top],
+        "daily": [dict(r) for r in daily],
+        "budget": {
+            "daily_usd": settings.free_gpu_daily_budget_usd,
+            "today": metering.free_gpu_spend_today(),
+        },
+        "limits": {
+            "free_runs_before_challenge": settings.turnstile_free_runs_before_challenge,
+            "daily_separation_cap": settings_store.resolve("SEPARATION_SHARED_DAILY_MAX_REQUESTS"),
+        },
+        "turnstile": turnstile.stats(days),
+    }
+
+
+@router.get("/monthly", dependencies=ADMIN)
+def monthly(months: int = Query(default=12, ge=1, le=36)) -> dict:
+    """Per calendar month: revenue, GPU cost, fixed cost, net. The yearly
+    report is this table summed. Costs are the metering floor, not the
+    RunPod invoice; fixed cost is MONTHLY_FIXED_COST_USD (the VPS)."""
+    excl = _test_emails()
+    excl_sql = f" AND LOWER(email) NOT IN ({','.join('?' * len(excl))})" if excl else ""
+    window = f"-{months} months"
+    with connect() as conn:
+        revenue = conn.execute(
+            """SELECT substr(created_at, 1, 7) AS month,
+                      COUNT(*) AS orders, COALESCE(SUM(amount_cents), 0) AS amount_cents,
+                      COALESCE(SUM(credits), 0) AS credits_sold
+               FROM orders
+               WHERE test_mode=0 AND status='paid'
+                 AND created_at >= strftime('%Y-%m-01T00:00:00Z','now',?)"""
+            + excl_sql
+            + " GROUP BY 1",
+            (window, *excl),
+        ).fetchall()
+        usage = conn.execute(
+            """SELECT substr(created_at, 1, 7) AS month,
+                      COUNT(*) AS jobs,
+                      SUM(CASE WHEN charge_type='credit' THEN 1 ELSE 0 END) AS paid_jobs,
+                      SUM(CASE WHEN charge_type='credit' THEN 0 ELSE 1 END) AS free_jobs,
+                      COALESCE(SUM(est_cost_usd), 0) AS gpu_cost_usd,
+                      COALESCE(SUM(CASE WHEN charge_type='credit' THEN 0 ELSE COALESCE(est_cost_usd,0) END), 0)
+                        AS free_gpu_cost_usd
+               FROM gpu_job_metrics
+               WHERE created_at >= strftime('%Y-%m-01T00:00:00Z','now',?)
+               GROUP BY 1""",
+            (window,),
+        ).fetchall()
+    fixed = get_settings().monthly_fixed_cost_usd
+    by_month: dict[str, dict] = {}
+    for r in revenue:
+        by_month.setdefault(r["month"], {})["revenue_usd"] = round(r["amount_cents"] / 100, 2)
+        by_month[r["month"]]["orders"] = r["orders"]
+        by_month[r["month"]]["credits_sold"] = r["credits_sold"]
+    for r in usage:
+        m = by_month.setdefault(r["month"], {})
+        m.update(jobs=r["jobs"], paid_jobs=r["paid_jobs"], free_jobs=r["free_jobs"],
+                 gpu_cost_usd=round(r["gpu_cost_usd"], 2), free_gpu_cost_usd=round(r["free_gpu_cost_usd"], 2))
+    rows = []
+    for month in sorted(by_month, reverse=True):
+        m = by_month[month]
+        rev = m.get("revenue_usd", 0.0)
+        gpu = m.get("gpu_cost_usd", 0.0)
+        rows.append({
+            "month": month,
+            "revenue_usd": rev,
+            "orders": m.get("orders", 0),
+            "credits_sold": m.get("credits_sold", 0),
+            "jobs": m.get("jobs", 0),
+            "paid_jobs": m.get("paid_jobs", 0),
+            "free_jobs": m.get("free_jobs", 0),
+            "gpu_cost_usd": gpu,
+            "free_gpu_cost_usd": m.get("free_gpu_cost_usd", 0.0),
+            "fixed_cost_usd": fixed,
+            "net_usd": round(rev - gpu - fixed, 2),
+        })
+    return {
+        "months": months,
+        "fixed_cost_usd": fixed,
+        "rows": rows,
+        "totals": {
+            "revenue_usd": round(sum(r["revenue_usd"] for r in rows), 2),
+            "gpu_cost_usd": round(sum(r["gpu_cost_usd"] for r in rows), 2),
+            "fixed_cost_usd": round(fixed * len(rows), 2),
+            "net_usd": round(sum(r["net_usd"] for r in rows), 2),
+        },
+    }
 
 
 @router.get("/sources", dependencies=ADMIN)

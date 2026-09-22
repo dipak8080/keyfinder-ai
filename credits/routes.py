@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field
 
-from . import claims, ledger, paywall
+from . import claims, ledger, paywall, turnstile
+from .identity import client_ip
 from .config import get_settings
 from .identity import Identity
 
@@ -83,6 +84,27 @@ def preview(
     decide anything.
     """
     return paywall.preview(identity, body.tool, body.input_seconds)
+
+
+class TurnstileRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=4096)
+
+
+@router.post("/turnstile/verify")
+async def turnstile_verify(
+    body: TurnstileRequest,
+    request: Request,
+    identity: Identity = Depends(paywall.get_identity),
+) -> dict:
+    """Solve once, then free GPU runs continue for TURNSTILE_PASS_HOURS."""
+    if not turnstile.enabled():
+        return {"ok": True, "passed": False, "reason": "disabled"}
+    ok = await turnstile.verify(body.token, client_ip(request) or None)
+    if not ok:
+        raise HTTPException(status_code=400, detail={"error": "turnstile_failed",
+                                                     "message": "That check didn't pass. Try again."})
+    turnstile.mark_passed(identity.ip_hash)
+    return {"ok": True, "passed": True}
 
 
 @router.post("/claim")

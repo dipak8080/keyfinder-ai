@@ -392,6 +392,10 @@ class Settings:
     runpod_usd_per_gpu_second: float
     # Daily ceiling for GPU spend by non-credit runs. 0 disables the switch.
     free_gpu_daily_budget_usd: float
+    turnstile_secret_key: str
+    turnstile_free_runs_before_challenge: int
+    turnstile_pass_hours: int
+    monthly_fixed_cost_usd: float
     admin_token: str
 
     def rule_for(self, tool: str) -> ToolRule | None:
@@ -566,6 +570,10 @@ def build_settings() -> Settings:
 
         runpod_usd_per_gpu_second=_float("RUNPOD_USD_PER_GPU_SECOND", 0.00019),
         free_gpu_daily_budget_usd=_float("FREE_GPU_DAILY_BUDGET_USD", 0.0),
+        turnstile_secret_key=os.getenv("TURNSTILE_SECRET_KEY", ""),
+        turnstile_free_runs_before_challenge=_int("TURNSTILE_FREE_RUNS_BEFORE_CHALLENGE", 3),
+        turnstile_pass_hours=_int("TURNSTILE_PASS_HOURS", 12),
+        monthly_fixed_cost_usd=_float("MONTHLY_FIXED_COST_USD", 18.0),
         admin_token=os.getenv("CREDITS_ADMIN_TOKEN", ""),
     )
 
