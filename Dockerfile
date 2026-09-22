@@ -53,29 +53,9 @@ RUN git clone --single-branch --branch 2.0.0 \
 
 WORKDIR /app
 
-# ---------- WHISPER MODEL ----------
-# Baked only when transcription runs locally. deploy.yml passes
-# BAKE_WHISPER_MODEL=0 when .env has TRANSCRIPTION_BACKEND=gpu, where the
-# local model is never loaded and baking it only cost ~480MB and build
-# time. Flip .env to local and redeploy to get it back.
-#
-# When baked, it MUST match the WHISPER_MODEL_SIZE / WHISPER_COMPUTE_TYPE
-# the container runs with: a missing model downloads at STARTUP, which
-# blows past the deploy health-check window. deploy.yml reads both from
-# .env so they can't drift.
-ARG WHISPER_MODEL_SIZE=small
-ARG WHISPER_COMPUTE_TYPE=int8
-ARG BAKE_WHISPER_MODEL=1
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
-    if [ "$BAKE_WHISPER_MODEL" = "1" ]; then \
-      echo "Baking Whisper model '${WHISPER_MODEL_SIZE}' (compute_type=${WHISPER_COMPUTE_TYPE})..." && \
-      python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL_SIZE}', device='cpu', compute_type='${WHISPER_COMPUTE_TYPE}')"; \
-    else \
-      echo "Skipping Whisper model bake (GPU transcription backend)."; \
-    fi && \
-    python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__, '- VAD filter available')"
+    python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__, '- VAD filter ready')"
 
 COPY . .
 
