@@ -76,11 +76,12 @@ bgutil-ytdlp-pot-provider==2.0.0
 # WARNING in the startup log. Declared here so that can't happen quietly.
 onnxruntime==1.29.0
 
-# huggingface_hub and tokenizers are deliberately left UNPINNED. They are
-# transitive dependencies of faster-whisper, which already constrains
-# them, and over-pinning transitives on a no-cache build is a reliable
-# way to produce a resolution conflict during some future, unrelated
-# dependency bump.
+# ---------- MAIL (credits/mailer.py -> Resend) ----------
+# Was an accidental transitive of faster-whisper via huggingface_hub;
+# removing Whisper silently removed it and broke sign-in emails (502 on
+# /auth/magic-link). Declared directly so that cannot happen again.
+# anyio, h11, certifi, idna are already pinned above; httpcore comes with it.
+httpx==0.28.1
 
 # ---------- AUDIO TO SHEET MUSIC (/audio-to-sheet) ----------
 # The sheet/ package's pipeline: transcription -> notation -> engrave.
