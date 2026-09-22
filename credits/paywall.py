@@ -29,6 +29,7 @@ from typing import AsyncIterator
 from fastapi import Depends, HTTPException, Request, Response
 
 from . import ledger as ledger_mod
+from . import metering as metering_mod
 from .config import get_settings
 from .identity import Identity, resolve_identity
 from .ledger import Charge, InsufficientCredits
@@ -196,6 +197,28 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
             input_seconds=input_seconds,
         )
         raise insufficient_credits_response(exc) from exc
+
+    # Daily GPU budget: free and unmetered runs stop when today's spend
+    # crosses the ceiling; credit-paid runs always pass. Checked after the
+    # charge so the same refund path returns whatever was taken.
+    if charge.charge_type != "credit":
+        budget = get_settings().free_gpu_daily_budget_usd
+        if budget > 0:
+            spend = await asyncio.to_thread(metering_mod.free_gpu_spend_today)
+            if spend["projected_usd"] >= budget:
+                try:
+                    await asyncio.to_thread(ledger_mod.refund_job, job_id, reason="gpu_budget_paused")
+                except Exception:
+                    log.error("refund failed for job %s", job_id, exc_info=True)
+                await _record_gate_event_async(
+                    identity, event="budget_paused", tool=tool,
+                    credits_needed=0, balance=0, free_remaining=0,
+                    input_seconds=input_seconds,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Free runs of this tool are paused for the rest of today to keep the servers funded. They come back at midnight UTC. Credits keep working right now.",
+                )
 
     try:
         yield charge

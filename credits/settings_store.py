@@ -109,6 +109,7 @@ KNOWN_KEYS: dict[str, dict] = {
     "FREE_MONTHLY_OPS_PER_IP": {"type": "int", "group": "free tier", "min": 1},
     "CREDIT_HOLD_TIMEOUT_MINUTES": {"type": "int", "group": "paywall"},
     "RUNPOD_USD_PER_GPU_SECOND": {"type": "float", "group": "metering"},
+    "FREE_GPU_DAILY_BUDGET_USD": {"type": "float", "group": "gpu budget", "min": 0, "max": 1000},
     "MAGIC_LINK_TTL_MINUTES": {"type": "int", "group": "auth"},
     "DEVICE_LINK_TTL_MINUTES": {"type": "int", "group": "auth"},
     "SESSION_TTL_DAYS": {"type": "int", "group": "auth"},

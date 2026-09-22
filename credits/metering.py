@@ -221,6 +221,36 @@ def gpu_seconds_from_runpod(payload: dict[str, Any] | None) -> tuple[float | Non
     )
 
 
+def free_gpu_spend_today() -> dict:
+    """GPU dollars spent today (UTC) by runs that were not paid with credits.
+
+    Finished jobs count their recorded est_cost_usd. Jobs still in flight
+    have no cost yet, so they are counted at today's average finished cost
+    - otherwise a burst of 20 simultaneous submits would all pass the
+    budget check with the meter still reading zero.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN status IN ('created','running') THEN 0
+                                        ELSE COALESCE(est_cost_usd, 0) END), 0) AS spent,
+                      SUM(CASE WHEN status IN ('created','running') THEN 0 ELSE 1 END) AS finished,
+                      SUM(CASE WHEN status IN ('created','running') THEN 1 ELSE 0 END) AS running
+               FROM gpu_job_metrics
+               WHERE charge_type != 'credit'
+                 AND created_at >= strftime('%Y-%m-%dT00:00:00', 'now')""",
+        ).fetchone()
+    spent = float(row["spent"] or 0.0)
+    finished = int(row["finished"] or 0)
+    running = int(row["running"] or 0)
+    avg = spent / finished if finished else 0.0
+    return {
+        "spent_usd": round(spent, 4),
+        "in_flight": running,
+        "projected_usd": round(spent + running * avg, 4),
+        "jobs": finished,
+    }
+
+
 def daily_costs(days: int = 30) -> list[dict]:
     """Per day, per tool: jobs, minutes in, GPU seconds out, dollars."""
     with connect() as conn:

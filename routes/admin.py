@@ -753,6 +753,7 @@ def _credits_snapshot() -> dict:
     try:
         from credits.config import get_settings as _credits_settings
         from credits.db import connect as _credits_connect
+        from credits.metering import free_gpu_spend_today as _free_gpu_spend_today
 
         settings = _credits_settings()
         with _credits_connect() as conn:
@@ -773,6 +774,8 @@ def _credits_snapshot() -> dict:
             "credits_outstanding": outstanding,
             "holds_open": held,
             "webhooks_unprocessed": stuck,
+            "free_gpu_budget_usd": settings.free_gpu_daily_budget_usd,
+            "free_gpu_spend_today": _free_gpu_spend_today(),
             "detail_at": "/admin/credits/overview",
         }
     except Exception as e:  # noqa: BLE001

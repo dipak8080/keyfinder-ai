@@ -390,6 +390,8 @@ class Settings:
 
     # metering
     runpod_usd_per_gpu_second: float
+    # Daily ceiling for GPU spend by non-credit runs. 0 disables the switch.
+    free_gpu_daily_budget_usd: float
     admin_token: str
 
     def rule_for(self, tool: str) -> ToolRule | None:
@@ -563,6 +565,7 @@ def build_settings() -> Settings:
         smtp_starttls=_bool("SMTP_STARTTLS", True),
 
         runpod_usd_per_gpu_second=_float("RUNPOD_USD_PER_GPU_SECOND", 0.00019),
+        free_gpu_daily_budget_usd=_float("FREE_GPU_DAILY_BUDGET_USD", 0.0),
         admin_token=os.getenv("CREDITS_ADMIN_TOKEN", ""),
     )
 
