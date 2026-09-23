@@ -157,6 +157,9 @@ def capture_order(body: CaptureRequest) -> dict:
     try:
         order = pp.capture_order(body.order_id)
     except pp.PayPalError as exc:
+        if exc.issue in pp.BUYER_SIDE_ISSUES:
+            log.info("paypal capture %s declined by buyer's funding source (%s)", body.order_id, exc.issue)
+            raise HTTPException(status_code=402, detail={"error": "instrument_declined"})
         log.error("paypal capture failed for %s: %s", body.order_id, exc)
         raise HTTPException(status_code=502, detail={"error": "capture_failed"})
 

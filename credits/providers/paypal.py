@@ -38,7 +38,20 @@ _token_cache: dict[str, tuple[str, float]] = {}
 
 
 class PayPalError(RuntimeError):
-    pass
+    def __init__(self, message: str, issue: str | None = None):
+        super().__init__(message)
+        self.issue = issue
+
+
+BUYER_SIDE_ISSUES = {"INSTRUMENT_DECLINED", "PAYER_ACTION_REQUIRED"}
+
+
+def _issue_of(resp) -> str | None:
+    try:
+        details = (resp.json() or {}).get("details") or []
+        return str(details[0].get("issue") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _env(name: str, default: str = "") -> str:
@@ -127,8 +140,10 @@ def _call(method: str, path: str, *, json_body=None, request_id: str | None = No
         method, f"{api_base()}{path}", headers=headers, json=json_body, timeout=_TIMEOUT
     )
     if resp.status_code >= 400:
-        log.error("paypal %s %s -> %s: %s", method, path, resp.status_code, resp.text[:800])
-        raise PayPalError(f"PayPal rejected the request ({resp.status_code}).")
+        issue = _issue_of(resp)
+        level = logging.WARNING if issue in BUYER_SIDE_ISSUES else logging.ERROR
+        log.log(level, "paypal %s %s -> %s: %s", method, path, resp.status_code, resp.text[:800])
+        raise PayPalError(f"PayPal rejected the request ({resp.status_code}).", issue=issue)
     if not resp.content:
         return {}
     return resp.json()
