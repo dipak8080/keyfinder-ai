@@ -1544,18 +1544,22 @@ async def youtube_separate_hq_route(
         ip_hash=identity.ip_hash,
     )
 
-    async with paywall.guard(
-        identity, job_id=job_id, tool="youtube/separate-hq", input_seconds=None
-    ) as charge:
-        spawn_background_task(_run_youtube_separation(
-            job_id, url,
-            stems=False,
-            model=SEPARATION_MODEL_HQ,
-            overlap=SEPARATION_OVERLAP_HQ,
-            timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
-            max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
-            hq=True,
-        ))
+    try:
+        async with paywall.guard(
+            identity, job_id=job_id, tool="youtube/separate-hq", input_seconds=None
+        ) as charge:
+            spawn_background_task(_run_youtube_separation(
+                job_id, url,
+                stems=False,
+                model=SEPARATION_MODEL_HQ,
+                overlap=SEPARATION_OVERLAP_HQ,
+                timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+                max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+                hq=True,
+            ))
+    except BaseException:
+        metering.record_job_rejected(job_id, "blocked_at_submit")
+        raise
 
     metering.record_job_created(
         job_id=job_id, tool="youtube/separate-hq",
@@ -1704,18 +1708,22 @@ async def youtube_stems_hq_route(
         ip_hash=identity.ip_hash,
     )
 
-    async with paywall.guard(
-        identity, job_id=job_id, tool="youtube/stems-hq", input_seconds=None
-    ) as charge:
-        spawn_background_task(_run_youtube_separation(
-            job_id, url,
-            stems=True,
-            model=SEPARATION_MODEL_HQ,
-            overlap=SEPARATION_OVERLAP_HQ,
-            timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
-            max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
-            hq=True,
-        ))
+    try:
+        async with paywall.guard(
+            identity, job_id=job_id, tool="youtube/stems-hq", input_seconds=None
+        ) as charge:
+            spawn_background_task(_run_youtube_separation(
+                job_id, url,
+                stems=True,
+                model=SEPARATION_MODEL_HQ,
+                overlap=SEPARATION_OVERLAP_HQ,
+                timeout_seconds=DEMUCS_TIMEOUT_SECONDS_HQ,
+                max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS_HQ,
+                hq=True,
+            ))
+    except BaseException:
+        metering.record_job_rejected(job_id, "blocked_at_submit")
+        raise
 
     metering.record_job_created(
         job_id=job_id, tool="youtube/stems-hq",

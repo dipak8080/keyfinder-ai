@@ -703,6 +703,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
                       COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
                FROM gpu_job_metrics
                WHERE COALESCE(charge_type, 'none') != 'credit'
+                 AND status != 'rejected'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
             (window,),
         ).fetchone()
@@ -715,6 +716,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
                       SUM(CASE WHEN status IN ('failed','timeout','cancelled') THEN 1 ELSE 0 END) AS failed
                FROM gpu_job_metrics
                WHERE COALESCE(charge_type, 'none') != 'credit'
+                 AND status != 'rejected'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                GROUP BY ip_hash ORDER BY runs DESC LIMIT 20""",
             (window,),
@@ -725,6 +727,7 @@ def abuse(days: int = Query(default=7, ge=1, le=90)) -> dict:
                       COALESCE(SUM(est_cost_usd), 0) AS est_cost_usd
                FROM gpu_job_metrics
                WHERE COALESCE(charge_type, 'none') != 'credit'
+                 AND status != 'rejected'
                  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                GROUP BY 1 ORDER BY 1 DESC""",
             (window,),
@@ -780,7 +783,8 @@ def monthly(months: int = Query(default=12, ge=1, le=36)) -> dict:
                       COALESCE(SUM(CASE WHEN charge_type='credit' THEN 0 ELSE COALESCE(est_cost_usd,0) END), 0)
                         AS free_gpu_cost_usd
                FROM gpu_job_metrics
-               WHERE created_at >= strftime('%Y-%m-01T00:00:00Z','now',?)
+               WHERE status != 'rejected'
+                 AND created_at >= strftime('%Y-%m-01T00:00:00Z','now',?)
                GROUP BY 1""",
             (window,),
         ).fetchall()

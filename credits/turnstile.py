@@ -27,6 +27,7 @@ def runs_today(ip_hash: str) -> int:
         row = conn.execute(
             """SELECT COUNT(*) AS n FROM gpu_job_metrics
                WHERE ip_hash=? AND COALESCE(charge_type, 'none') != 'credit'
+                 AND status != 'rejected'
                  AND created_at >= strftime('%Y-%m-%dT00:00:00', 'now')""",
             (ip_hash,),
         ).fetchone()

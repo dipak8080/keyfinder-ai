@@ -231,6 +231,7 @@ async def _queue_separation(
         except SeparationError as e:
             cleanup_file(file_path)
             mark_failed(job_id, str(e))
+            metering.record_job_rejected(job_id, "unreadable_audio")
             raise HTTPException(400, {"kind": "unreadable_audio", "message": str(e)})
 
         if duration > max_duration_seconds:
@@ -241,6 +242,7 @@ async def _queue_separation(
             )
             cleanup_file(file_path)
             mark_failed(job_id, message)
+            metering.record_job_rejected(job_id, "hq_duration_exceeded")
             # Structured, not a bare string: the frontend's ApiError.kind
             # carries an explicit "branch on this, never on message"
             # contract, and this rejection has to be told apart from
@@ -312,10 +314,14 @@ async def _queue_separation(
         # credit is returned before the exception leaves the block. A 402
         # is raised before the body runs when the caller can't pay, and
         # its detail carries the pack list the frontend modal renders.
-        async with paywall.guard(
-            identity, job_id=job_id, tool=rule_key, input_seconds=duration
-        ) as charge:
-            _spawn()
+        try:
+            async with paywall.guard(
+                identity, job_id=job_id, tool=rule_key, input_seconds=duration
+            ) as charge:
+                _spawn()
+        except BaseException:
+            metering.record_job_rejected(job_id, "blocked_at_submit")
+            raise
         billing = {
             "charged": charge.charge_type,
             "credits": charge.credits,

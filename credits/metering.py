@@ -46,7 +46,7 @@ from .db import connect, now_iso, tx
 
 log = logging.getLogger("credits.metering")
 
-TERMINAL = ("completed", "failed", "cancelled", "timeout")
+TERMINAL = ("completed", "failed", "cancelled", "timeout", "rejected")
 
 
 def record_job_created(
@@ -86,6 +86,14 @@ def record_job_created(
             )
     except Exception:  # noqa: BLE001
         log.exception("failed to open metrics row for %s", job_id)
+
+
+def record_job_rejected(job_id: str, reason: str) -> None:
+    """Close a metrics row for a submit that was refused before any GPU
+    work existed (402, over-length 400, budget 503, turnstile 428).
+    A 'rejected' row costs nothing and is excluded from spend
+    projection and Turnstile run counts."""
+    record_job_finished(job_id, status="rejected", error=reason, client_side=True)
 
 
 def record_input_duration(job_id: str, input_seconds: float | None) -> None:
@@ -237,6 +245,7 @@ def free_gpu_spend_today() -> dict:
                       SUM(CASE WHEN status IN ('created','running') THEN 1 ELSE 0 END) AS running
                FROM gpu_job_metrics
                WHERE COALESCE(charge_type, 'none') != 'credit'
+                 AND status != 'rejected'
                  AND created_at >= strftime('%Y-%m-%dT00:00:00', 'now')""",
         ).fetchone()
     spent = float(row["spent"] or 0.0)
