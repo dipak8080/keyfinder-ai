@@ -1,5 +1,5 @@
 """
-speech_vad.py - Silero VAD (v6, bundled with faster-whisper, run on
+speech_vad.py - Silero VAD (v6, vendored in silero_vad_onnx.py, run on
 onnxruntime) for the "speech" mode of /silence-remove and
 /silence-split. Answers "is someone speaking" instead of "is it quiet",
 so music beds, applause and room tone count as gaps and breaths inside
@@ -41,7 +41,7 @@ def _decode_mono_16k(input_path: str) -> np.ndarray:
 def speech_spans(input_path: str, min_silence_seconds: float) -> List[Tuple[float, float]]:
     """(start, end) seconds of every speech region, padded by SPEECH_PAD_MS.
     Pauses shorter than min_silence_seconds stay inside a region."""
-    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    from silero_vad_onnx import VadOptions, get_speech_timestamps
 
     audio = _decode_mono_16k(input_path)
     options = VadOptions(
