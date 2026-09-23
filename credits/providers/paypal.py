@@ -220,10 +220,12 @@ def event_from_order(order: dict):
     if not email:
         raise WebhookUnprocessable(f"capture {capture_id} carries no buyer email")
 
-    return _build_event(capture_id, pack_key, email, capture.get("amount") or unit.get("amount"), order)
+    return _build_event(capture_id, pack_key, email, capture.get("amount") or unit.get("amount"), order,
+                        order_ref=str(order.get("id") or ""))
 
 
-def _build_event(capture_id: str, pack_key: str, email: str, amount: dict | None, raw: dict):
+def _build_event(capture_id: str, pack_key: str, email: str, amount: dict | None, raw: dict,
+                 order_ref: str = ""):
     from . import PaymentEvent, WebhookUnprocessable
 
     settings = get_settings()
@@ -267,6 +269,7 @@ def _build_event(capture_id: str, pack_key: str, email: str, amount: dict | None
         amount_usd=paid,
         currency=str(amount.get("currency_code") or currency()),
         delivery_id=capture_id,
+        order_ref=order_ref,
         raw=raw,
     )
 
@@ -334,4 +337,6 @@ def to_event(payload: dict):
     if not email:
         raise WebhookUnprocessable(f"capture {capture_id} carries no buyer email")
 
-    return _build_event(capture_id, pack_key, email, resource.get("amount"), payload)
+    related = (resource.get("supplementary_data") or {}).get("related_ids") or {}
+    return _build_event(capture_id, pack_key, email, resource.get("amount"), payload,
+                        order_ref=str(related.get("order_id") or ""))

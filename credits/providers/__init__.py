@@ -76,6 +76,10 @@ class PaymentEvent:
     # webhook_events replay log, so a retried delivery is visible as a
     # retry rather than silently collapsing into the payment row.
     delivery_id: str
+    # The provider's checkout/order id when it differs from the payment
+    # id. PayPal: the order id that order_sources is keyed by, while
+    # provider_txid is the capture id. Empty for single-id providers.
+    order_ref: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 

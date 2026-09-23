@@ -842,7 +842,7 @@ def order_sources(days: int = Query(default=90, ge=1, le=365)) -> dict:
                       COALESCE(SUM(o.credits), 0) AS credits,
                       MAX(o.created_at) AS last_at
                FROM orders o
-               LEFT JOIN order_sources os ON os.provider_order_id=o.provider_order_id
+               LEFT JOIN order_sources os ON os.provider_order_id IN (o.provider_ref, o.provider_order_id)
                WHERE o.test_mode=0 AND o.status='paid'
                  AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
             + excl_sql
@@ -916,7 +916,7 @@ def orders(
                         AS balance
                FROM orders o
                LEFT JOIN accounts a ON a.id=o.account_id
-               LEFT JOIN order_sources os ON os.provider_order_id=o.provider_order_id
+               LEFT JOIN order_sources os ON os.provider_order_id IN (o.provider_ref, o.provider_order_id)
                WHERE o.test_mode=0 AND o.status='paid'
                  AND o.created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now',?)"""
             + excl_sql.format(col="o.email")

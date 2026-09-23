@@ -54,7 +54,7 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
                status, test_mode, created_at, raw)
                VALUES (?,?,?,?,?,?,?,?,?,?,?, 'paid', ?, ?, ?)""",
             (new_id("ord_"), event.provider, event.provider_txid,
-             str(event.raw.get("url") or ""), account_id, subject_id, event.email,
+             event.order_ref or str(event.raw.get("url") or ""), account_id, subject_id, event.email,
              ",".join(event.pack_keys), event.credits, round(event.amount_usd * 100),
              event.currency, 1 if get_settings().provider_test_mode else 0,
              now_iso(), json.dumps(event.raw)[:20000]),
