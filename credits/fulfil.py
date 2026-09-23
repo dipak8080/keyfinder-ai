@@ -35,8 +35,24 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
     with connect() as conn, tx(conn):
         account_id = get_or_create_account(conn, event.email)
 
+        # Which browser gets linked. order_sources.subject_id is written
+        # server-side when THIS order was created, from the creator's own
+        # signed cookie - it cannot be planted for someone else's order.
+        # The email-keyed claim can (anyone may record a claim for any
+        # email), so for orders that carry an order_ref the claim is only
+        # consumed, never trusted. Claim-only linking remains for Ko-fi,
+        # whose webhook has nothing better than the email.
+        subject_id = None
+        if event.order_ref:
+            src = conn.execute(
+                "SELECT subject_id FROM order_sources WHERE provider=? AND provider_order_id=?",
+                (event.provider, event.order_ref),
+            ).fetchone()
+            subject_id = src["subject_id"] if src else None
+
         claim = claims.take_claim(conn, event.email)
-        subject_id = claim["subject_id"] if claim else None
+        if subject_id is None and not event.order_ref:
+            subject_id = claim["subject_id"] if claim else None
         if subject_id:
             exists = conn.execute("SELECT id FROM subjects WHERE id=?", (subject_id,)).fetchone()
             if exists is None:
