@@ -23,8 +23,12 @@ from __future__ import annotations
 
 import logging
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field
+
+from rate_limit import check_rate_limit
 
 from . import claims, ledger, paywall, turnstile
 from .identity import client_ip
@@ -90,7 +94,13 @@ class TurnstileRequest(BaseModel):
     token: str = Field(..., min_length=10, max_length=4096)
 
 
-@router.post("/turnstile/verify")
+def _turnstile_verify_limit(request: Request) -> None:
+    # Closed over, not partial() - same reasoning as paypal_routes.py:
+    # a partial would expose max_requests as a query parameter.
+    check_rate_limit(request, max_requests=20, window_seconds=3600)
+
+
+@router.post("/turnstile/verify", dependencies=[Depends(_turnstile_verify_limit)])
 async def turnstile_verify(
     body: TurnstileRequest,
     request: Request,
@@ -103,7 +113,7 @@ async def turnstile_verify(
     if not ok:
         raise HTTPException(status_code=400, detail={"error": "turnstile_failed",
                                                      "message": "That check didn't pass. Try again."})
-    turnstile.mark_passed(identity.ip_hash)
+    await asyncio.to_thread(turnstile.mark_passed, identity.ip_hash)
     return {"ok": True, "passed": True}
 
 

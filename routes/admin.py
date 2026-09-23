@@ -1377,7 +1377,7 @@ async def root():
         "engine": (
             "Essentia (key/BPM) + Demucs (separation) + ffmpeg (conversion, trim, "
             "volume, reverse, fade, channels, resample, denoise, echo, silence) + "
-            "rubberband (pitch, tempo) + faster-whisper (transcription)"
+            "rubberband (pitch, tempo) + Silero VAD (speech silence)"
         ),
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
