@@ -42,6 +42,7 @@ from credits.routes import router as credits_router
 from credits.auth import router as credits_auth_router
 from credits.webhook import router as credits_webhook_router
 from credits.paypal_routes import router as credits_paypal_router
+from credits.paddle_routes import router as credits_paddle_router
 from credits.admin import router as credits_admin_router
 
 
@@ -549,6 +550,7 @@ app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file tra
 #   credits_auth_router     /auth/magic-link, /auth/verify, /auth/logout
 #   credits_webhook_router  /credits/webhook/{provider}
 #   credits_paypal_router   /credits/paypal/config, /order, /capture
+#   credits_paddle_router   /credits/paddle/config, /transaction, /confirm
 #
 # All three are live regardless of PAYWALL_ENABLED, on purpose. With the
 # paywall off, /credits/me reports enabled=false and the frontend renders
@@ -557,16 +559,17 @@ app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file tra
 # makes a soft launch possible: sell first, meter second, and never
 # discover on flip day that the payment path was broken all along.
 #
-# CLOUDFLARE: /credits/webhook/kofi and /credits/webhook/paypal must be
-# in the POST allowlist AND have a bot-fight skip rule. Both post
+# CLOUDFLARE: /credits/webhook/kofi, /paypal and /paddle must be in the
+# POST allowlist AND have a bot-fight skip rule. All post
 # server-to-server with no browser, so a JS challenge eats them silently
 # and the payment is simply lost - the failure looks exactly like "the
-# webhook never fired". /credits/paypal/* is browser traffic and only
-# needs the POST allowlist.
+# webhook never fired". /credits/paypal/* and /credits/paddle/* are
+# browser traffic and only need the POST allowlist.
 app.include_router(credits_router)
 app.include_router(credits_auth_router)
 app.include_router(credits_webhook_router)
 app.include_router(credits_paypal_router)
+app.include_router(credits_paddle_router)
 
 # /admin/credits/* - operator surface: cost economics, user lookup,
 # webhook triage, manual adjust. Guarded by CREDITS_ADMIN_TOKEN, which is
