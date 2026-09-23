@@ -244,6 +244,8 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
     credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
     log_prune_task = asyncio.create_task(_log_prune_loop())
+    from routes.batch import batch_reaper_loop
+    batch_reaper_task = asyncio.create_task(batch_reaper_loop())
     logger.info(
         f"[JOBS] Background cleanup running every {JOB_CLEANUP_INTERVAL_SECONDS}s"
     )
@@ -262,7 +264,8 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     credit_sweep_task.cancel()
     log_prune_task.cancel()
-    for task in (cleanup_task, credit_sweep_task, log_prune_task):
+    batch_reaper_task.cancel()
+    for task in (cleanup_task, credit_sweep_task, log_prune_task, batch_reaper_task):
         try:
             await task
         except asyncio.CancelledError:

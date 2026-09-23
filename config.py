@@ -1636,3 +1636,15 @@ PIANO_TIMEOUT_SECONDS = int(os.environ.get("PIANO_TIMEOUT_SECONDS", "600"))  # 1
 # enforces its own ceiling as a backstop; if these drift, a user waits for
 # a job that was always going to be rejected on the far side.
 MAX_PIANO_DURATION_SECONDS = int(os.environ.get("MAX_PIANO_DURATION_SECONDS", "900"))  # 15 min
+# --- Batch separation (routes/batch.py) ---------------------------------
+# Studio Quality only, credits only. One batch job runs at a time server-
+# wide so interactive users always keep a GPU slot, and a batch job is only
+# started while the shared separation queue has BATCH_QUEUE_RESERVE free.
+BATCH_MAX_FILES = int(os.environ.get("BATCH_MAX_FILES", "20"))
+BATCH_MAX_CONCURRENT = int(os.environ.get("BATCH_MAX_CONCURRENT", "1"))
+BATCH_QUEUE_RESERVE = int(os.environ.get("BATCH_QUEUE_RESERVE", "2"))
+BATCH_MAX_PENDING_JOBS = int(os.environ.get("BATCH_MAX_PENDING_JOBS", "40"))
+BATCH_JOB_TTL_SECONDS = int(os.environ.get("BATCH_JOB_TTL_SECONDS", str(4 * 60 * 60)))
+BATCH_COLLECT_TIMEOUT_SECONDS = int(os.environ.get("BATCH_COLLECT_TIMEOUT_SECONDS", "1800"))
+BATCH_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("BATCH_RATE_LIMIT_MAX_REQUESTS", "80"))
+BATCH_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("BATCH_RATE_LIMIT_WINDOW_SECONDS", "3600"))
