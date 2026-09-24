@@ -90,11 +90,13 @@ class PaymentEvent:
 from . import kofi as _kofi  # noqa: E402  (circular-free: kofi imports nothing from here)
 from . import paypal as _paypal  # noqa: E402
 from . import paddle as _paddle  # noqa: E402
+from . import dodo as _dodo  # noqa: E402
 
 ADAPTERS = {
     _kofi.NAME: _kofi,
     _paypal.NAME: _paypal,
     _paddle.NAME: _paddle,
+    _dodo.NAME: _dodo,
 }
 
 SUPPORTED_PROVIDERS = tuple(ADAPTERS)
