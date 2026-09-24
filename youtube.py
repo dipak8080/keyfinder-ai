@@ -1298,6 +1298,18 @@ def is_proxy_tls_error(error_text: str) -> bool:
 _proxy_lock = threading.Lock()
 _proxy_disabled_until = 0.0
 
+# Outage trips need a few refusals close together, and back off 2 -> 4 ->
+# 8 -> 10 min on repeat trips. One refused connect is usually a single bad
+# gateway hop, and a short cooldown means the next request re-tests the
+# proxy for free instead of serving 503s for the full window.
+PROXY_OUTAGE_TRIP_COUNT = int(os.environ.get("PROXY_OUTAGE_TRIP_COUNT", "3"))
+PROXY_OUTAGE_WINDOW_SECONDS = int(os.environ.get("PROXY_OUTAGE_WINDOW_SECONDS", "120"))
+PROXY_OUTAGE_MIN_COOLDOWN_SECONDS = int(os.environ.get("PROXY_OUTAGE_MIN_COOLDOWN_SECONDS", "120"))
+PROXY_OUTAGE_BACKOFF_RESET_SECONDS = 30 * 60
+_proxy_outage_hits: list = []
+_proxy_trip_level = 0
+_proxy_last_trip = 0.0
+
 
 def proxy_available() -> bool:
     with _proxy_lock:
@@ -1318,10 +1330,37 @@ def _trip_proxy_circuit_breaker(cause: str = "billing"):
     parameter existed.
     """
     _record_event("proxy_quota", cause=cause)
-    global _proxy_disabled_until
+    global _proxy_disabled_until, _proxy_trip_level, _proxy_last_trip
+    now = time.time()
     with _proxy_lock:
-        _proxy_disabled_until = time.time() + PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS
-    cooldown_min = PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS // 60
+        if cause == "outage":
+            _proxy_outage_hits[:] = [t for t in _proxy_outage_hits if now - t < PROXY_OUTAGE_WINDOW_SECONDS]
+            _proxy_outage_hits.append(now)
+            hits = len(_proxy_outage_hits)
+            if hits < PROXY_OUTAGE_TRIP_COUNT:
+                cooldown = 0
+            else:
+                _proxy_outage_hits.clear()
+                if now - _proxy_last_trip > PROXY_OUTAGE_BACKOFF_RESET_SECONDS:
+                    _proxy_trip_level = 0
+                cooldown = min(
+                    PROXY_OUTAGE_MIN_COOLDOWN_SECONDS * (2 ** _proxy_trip_level),
+                    PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+                )
+                _proxy_trip_level += 1
+                _proxy_last_trip = now
+        else:
+            hits = 0
+            cooldown = PROXY_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        if cooldown:
+            _proxy_disabled_until = now + cooldown
+    if not cooldown:
+        logger.warning(
+            f"[PROXY] Gateway refused a connection ({hits}/{PROXY_OUTAGE_TRIP_COUNT} "
+            f"in {PROXY_OUTAGE_WINDOW_SECONDS}s) - proxy stays on."
+        )
+        return
+    cooldown_min = max(1, cooldown // 60)
     if cause == "outage":
         message = (
             f"[PROXY] Circuit breaker TRIPPED - the proxy provider's gateway is "
@@ -1353,9 +1392,11 @@ def _trip_proxy_circuit_breaker(cause: str = "billing"):
 def reset_proxy_circuit_breaker():
     """Manual override - e.g. call this after topping up proxy credit,
     from a future admin endpoint, instead of waiting out the full cooldown."""
-    global _proxy_disabled_until
+    global _proxy_disabled_until, _proxy_trip_level
     with _proxy_lock:
         _proxy_disabled_until = 0.0
+        _proxy_trip_level = 0
+        _proxy_outage_hits.clear()
     logger.info("[PROXY] Circuit breaker manually reset - proxy re-enabled.")
 
 
