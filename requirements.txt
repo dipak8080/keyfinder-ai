@@ -45,24 +45,6 @@ urllib3==2.6.2
 uvicorn==0.40.0
 email-validator>=2.0
 
-# ---------- YOUTUBE / TIKTOK EXTRACTION -----------
-# NOTE: this line previously appeared TWICE - once here and once again a
-# few lines below, under a comment describing browser TLS/JA3
-# impersonation. The duplicate has been removed because it did not do
-# what its comment claimed: `yt-dlp[default]` pulls brotli, certifi,
-# mutagen, pycryptodomex, requests, urllib3 and websockets, but NOT
-# curl-cffi, which is what actually provides impersonation. The result
-# was a comment promising a capability that was never installed.
-#
-# Impersonation is enabled via the [curl-cffi] extra - see the block at
-# the bottom of this file.
-# 2026.08.19 fixes TikTok "Unexpected response from webpage request"
-# (yt-dlp #17403/#17452), raised by the TikTok challenge solver.
-yt-dlp[default,curl-cffi]==2026.8.19
-# 2.0.0: YouTube Aug 2026 BotGuard fix (from 1.3.2), server binds localhost only.
-# Must match the git clone tag in the Dockerfile. Needs Node >= 22.
-bgutil-ytdlp-pot-provider==2.0.0
-
 # ---------- SEPARATION ----------
 # Removed 2026-09-11: torch, torchaudio, demucs. Every separation path
 # (separate, stems, MIDI stems, piano isolation) runs on the RunPod GPU
@@ -94,8 +76,7 @@ httpx==0.28.1
 #               fonts in the wheel, so no font package is needed for the
 #               NOTATION itself.
 #   cairosvg    per-page SVG -> PDF. Uses the libcairo2 already present on
-#               this image via libcairo2-dev (installed for bgutil's
-#               canvas build) - NO new system dependency.
+#               this image via libcairo2-dev - NO new system dependency.
 #   pypdf       merge the per-page PDFs into one document.
 #   pretty_midi MIDI parsing + note-count summary in the sheet pipeline.
 #
@@ -108,34 +89,6 @@ cairosvg==2.7.1
 pypdf==6.1.1
 pretty_midi>=0.2.10
 
-# ---------- INSTALLED 2026-09-09: yt-dlp browser impersonation ----------
-# curl-cffi (the [curl-cffi] extra on yt-dlp above) supplies TLS/JA3
-# impersonation. It was deliberately left out until now, with the note
-# below kept as the record of why it went in.
-#
-# The predicted day arrived. Production log, job 6b6ac216, TikTok:
-#     WARNING: [TikTok] The extractor is attempting impersonation, but
-#     no impersonate target is available
-#     ERROR: Postprocessing: WARNING: unable to obtain file audio codec
-#     with ffprobe
-# i.e. the extractor asked to impersonate, had no target, fell back to a
-# plain request, and TikTok returned something that was not real audio -
-# ffprobe then failed on the postprocessing step. Not yet a full outage
-# (10 completes against 2 kind=unknown failures in the same 24h), which
-# is exactly the shape the old note predicted: TikTok has no client
-# ladder to fall through, so its tightening shows up as outright
-# failures rather than degraded retries.
-#
-# YouTube does NOT need this - it has the client ladder (see
-# CLIENT_LADDER_* in youtube.py), so impersonation is only a
-# nice-to-have there.
-#
-# WATCH AFTER DEPLOY: curl-cffi ships compiled binaries and replaces
-# yt-dlp's request handler for impersonated requests, so YouTube
-# extraction is the thing to verify, not just TikTok. Verify targets are
-# actually available with:
-#     docker exec audioforges-api yt-dlp --list-impersonate-targets
-# Rollback: yt-dlp[default,curl-cffi]==2026.07.04 (TikTok is broken on it).
 # ---------- REDIS (job state + rate limiting) ----------
 # Shared state across the a/b deploy slots, replacing the per-process dicts
 # in jobs.py and rate_limit.py. Runs as a container on audioforges-net;

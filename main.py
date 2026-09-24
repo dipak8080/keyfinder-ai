@@ -19,7 +19,6 @@ from config import (
     logger,
     ALLOWED_ORIGINS,
 )
-from utils import ensure_cookies_file
 from routes import router
 from jobs import cleanup_expired_jobs, get_job_stats
 from log_stream import (
@@ -29,7 +28,6 @@ from log_stream import (
     prune_logs_older_than,
 )
 from idempotency import IdempotencyMiddleware
-from cookie_upload import router as cookie_upload_router
 from gpu_internal_routes import router as gpu_internal_router
 
 # ---------- CREDITS / PAYWALL ----------
@@ -182,7 +180,6 @@ async def lifespan(app: FastAPI):
     # Startup
     attach_system_log_capture()  # starts capturing all logger.info()/error() calls app-wide
     stats.init()  # persistent processed-jobs counter; seeds once from logs.db history
-    ensure_cookies_file()
     logger.info(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
     # Credits schema. Idempotent - every migration in credits/migrations/
@@ -539,7 +536,6 @@ async def public_stats():
 
 app.include_router(router)
 app.include_router(logs_router)  # /admin/logs live dashboard (HTTP + system logs)
-app.include_router(cookie_upload_router)  # /admin/upload-cookies - upload cookies.txt directly, no base64
 app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file transfer, shared-secret auth
 
 # ---------- CREDITS ----------

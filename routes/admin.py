@@ -161,7 +161,6 @@ hand.
 --------------------------------------------------------------------------
 """
 import requests
-from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from config import (
@@ -249,27 +248,10 @@ from config import (
     MIDI_WORKER_URL,
 )
 from utils import run_blocking
-from youtube import (
-    proxy_available,
-    reset_proxy_circuit_breaker,
-    cdn_breaker_status,
-    reset_cdn_breaker,
-    proxy_botcheck_degraded,
-    reset_proxy_botcheck_breaker,
-    get_account_health,
-    get_path_stats,
-    get_cookie_accounts,
-    split_breaker_status,
-    reset_split_breaker,
-    anon_status,
-    client_health_status,
-    PROXY_MAX_DURATION_SECONDS,
-)
 from cache import clear_cache, set_cache_max_gb, get_cache_stats
 from monitoring import get_status_snapshot
 from jobs import get_job_stats, count_processing, instance_slot
 from admin_auth import guard_admin_request, verify_admin_key
-from tiktok import maintenance as tiktok_maintenance
 from log_stream import get_endpoint_counts, get_tool_counts
 
 router = APIRouter()
@@ -293,51 +275,6 @@ async def admin_set_cache_limit(request: Request, key: str = Query(...), gb: flo
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"status": "updated", **stats}
-
-
-@router.post("/admin/reset-proxy")
-async def admin_reset_proxy(request: Request, key: str = Query(...)):
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    reset_proxy_circuit_breaker()
-    return {"status": "proxy circuit breaker reset"}
-
-
-@router.get("/admin/tiktok/maintenance")
-async def admin_tiktok_maintenance_get(request: Request, key: str = Query(...)):
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    return tiktok_maintenance.get_state()
-
-
-@router.post("/admin/tiktok/maintenance")
-async def admin_tiktok_maintenance_set(
-    request: Request,
-    key: str = Query(...),
-    on: bool = Query(...),
-    message: Optional[str] = Query(None, max_length=300),
-):
-    """Pauses or resumes /tiktok-to-mp3 sitewide. Flip it ON when the
-    canary or the logs show every TikTok conversion failing (extractor
-    break, TikTok outage); flip it OFF once a yt-dlp bump or a TikTok-side
-    fix lands. Users get `message` verbatim, so write it for them."""
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    return tiktok_maintenance.set_state(on, message)
-
-
-@router.post("/admin/reset-cdn-breaker")
-async def admin_reset_cdn_breaker(request: Request, key: str = Query(...)):
-    """
-    Forces the direct path back to healthy immediately instead of waiting
-    out CDN_DEGRADED_COOLDOWN_SECONDS. Useful when you know the network
-    situation changed (proxy topped up, host routing fixed, edges came
-    back) and don't want to keep paying for proxy traffic in the meantime.
-    """
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    reset_cdn_breaker()
-    return {"status": "CDN degradation breaker reset - direct path re-enabled"}
 
 
 def _iter_tool_routes():
@@ -673,41 +610,6 @@ def _humanize_endpoint(segments: list) -> str:
     return " ".join(words)
 
 
-@router.post("/admin/reset-proxy-botcheck")
-async def admin_reset_proxy_botcheck(request: Request, key: str = Query(...)):
-    """
-    Clears the proxy bot-check breaker immediately instead of waiting out
-    PROXY_BOTCHECK_COOLDOWN_SECONDS. Use after changing YT_PROXY_URL
-    (e.g. pinning a sticky session or a fixed exit country) so the new
-    configuration gets tried right away rather than sitting behind a
-    cooldown earned by the old one.
-    """
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    reset_proxy_botcheck_breaker()
-    return {"status": "proxy bot-check breaker reset - escalation re-enabled"}
-
-
-@router.post("/admin/reset-split-breaker")
-async def admin_reset_split_breaker(request: Request, key: str = Query(...)):
-    """
-    Clears the split-tunnel health breaker immediately instead of waiting
-    out SPLIT_TUNNEL_COOLDOWN_SECONDS.
-
-    Use after changing whatever the breaker was reacting to - pinning a
-    sticky session in YT_PROXY_URL, switching proxy provider, raising
-    YT_MEDIA_SOCKET_TIMEOUT - so the new setup gets measured on its own
-    merits rather than serving out a cooldown earned by the old one.
-    Exactly the same purpose and shape as /admin/reset-proxy-botcheck
-    above; the breaker it resets just happens to govern bandwidth spend
-    rather than escalation.
-    """
-    client_ip = guard_admin_request(request)
-    verify_admin_key(key, client_ip)
-    reset_split_breaker()
-    return {"status": "split-tunnel health breaker reset - direct media re-enabled"}
-
-
 def _probe_midi_worker() -> dict:
     """
     Blocking midi-worker health probe, dispatched via run_blocking from
@@ -788,57 +690,6 @@ async def admin_status(request: Request, key: str = Query(...)):
     client_ip = guard_admin_request(request)
     verify_admin_key(key, client_ip)
     snapshot = get_status_snapshot()
-    snapshot["proxy"] = {
-        "circuit_breaker": "OPEN (proxy disabled)" if not proxy_available() else "CLOSED (proxy available)",
-        # Separate from the quota breaker above: this one means the proxy
-        # works but YouTube is challenging its exits, so escalations are
-        # being skipped to avoid paying for known-bad requests.
-        "botcheck_breaker": "ACTIVE (escalation paused)" if proxy_botcheck_degraded() else "clear",
-    }
-    # Direct-path health. When this shows DEGRADED, YouTube is routing
-    # this server's IP to unreachable googlevideo edges and downloads are
-    # being sent straight to the proxy - which means proxy spend is
-    # temporarily higher, and is the number to watch if the bill moves.
-    #
-    # As of 2026-08-15 this breaker is fed ONLY by genuine connect
-    # timeouts. It used to be fed by read timeouts too, which meant a
-    # merely SLOW transfer counted as an unreachable edge - three of them
-    # in five minutes forced every subsequent download onto the proxy,
-    # so slow transfers were manufacturing proxy spend. See
-    # is_cdn_read_timeout_error() in youtube.py for the full writeup.
-    snapshot["cdn"] = cdn_breaker_status()
-    snapshot["tiktok"] = tiktok_maintenance.get_state()
-    # Per-path success rates. Answers "is the proxy actually working?"
-    # and "did that proxy config change help?" - both previously
-    # unanswerable without reading raw logs.
-    #
-    # With YT_SPLIT_TUNNEL=1 this grows three buckets beyond
-    # direct/proxy: proxy_extract (phase 1 through the proxy),
-    # direct_media (phase 2 direct - the bytes no longer being paid for),
-    # and proxy_media (phase 2 fallback). direct_media.success_rate is
-    # the single number that says whether the split tunnel is working.
-    snapshot["paths"] = get_path_stats()
-    # The context those raw counters can't carry: whether the feature is
-    # enabled at all, whether a sticky session is pinned (without one the
-    # media fallback can land on a different exit IP and 403 on a signed
-    # URL), and whether the health breaker has reverted to full-proxy
-    # downloads. That last one is why this block exists - a silent revert
-    # is otherwise indistinguishable from "the savings stopped".
-    snapshot["split_tunnel"] = split_breaker_status()
-    snapshot["anon"] = anon_status()
-    snapshot["clients"] = client_health_status()
-    snapshot["proxy"]["max_duration_seconds"] = PROXY_MAX_DURATION_SECONDS
-    snapshot["cookies"] = {
-        "accounts_available": len(get_cookie_accounts()),
-        # Per-account detail, including WHICH phase each account last
-        # failed in. A media-phase failure means extraction succeeded,
-        # which means the cookie was ACCEPTED - so a high failure count
-        # with last_failure_phase="media" is a network problem, not a
-        # cookie problem. That distinction is the whole reason this
-        # exists; without it a healthy account looks identical to a dead
-        # one.
-        "accounts": get_account_health(),
-    }
     # GPU spend is no longer tracked as a separate in-app counter - the
     # ceiling is RunPod's own account balance, checked directly at
     # https://runpod.io (Billing), not estimated here. See
