@@ -26,6 +26,7 @@ the six they need from here instead of from routes.py.
 """
 import os
 import gc
+import time
 import sys
 import json
 import signal
@@ -437,6 +438,7 @@ async def run_in_killable_subprocess(
                     "progress_label": progress_label,
                     "request_id": request_id,
                     "events_path": events_path,
+                    "deadline": time.time() + timeout_seconds,
                 },
                 f,
             )
@@ -447,7 +449,7 @@ async def run_in_killable_subprocess(
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, _worker_script_path(), input_path, output_path,
+            sys.executable, "-u", _worker_script_path(), input_path, output_path,
             start_new_session=True,  # own process group - required for killpg below
             # NO stdout/stderr PIPE - inherits parent's fds so yt-dlp's
             # verbose output, [COOKIES]/[PROXY]/[CDN] log lines, etc. still

@@ -40,6 +40,8 @@ from youtube import (
     enable_event_recording,
     import_breaker_state,
     drain_events,
+    set_download_deadline,
+    slow_transfer_guard,
 )
 from download_progress import make_progress_hook
 
@@ -77,14 +79,18 @@ def main():
     # group under the same request in the dashboard as everything else
     # that request logged. tool/tier are hardcoded here since progress_label
     # is only ever sent by /download, which always tags itself this way.
+    set_download_deadline(payload.get("deadline"))
+    hooks = []
     progress_label = payload.get("progress_label")
     if progress_label:
-        ydl_opts["progress_hooks"] = [make_progress_hook(
+        hooks.append(make_progress_hook(
             progress_label,
             request_id=payload.get("request_id", "-"),
             tool="DOWNLOAD",
             tier="standard",
-        )]
+        ))
+    hooks.append(slow_transfer_guard)
+    ydl_opts["progress_hooks"] = hooks
 
     try:
         info = download_with_fallback(ydl_opts, url, proxy_url)

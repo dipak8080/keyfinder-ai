@@ -8,6 +8,7 @@ import os
 import re
 import json
 import time
+import socket
 import base64
 import uuid
 import threading
@@ -1506,6 +1507,103 @@ def _dead_edge_skip_error(site: str) -> Exception:
     )
 
 
+EDGE_PROBE_TIMEOUT_SECONDS = float(os.environ.get("YT_EDGE_PROBE_TIMEOUT", "3"))
+_EDGE_HOST_RE = re.compile(r"rr\d+---sn-[a-z0-9-]+\.googlevideo\.com", re.IGNORECASE)
+_probed_hosts: dict = {}
+
+
+def _edge_reachable(host: str) -> bool:
+    if host in _probed_hosts:
+        return _probed_hosts[host]
+    try:
+        with socket.create_connection((host, 443), timeout=EDGE_PROBE_TIMEOUT_SECONDS):
+            ok = True
+    except socket.gaierror:
+        ok = True
+    except OSError:
+        ok = False
+    _probed_hosts[host] = ok
+    return ok
+
+
+def _probe_dead_site(info: Optional[dict]) -> Optional[str]:
+    """TCP-dials each unknown audio edge (3s) before a direct media fetch, so a
+    dead site costs 3s instead of yt-dlp's socket_timeout x retries (60s+ on
+    the split leg, 2026-09-24)."""
+    if not info:
+        return None
+    candidates = {}
+    for f in info.get("formats") or []:
+        if f.get("vcodec") not in (None, "none") or f.get("acodec") in (None, "none"):
+            continue
+        m = _EDGE_HOST_RE.search(f.get("url", ""))
+        if not m:
+            continue
+        host = m.group(0).lower()
+        site = edge_site(host)
+        if site and not is_edge_dead(site):
+            candidates.setdefault(site, host)
+    for site, host in candidates.items():
+        if not _edge_reachable(host):
+            logger.warning(f"[CDN] Probe: {host} did not answer in {EDGE_PROBE_TIMEOUT_SECONDS:.0f}s.")
+            record_dead_edge(site)
+    return _info_dead_site(info)
+
+
+# ---------- WORKER DEADLINE + SLOW-TRANSFER GUARD ----------
+SLOW_GUARD_MIN_ELAPSED_SECONDS = float(os.environ.get("YT_SLOW_GUARD_MIN_ELAPSED", "12"))
+SLOW_GUARD_FLOOR_BPS = int(os.environ.get("YT_SLOW_GUARD_FLOOR_KBPS", "64")) * 1024
+SLOW_GUARD_MARGIN_SECONDS = 8
+PROXY_RESTART_MIN_SECONDS = int(os.environ.get("YT_PROXY_RESTART_MIN_SECONDS", "40"))
+SLOW_TRANSFER_MARKER = "slow-transfer"
+_download_deadline: Optional[float] = None
+
+
+class SlowTransferError(yt_dlp.utils.DownloadError):
+    pass
+
+
+def set_download_deadline(deadline) -> None:
+    global _download_deadline
+    try:
+        _download_deadline = float(deadline) if deadline else None
+    except (TypeError, ValueError):
+        _download_deadline = None
+
+
+def seconds_left() -> Optional[float]:
+    return None if _download_deadline is None else _download_deadline - time.time()
+
+
+def slow_transfer_guard(status: dict):
+    """Progress hook. Aborts a transfer that is crawling (below the floor) or
+    cannot finish before the worker's wall clock. Worded as a googlevideo read
+    timeout so the existing classifiers fail fast and escalate to the proxy."""
+    if status.get("status") != "downloading":
+        return
+    elapsed = status.get("elapsed") or 0
+    if elapsed < SLOW_GUARD_MIN_ELAPSED_SECONDS:
+        return
+    total = status.get("total_bytes") or status.get("total_bytes_estimate")
+    done = status.get("downloaded_bytes") or 0
+    if not total or done >= total:
+        return
+    avg = done / elapsed
+    remaining = total - done
+    left = seconds_left()
+    too_slow = avg < SLOW_GUARD_FLOOR_BPS
+    too_late = left is not None and (avg <= 0 or remaining / avg > left - SLOW_GUARD_MARGIN_SECONDS)
+    if not (too_slow or too_late):
+        return
+    m = _EDGE_HOST_RE.search((status.get("info_dict") or {}).get("url") or "")
+    host = m.group(0) if m else "googlevideo.com"
+    budget = "no deadline" if left is None else f"{left:.0f}s left"
+    raise SlowTransferError(
+        f"[download] Got error: {host} Read timed out ({SLOW_TRANSFER_MARKER}: "
+        f"{avg / 1024:.0f} KB/s after {elapsed:.0f}s, {remaining / 1048576:.1f} MB to go, {budget})"
+    )
+
+
 def reset_cdn_breaker():
     """Manual override, mirroring reset_proxy_circuit_breaker()."""
     global _direct_degraded_until
@@ -2152,7 +2250,7 @@ def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
       - PostProcessingError: ffmpeg/disk, nothing to do with the network
       - is_permanent_error(): the video itself is the blocker
     """
-    dead_site = _info_dead_site(info) if extract_opts.get("proxy") else None
+    dead_site = _probe_dead_site(info) if extract_opts.get("proxy") else None
     if dead_site:
         logger.info(
             f"[SPLIT] Media assigned to dead edge site {dead_site} - skipping "
@@ -2327,7 +2425,7 @@ def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] =
 
                 if media_opts is None:
                     if not ydl_opts.get("proxy"):
-                        dead_site = _info_dead_site(info)
+                        dead_site = _probe_dead_site(info)
                         if dead_site:
                             logger.info(
                                 f"[CDN] Audio assigned to dead edge site {dead_site} - "
@@ -2702,6 +2800,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             # One session id shared by both phases - see _sticky_proxy_url.
             session_id = uuid.uuid4().hex[:12]
             proxied_opts["proxy"] = _sticky_proxy_url(proxy_url, session_id)
+            # Any .part on disk came from another IP; never Range-resume it.
+            proxied_opts["continuedl"] = False
             proxy_account = remaining_accounts[0] if remaining_accounts else None
             if proxy_account:
                 proxied_opts["cookiefile"] = proxy_account
@@ -2753,6 +2853,18 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                         f"{session_id} (attempt {session_attempt}/"
                         f"{PROXY_TLS_MAX_SESSIONS}) - rolling a fresh session. "
                         f"This is a bad exit node, not a YouTube-side block."
+                    )
+                    continue
+
+                left = seconds_left()
+                if (SLOW_TRANSFER_MARKER in proxy_error_text
+                        and session_attempt < PROXY_TLS_MAX_SESSIONS
+                        and (left is None or left >= PROXY_RESTART_MIN_SECONDS)):
+                    record_path_attempt("proxy", False)
+                    logger.warning(
+                        f"[PROXY] Exit session {session_id} too slow (attempt "
+                        f"{session_attempt}/{PROXY_TLS_MAX_SESSIONS}) - rolling a fresh "
+                        f"session: {proxy_error_text[:200]}"
                     )
                     continue
 
