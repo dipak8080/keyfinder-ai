@@ -289,6 +289,7 @@ from config import (
     DEMUCS_TIMEOUT_SECONDS_HQ,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     SEPARATION_HQ_ENABLED,
+    YOUTUBE_HQ_ENABLED,
     YOUTUBE_ANALYZE_RATE_LIMIT_MAX_REQUESTS,
     YOUTUBE_ANALYZE_RATE_LIMIT_WINDOW_SECONDS,
     YOUTUBE_SEPARATE_RATE_LIMIT_MAX_REQUESTS,
@@ -1520,6 +1521,13 @@ async def youtube_separate_hq_route(
     turns out to exceed the 6-minute HQ cap, _run_tool_job's `finally`
     refunds the credit immediately.
     """
+    if not YOUTUBE_HQ_ENABLED:
+        raise HTTPException(
+            410,
+            "Studio Quality is available for uploaded files only. "
+            "Use the standard tier for links, or upload your file on the vocal remover.",
+        )
+
     if not SEPARATION_HQ_ENABLED:
         raise HTTPException(
             503,
@@ -1685,6 +1693,13 @@ async def youtube_stems_hq_route(
 
     COSTS ONE CREDIT when PAYWALL_TOOL_YOUTUBE_STEMS_HQ_ENABLED is on.
     """
+    if not YOUTUBE_HQ_ENABLED:
+        raise HTTPException(
+            410,
+            "Studio Quality is available for uploaded files only. "
+            "Use the standard tier for links, or upload your file on the vocal remover.",
+        )
+
     if not SEPARATION_HQ_ENABLED:
         raise HTTPException(
             503,

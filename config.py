@@ -465,6 +465,10 @@ MAX_SEPARATION_DURATION_SECONDS_HQ = int(os.environ.get("MAX_SEPARATION_DURATION
 # rather than letting users submit into a guaranteed error.
 SEPARATION_HQ_ENABLED = os.environ.get("SEPARATION_HQ_ENABLED", "true").lower() == "true"
 
+# Studio Quality on link input (/youtube/separate-hq, /youtube/stems-hq and
+# YouTube-sourced upgrades). Off by default: paid runs are upload-only.
+YOUTUBE_HQ_ENABLED = os.environ.get("YOUTUBE_HQ_ENABLED", "false").lower() == "true"
+
 # ----- Model whitelist enforcement -----
 # Applied AFTER both model settings are read so one loop covers both. A
 # bad value falls back to the known-good default rather than raising: a

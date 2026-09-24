@@ -60,6 +60,7 @@ from config import (
     DEMUCS_TIMEOUT_SECONDS_HQ,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     SEPARATION_HQ_ENABLED,
+    YOUTUBE_HQ_ENABLED,
     SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
     STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
@@ -187,6 +188,9 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
 
     rule = settings.rule_for(rule_key)
     state = {"job": job, "settings": settings, "rule": rule, "rule_key": rule_key}
+
+    if job["job_type"] == youtube_type and not YOUTUBE_HQ_ENABLED:
+        return (state, {"reason": "tool_disabled"})
 
     existing = _existing_upgrade(job_id)
     if existing:
