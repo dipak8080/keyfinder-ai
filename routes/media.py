@@ -116,7 +116,7 @@ from audio_analysis import detect_key_bpm_essentia, cross_check_with_librosa, tr
 from rate_limit import rate_limited
 from monitoring import record_result
 from jobs import create_job, mark_failed, mark_tool_complete, mark_stems_complete, get_job
-from audio_common import AudioToolError, build_output_path, get_audio_mime_type
+from audio_common import AudioToolError, build_output_path, get_audio_mime_type, get_extension
 from video_to_audio import extract_audio, validate_video_input_format
 from audio_joiner import join_audio
 from silence_splitter import split_on_silence, SPLIT_MODES
@@ -151,6 +151,27 @@ router = APIRouter()
 # what the bare version was actually allowing.
 # ============================================================
 
+_NOT_AUDIO_EXTENSIONS = frozenset({
+    "m3u", "m3u8", "pls", "xspf", "asx", "wpl", "cue", "txt", "nfo", "lrc", "srt",
+})
+
+
+def _is_undecodable(exc: BaseException) -> bool:
+    """True when the failure is 'nothing could decode this file' rather than
+    a bug. librosa's last-resort audioread raises NoBackendError with an
+    EMPTY message, which is why these used to log as a bare 500."""
+    seen = 0
+    while exc is not None and seen < 5:
+        name = type(exc).__name__
+        text = str(exc).lower()
+        if name in ("NoBackendError", "LibsndfileError") or "invalid data found" in text \
+                or "format not recognised" in text or "could not open file" in text:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
+
+
 @router.post(
     "/analyze",
     dependencies=[Depends(rate_limited(
@@ -164,6 +185,16 @@ async def analyze_audio(file: UploadFile = File(...)):
     set_job_context(tool="ANALYZE", tier="standard")
 
     started = time.monotonic()
+
+    # Browsers file playlists under audio/*, so the key finder's picker
+    # lets them through. They hold track paths, not audio.
+    if get_extension(file.filename) in _NOT_AUDIO_EXTENSIONS:
+        logger.warning(f"[ANALYZE] Rejected non-audio upload '{file.filename}'")
+        raise HTTPException(
+            400,
+            "This is a playlist or text file, not audio. Upload the song itself "
+            "(MP3, WAV, FLAC, M4A, AAC, OGG or AIFF).",
+        )
 
     file_id = str(uuid.uuid4())
     file_path = build_safe_upload_path(UPLOAD_DIR, file_id, file.filename)
@@ -227,6 +258,16 @@ async def analyze_audio(file: UploadFile = File(...)):
         logger.warning(f"[ANALYZE] FAILED '{file.filename}': {e}")
         raise HTTPException(400, str(e))
     except Exception as e:
+        if _is_undecodable(e):
+            logger.warning(
+                f"[ANALYZE] Rejected '{file.filename}': no decoder could read it "
+                f"({type(e).__name__})"
+            )
+            raise HTTPException(
+                400,
+                "Could not read any audio from this file. It may be corrupt or not "
+                "an audio file. Try MP3, WAV, FLAC, M4A, AAC, OGG or AIFF.",
+            )
         logger.error(f"[ANALYZE] FAILED '{file.filename}' (unexpected): {e}", exc_info=True)
         raise HTTPException(500, "Could not analyze this file. It may be corrupt or in an unsupported format.")
     finally:
