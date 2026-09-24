@@ -42,6 +42,7 @@ from config import (
     COOKIE_ACCOUNT_COOLDOWN_SECONDS,
 )
 from monitoring import alert_now
+from yt_dlp.extractor.youtube import YoutubeIE as _YoutubeIE
 import cookie_health
 
 
@@ -1548,6 +1549,57 @@ def _probe_dead_site(info: Optional[dict]) -> Optional[str]:
             logger.warning(f"[CDN] Probe: {host} did not answer in {EDGE_PROBE_TIMEOUT_SECONDS:.0f}s.")
             record_dead_edge(site)
     return _info_dead_site(info)
+
+
+# ---------- PLAYER JS DISK CACHE ----------
+# Each worker is a fresh process, so yt-dlp re-downloaded base.js (~0.7 MB)
+# on every extraction, through the proxy when proxied: most of the
+# www.youtube.com proxy bytes on 2026-09-24. Shared across workers on disk.
+PLAYER_JS_CACHE_DIR = os.environ.get("YT_PLAYER_JS_CACHE_DIR", "/app/data/player_js")
+PLAYER_JS_KEEP_SECONDS = 10 * 24 * 3600
+_orig_load_player = _YoutubeIE._load_player
+
+
+def _player_js_path(key: str) -> str:
+    return os.path.join(PLAYER_JS_CACHE_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", key) + ".js")
+
+
+def _store_player_js(path: str, code: str):
+    try:
+        os.makedirs(PLAYER_JS_CACHE_DIR, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(code)
+        os.replace(tmp, path)
+        cutoff = time.time() - PLAYER_JS_KEEP_SECONDS
+        for name in os.listdir(PLAYER_JS_CACHE_DIR):
+            old = os.path.join(PLAYER_JS_CACHE_DIR, name)
+            if os.path.getmtime(old) < cutoff:
+                os.remove(old)
+    except OSError:
+        pass
+
+
+def _cached_load_player(self, video_id, player_url, fatal=True):
+    key = self._player_js_cache_key(player_url)
+    if key in self._code_cache:
+        return self._code_cache[key]
+    path = _player_js_path(key)
+    try:
+        with open(path, encoding="utf-8") as f:
+            code = f.read()
+        if code:
+            self._code_cache[key] = code
+            return code
+    except OSError:
+        pass
+    code = _orig_load_player(self, video_id, player_url, fatal=fatal)
+    if code and len(code) > 100_000:
+        _store_player_js(path, code)
+    return code
+
+
+_YoutubeIE._load_player = _cached_load_player
 
 
 # ---------- WORKER DEADLINE + SLOW-TRANSFER GUARD ----------
