@@ -1,4 +1,4 @@
-"""Passwordless auth. A Ko-fi purchase creates the account; this is how
+"""Passwordless auth. A purchase creates the account; this is how
 someone gets back into it from a different browser than the one they bought
 from."""
 

@@ -71,8 +71,8 @@ LOCKED_KEYS = frozenset({
     "CREDITS_SECRET_KEY",
     "CREDITS_ADMIN_TOKEN",
     "IP_HASH_SALT",
-    "PAYMENTS_WEBHOOK_SECRET",
-    "PAYMENTS_API_KEY",
+    "DODO_API_KEY",
+    "DODO_WEBHOOK_SECRET",
     "RESEND_API_KEY",
     "TURNSTILE_SECRET_KEY",
     "SMTP_USER",
@@ -120,7 +120,6 @@ KNOWN_KEYS: dict[str, dict] = {
     "MAGIC_LINKS_PER_HOUR": {"type": "int", "group": "auth"},
     "DEVICE_LINKS_PER_HOUR": {"type": "int", "group": "auth"},
     "CLAIM_TTL_MINUTES": {"type": "int", "group": "payments"},
-    "PAYMENTS_TEST_MODE": {"type": "bool", "group": "payments"},
     "MAIL_PROVIDER": {"type": "str", "group": "mail"},
     # In KNOWN_KEYS specifically so _is_secretish() lets them through.
     # build_settings() genuinely reads all three, and the fragment match

@@ -11,7 +11,7 @@ identical regardless of who took the money:
 
 STATUS CODES ARE PART OF THE CONTRACT
 -------------------------------------
-Ko-fi retries until it gets a 200, so what this returns decides whether
+Dodo retries until it gets a 2xx, so what this returns decides whether
 a payment is redelivered:
 
     200  processed, or deliberately ignored (a tip), or a duplicate
@@ -19,7 +19,7 @@ a payment is redelivered:
     400  unprocessable payload - do NOT retry, it'll still be malformed
     500  something broke here  - DO retry, this is our fault
 
-Returning 500 for a malformed body would have Ko-fi redelivering it for
+Returning 500 for a malformed body would have Dodo redelivering it for
 hours. Returning 200 for our own failure would silently lose a payment
 someone actually made. Both mistakes are easy and neither is visible
 until it costs a real customer, which is why the mapping is spelled out
@@ -39,6 +39,7 @@ from .config import get_settings
 from .db import connect, now_iso, tx
 from .providers import (
     WebhookRejected,
+    SUPPORTED_PROVIDERS,
     WebhookUnprocessable,
     get_adapter,
 )
@@ -48,12 +49,14 @@ router = APIRouter(prefix="/credits", tags=["credits"])
 
 
 def _enabled_providers(settings) -> set[str]:
-    """PAYMENTS_ENABLED_PROVIDERS, comma separated. Defaults to the single
-    configured provider, so existing deployments are unchanged."""
+    """PAYMENTS_ENABLED_PROVIDERS, comma separated, 'none' to switch
+    checkout off. Unset means the default provider. Names without an
+    adapter (old kofi/paypal/paddle values) are ignored."""
     raw = os.getenv("PAYMENTS_ENABLED_PROVIDERS", "").strip()
     if not raw:
         return {settings.payments_provider}
-    return {name.strip().lower() for name in raw.split(",") if name.strip()}
+    names = {name.strip().lower() for name in raw.split(",") if name.strip()}
+    return names & set(SUPPORTED_PROVIDERS)
 
 
 @router.post("/webhook/{provider}")
@@ -61,9 +64,7 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
     settings = get_settings()
 
     # Only an ENABLED provider is accepted, so a stale webhook still
-    # registered at an old provider cannot keep granting credits after a
-    # migration. More than one may be live at a time: Ko-fi kept for
-    # donations while PayPal takes credit sales.
+    # registered at an old provider cannot grant credits.
     if provider not in _enabled_providers(settings):
         log.warning("webhook for %r but enabled providers are %s",
                     provider, sorted(_enabled_providers(settings)))
@@ -91,8 +92,8 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
         raise HTTPException(status_code=401, detail={"error": "bad_signature"})
 
     if event is None:
-        # A tip or a membership payment. Real, authenticated, and not
-        # ours to act on - 200 so it isn't redelivered forever.
+        # Authenticated but not a credit-granting event - 200 so it
+        # isn't redelivered forever.
         return {"ok": True, "ignored": True}
 
     delivery_key = f"{provider}:{event.delivery_id}"

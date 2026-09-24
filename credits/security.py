@@ -85,15 +85,5 @@ def hash_ip(ip: str | None) -> str:
 # ---------------------------------------------------------------------------
 #
 # Provider-specific verification lives in credits/providers/<name>.py,
-# NOT here. Ko-fi authenticates with a token inside the body; a provider
-# added later might sign the raw body with an HMAC header instead, and
-# that difference belongs next to the code that parses that provider's
-# payload rather than in a shared dispatch function that has to know
-# about all of them.
-#
-# An earlier version of this file carried verify_lemonsqueezy_signature()
-# and verify_paddle_signature() alongside Ko-fi's, plus a
-# verify_webhook() that switched on PAYMENTS_PROVIDER. Both were removed:
-# they were dead code for providers that were never wired up, and
-# untested crypto that nothing calls is worse than no crypto at all -
-# it reads as "this is handled" to whoever comes next.
+# NOT here. It belongs next to the code that parses that provider's
+# payload rather than in a shared dispatch function.

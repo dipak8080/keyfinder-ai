@@ -1,14 +1,14 @@
 """
 credits/admin.py - The operator's view. Six endpoints, no more.
 
-WHAT THIS IS FOR, AND WHY KO-FI'S DASHBOARD ISN'T ENOUGH
---------------------------------------------------------
-Ko-fi tells you a payment happened. It cannot tell you whether the
+WHAT THIS IS FOR, AND WHY THE DODO DASHBOARD ISN'T ENOUGH
+---------------------------------------------------------
+Dodo tells you a payment happened. It cannot tell you whether the
 credits landed, whether they were spent, whether a job failed and
 refunded, or what any of it cost you in GPU time. Those live here.
 
 The question that actually arrives in your inbox is "I paid $8 and got
-nothing" - and answering it needs three facts Ko-fi does not have: did
+nothing" - and answering it needs three facts Dodo does not have: did
 the webhook arrive, did the ledger move, and is the balance sitting on
 an account whose email differs by a typo from the one they're writing
 from. /users/lookup answers all three in one call.
@@ -583,7 +583,7 @@ def lookup_user(email: str = Query(..., max_length=254)) -> dict:
                 "hint": (
                     "No account for that email. If orders is non-empty the webhook "
                     "ran but the account link failed. If both are empty, they paid "
-                    "with a different address - search Ko-fi for the transaction."
+                    "with a different address - search the Dodo dashboard for the payment."
                 ),
             }
 
@@ -660,8 +660,8 @@ def recent_webhooks(
 
 def _access_state(row) -> str:
     """in_tab: claim matched, credits appeared silently in the buying tab.
-    signed_in: claim missed (direct Ko-fi buyer, or a different email at
-    checkout) but a session was created after the order, via the receipt
+    signed_in: the buying browser wasn't linked but a session was created
+    after the order, via the receipt
     link or the recovery form. not_yet: paid, and no evidence they have
     reached their credits."""
     if row["subject_id"]:

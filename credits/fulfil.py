@@ -1,13 +1,9 @@
 """
 credits/fulfil.py - Everything that happens once a payment is real.
 
-Lifted out of credits/webhook.py unchanged. It lived there while the
-webhook was the only way money arrived; PayPal grants credits from the
-capture response instead, so both paths now call the same code rather
-than one reaching into the other's privates.
-
-apply_payment() is idempotent on event.provider_txid. A payment applied
-by the capture route and then redelivered by the webhook credits once.
+Called from both the Dodo confirm route and the webhook.
+apply_payment() is idempotent on event.provider_txid, so a payment
+applied by confirm and then redelivered by the webhook credits once.
 """
 
 from __future__ import annotations
@@ -16,11 +12,11 @@ import json
 import logging
 
 from . import claims, mailer
-from .config import get_settings
 from .db import connect, now_iso, tx
 from .identity import get_or_create_account, link_subject_to_account
 from .ledger import grant
 from .providers import PaymentEvent
+from .providers import dodo as _dodo
 from .security import new_id
 
 log = logging.getLogger("credits.fulfil")
@@ -40,8 +36,8 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
         # signed cookie - it cannot be planted for someone else's order.
         # The email-keyed claim can (anyone may record a claim for any
         # email), so for orders that carry an order_ref the claim is only
-        # consumed, never trusted. Claim-only linking remains for Ko-fi,
-        # whose webhook has nothing better than the email.
+        # consumed, never trusted. Claim-only linking is the fallback for a
+        # payment with no order_ref.
         subject_id = None
         if event.order_ref:
             src = conn.execute(
@@ -72,7 +68,7 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
             (new_id("ord_"), event.provider, event.provider_txid,
              event.order_ref or str(event.raw.get("url") or ""), account_id, subject_id, event.email,
              ",".join(event.pack_keys), event.credits, round(event.amount_usd * 100),
-             event.currency, 1 if get_settings().provider_test_mode else 0,
+             event.currency, 1 if _dodo.is_test() else 0,
              now_iso(), json.dumps(event.raw)[:20000]),
         )
 

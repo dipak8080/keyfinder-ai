@@ -24,14 +24,6 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Any
 
-# The set of providers with an adapter in credits/providers/. Imported
-# from there rather than restated here, so adding a provider is one file
-# and cannot leave config validating against a stale list.
-def _supported_providers() -> tuple[str, ...]:
-    from .providers import SUPPORTED_PROVIDERS as _sp
-    return _sp
-
-
 # --- env helpers ------------------------------------------------------------
 
 def _raw(name: str) -> str | None:
@@ -325,18 +317,6 @@ class Pack:
     credits: int
     price_usd: float
     label: str
-    # Ko-fi: the shop item's direct_link_code (the bit after ko-fi.com/s/).
-    price_ref: str = ""
-    # Ko-fi: https://ko-fi.com/s/<direct_link_code>. Required, since Ko-fi has
-    # no checkout API to create sessions against - the buy link IS the checkout.
-    buy_url: str = ""
-
-    def resolved_buy_url(self, provider: str, store_slug: str) -> str:
-        if self.buy_url:
-            return self.buy_url
-        if provider == "kofi" and self.price_ref:
-            return f"https://ko-fi.com/s/{self.price_ref}"
-        return ""
 
 
 @dataclass(frozen=True)
@@ -369,11 +349,6 @@ class Settings:
 
     # payments
     payments_provider: str
-    webhook_secret: str          # Ko-fi: the verification token
-    provider_api_key: str        # unused for Ko-fi
-    provider_store_id: str       # unused for Ko-fi
-    provider_store_slug: str     # Ko-fi: your page slug, e.g. 'audioforges'
-    provider_test_mode: bool
     claim_ttl_minutes: int       # how long a pre-checkout email claim stays matchable
     packs: dict[str, Pack]
 
@@ -406,24 +381,6 @@ class Settings:
 
     def packs_sorted(self) -> list[Pack]:
         return sorted(self.packs.values(), key=lambda p: p.credits)
-
-    def pack_by_price_ref(self, ref: str) -> Pack | None:
-        """Webhook lookup: which pack did they buy?"""
-        if not ref:
-            return None
-        target = str(ref).strip().lower()
-        for pack in self.packs.values():
-            if pack.price_ref and pack.price_ref.strip().lower() == target:
-                return pack
-        return None
-
-    def pack_by_amount(self, amount_usd: float, tolerance: float = 0.01) -> Pack | None:
-        """Ko-fi fallback: plain donations carry no item code, so match on the
-        amount paid. Used only when price_ref lookup fails."""
-        for pack in self.packs_sorted():
-            if abs(pack.price_usd - amount_usd) <= tolerance:
-                return pack
-        return None
 
 
 def _load_tool_rules() -> dict[str, ToolRule]:
@@ -483,8 +440,6 @@ def _load_packs() -> dict[str, Pack]:
             credits=credits,
             price_usd=_float(f"PACK_{slug}_PRICE_USD", float(cfg.get("price_usd", 0) or 0)),
             label=str(cfg.get("label") or f"{credits} credits"),
-            price_ref=str(_str(f"PACK_{slug}_PRICE_REF") or cfg.get("price_ref", "") or ""),
-            buy_url=str(_str(f"PACK_{slug}_BUY_URL") or cfg.get("buy_url", "") or ""),
         )
     return packs
 
@@ -499,10 +454,7 @@ def build_settings() -> Settings:
             '  python -c "import secrets; print(secrets.token_urlsafe(48))"'
         )
 
-    provider = _str("PAYMENTS_PROVIDER", "kofi").lower().strip()
-    supported = _supported_providers()
-    if provider not in supported:
-        raise RuntimeError(f"PAYMENTS_PROVIDER={provider!r} is not one of {supported}")
+    from .providers import DEFAULT_PROVIDER as provider
 
     settings = Settings(
         db_path=os.getenv("CREDITS_DB_PATH", "data/credits.db"),
@@ -550,11 +502,6 @@ def build_settings() -> Settings:
         device_links_per_hour=_int("DEVICE_LINKS_PER_HOUR", 20),
 
         payments_provider=provider,
-        webhook_secret=os.getenv("PAYMENTS_WEBHOOK_SECRET", ""),
-        provider_api_key=os.getenv("PAYMENTS_API_KEY", ""),
-        provider_store_id=_str("PAYMENTS_STORE_ID", ""),
-        provider_store_slug=_str("PAYMENTS_STORE_SLUG", "audioforges"),
-        provider_test_mode=_bool("PAYMENTS_TEST_MODE", False),
         claim_ttl_minutes=_int("CLAIM_TTL_MINUTES", 120),
         packs=_load_packs(),
 
@@ -649,29 +596,18 @@ def build_settings() -> Settings:
             f"lower FREE_MONTHLY_OPS."
         )
 
-    # Fail at boot, not at the first checkout.
+    # Warn, not refuse: a missing Dodo key only disables checkout (the
+    # /credits/dodo routes answer 503), it must not take the API down.
     if settings.paywall_enabled:
-        if not settings.webhook_secret:
-            raise RuntimeError(
-                "PAYWALL_ENABLED=true requires PAYMENTS_WEBHOOK_SECRET "
-                "(Ko-fi: Settings -> API -> Verification token)"
+        missing = [n for n in ("DODO_API_KEY", "DODO_WEBHOOK_SECRET") if not os.getenv(n)]
+        missing += [f"DODO_PRODUCT_{p.key.upper()}" for p in settings.packs_sorted()
+                    if not os.getenv(f"DODO_PRODUCT_{p.key.upper()}")]
+        if missing:
+            import logging
+            logging.getLogger("credits.config").warning(
+                "PAYWALL_ENABLED=true but checkout is unavailable, missing: %s",
+                ", ".join(missing),
             )
-        for pack in settings.packs_sorted():
-            if not pack.resolved_buy_url(provider, settings.provider_store_slug):
-                raise RuntimeError(
-                    f"PAYWALL_ENABLED=true but pack '{pack.key}' has no checkout link. "
-                    f"Set PACK_{pack.key.upper()}_PRICE_REF (Ko-fi shop item code) "
-                    f"or PACK_{pack.key.upper()}_BUY_URL"
-                )
-        if provider == "kofi":
-            refs = [p.price_ref.strip().lower() for p in settings.packs.values() if p.price_ref]
-            if len(refs) != len(set(refs)):
-                raise RuntimeError("Two packs share the same PACK_*_PRICE_REF — credits would be ambiguous")
-            prices = [p.price_usd for p in settings.packs.values()]
-            if len(prices) != len(set(prices)):
-                raise RuntimeError(
-                    "Two packs share the same price — the Ko-fi amount fallback couldn't tell them apart"
-                )
     return settings
 
 

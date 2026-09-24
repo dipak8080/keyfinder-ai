@@ -1,12 +1,9 @@
-"""Ko-fi's webhook carries no custom data — only the buyer's email. So before
-sending someone to a ko-fi.com/s/<code> link, we record which browser (subject)
-is about to buy which pack, keyed by the email they're about to pay with. When
-the webhook lands, we match on email and credit that same browser silently.
+"""Pending email claims, recorded when a checkout starts.
 
-Best-effort by design: if the match misses (different email at checkout,
-claim expired), the purchase still succeeds — the receipt email's magic link
-recovers it on any device. Nothing is ever blocked by this table; it only
-makes the common case (buy → see credits in the same tab) work smoothly.
+Browser linking now goes through order_sources.subject_id (see fulfil.py),
+so a claim is only consumed on payment, and used for linking only when a
+payment carries no checkout reference. Best-effort: the receipt email's
+magic link recovers a purchase on any device.
 """
 
 from __future__ import annotations

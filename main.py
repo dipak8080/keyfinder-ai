@@ -41,8 +41,6 @@ from credits.ledger import sweep_stale_holds
 from credits.routes import router as credits_router
 from credits.auth import router as credits_auth_router
 from credits.webhook import router as credits_webhook_router
-from credits.paypal_routes import router as credits_paypal_router
-from credits.paddle_routes import router as credits_paddle_router
 from credits.dodo_routes import router as credits_dodo_router
 from credits.admin import router as credits_admin_router
 
@@ -211,7 +209,7 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         # get_settings() raises on genuine misconfiguration (no secret
-        # key, paywall on with no webhook secret). run_credits_migrations()
+        # key, contradictory free limits). run_credits_migrations()
         # above already called it, so reaching here means something odd -
         # log it rather than hiding it, but don't take the app down twice
         # for the same cause.
@@ -547,11 +545,9 @@ app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file tra
 # ---------- CREDITS ----------
 # Three routers, mounted last so nothing above changes shape.
 #
-#   credits_router          /credits/me, /credits/preview, /credits/claim
+#   credits_router          /credits/me, /credits/preview, /credits/turnstile/verify
 #   credits_auth_router     /auth/magic-link, /auth/verify, /auth/logout
 #   credits_webhook_router  /credits/webhook/{provider}
-#   credits_paypal_router   /credits/paypal/config, /order, /capture
-#   credits_paddle_router   /credits/paddle/config, /transaction, /confirm
 #   credits_dodo_router     /credits/dodo/config, /checkout, /confirm
 #
 # All three are live regardless of PAYWALL_ENABLED, on purpose. With the
@@ -561,17 +557,15 @@ app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file tra
 # makes a soft launch possible: sell first, meter second, and never
 # discover on flip day that the payment path was broken all along.
 #
-# CLOUDFLARE: /credits/webhook/kofi, /paypal, /paddle and /dodo must be in the
+# CLOUDFLARE: /credits/webhook/dodo must be in the
 # POST allowlist AND have a bot-fight skip rule. All post
 # server-to-server with no browser, so a JS challenge eats them silently
 # and the payment is simply lost - the failure looks exactly like "the
-# webhook never fired". /credits/paypal/*, /credits/paddle/* and /credits/dodo/* are
-# browser traffic and only need the POST allowlist.
+# webhook never fired". /credits/dodo/* is browser traffic and only needs
+# the POST allowlist.
 app.include_router(credits_router)
 app.include_router(credits_auth_router)
 app.include_router(credits_webhook_router)
-app.include_router(credits_paypal_router)
-app.include_router(credits_paddle_router)
 app.include_router(credits_dodo_router)
 
 # /admin/credits/* - operator surface: cost economics, user lookup,

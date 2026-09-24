@@ -112,8 +112,7 @@ class InsufficientCredits(Exception):
             "free_remaining": self.free_remaining,
             "free_resets_at": next_period_start_iso(),
             "packs": [
-                {"key": p.key, "credits": p.credits, "price_usd": p.price_usd, "label": p.label,
-                 "buy_url": p.resolved_buy_url(s.payments_provider, s.provider_store_slug)}
+                {"key": p.key, "credits": p.credits, "price_usd": p.price_usd, "label": p.label}
                 for p in s.packs_sorted()
             ],
         }
@@ -294,8 +293,7 @@ def summary(identity: Identity) -> dict:
             },
         },
         "packs": [
-            {"key": p.key, "credits": p.credits, "price_usd": p.price_usd, "label": p.label,
-             "buy_url": p.resolved_buy_url(s.payments_provider, s.provider_store_slug)}
+            {"key": p.key, "credits": p.credits, "price_usd": p.price_usd, "label": p.label}
             for p in s.packs_sorted()
         ],
         "held_credits": held,
