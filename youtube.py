@@ -6,6 +6,7 @@ proxy runs out of credit), and a per-account cookie-expiry Discord alert.
 """
 import os
 import re
+import json
 import time
 import base64
 import uuid
@@ -181,6 +182,15 @@ SPLIT_TUNNEL_COOLDOWN_SECONDS = int(os.environ.get("YT_SPLIT_COOLDOWN_SECONDS", 
 # whole process group. That is the bound this phase should rely on - not
 # a read timeout tuned for a completely different failure mode.
 MEDIA_SOCKET_TIMEOUT_SECONDS = int(os.environ.get("YT_MEDIA_SOCKET_TIMEOUT", "30"))
+
+# Direct attempts only (VPS link, no residential exit). yt-dlp's own
+# RetryManager runs BELOW is_cdn_connect_timeout_error's fast-fail, so the
+# old 20s x (3+1) spent ~80s on a dead edge before our handler saw it.
+# 2026-09-24: sn-ojq4f5-51 dropped this IP inside Google's network for hours.
+DIRECT_SOCKET_TIMEOUT_SECONDS = int(os.environ.get("YT_DIRECT_SOCKET_TIMEOUT", "10"))
+DIRECT_RETRIES = int(os.environ.get("YT_DIRECT_RETRIES", "1"))
+MEDIA_DIRECT_RETRIES = int(os.environ.get("YT_MEDIA_DIRECT_RETRIES", "1"))
+DEAD_EDGE_COOLDOWN_SECONDS = int(os.environ.get("YT_DEAD_EDGE_COOLDOWN_SECONDS", str(30 * 60)))
 
 
 def _sticky_proxy_url(proxy_url: Optional[str], session_id: str) -> Optional[str]:
@@ -1421,7 +1431,79 @@ def cdn_breaker_status() -> dict:
         "recent_cdn_timeouts": len(recent),
         "trip_threshold": CDN_DEGRADED_THRESHOLD,
         "window_seconds": CDN_DEGRADED_WINDOW_SECONDS,
+        "dead_edge_sites": dead_edges_snapshot(),
     }
+
+
+# ---------- DEAD EDGE SITES ----------
+# Per-site memory, finer than the global breaker above. One googlevideo
+# site (e.g. sn-ojq4f5-51) can drop this IP while every other site serves
+# fine; remembering it lets requests assigned there skip the doomed direct
+# fetch without pushing healthy sites onto the proxy.
+_EDGE_SITE_RE = re.compile(r"rr\d+---(sn-[a-z0-9-]+)\.googlevideo\.com", re.IGNORECASE)
+DEAD_EDGE_SKIP_MARKER = "dead-edge-skip"
+_dead_edge_lock = threading.Lock()
+_dead_edges: dict = {}
+
+
+def edge_site(text: str) -> Optional[str]:
+    m = _EDGE_SITE_RE.search(text or "")
+    return m.group(1).lower() if m else None
+
+
+def record_dead_edge(site: Optional[str], until: Optional[float] = None):
+    if not site:
+        return
+    deadline = until or (time.time() + DEAD_EDGE_COOLDOWN_SECONDS)
+    with _dead_edge_lock:
+        is_new = _dead_edges.get(site, 0.0) < time.time()
+        _dead_edges[site] = max(_dead_edges.get(site, 0.0), deadline)
+    _record_event("dead_edge", site=site, until=deadline)
+    if is_new:
+        logger.warning(
+            f"[CDN] Edge site {site} unreachable from this IP - direct fetches "
+            f"assigned there skip straight to the fallback for "
+            f"{DEAD_EDGE_COOLDOWN_SECONDS // 60} min."
+        )
+
+
+def is_edge_dead(site: Optional[str]) -> bool:
+    if not site:
+        return False
+    with _dead_edge_lock:
+        return _dead_edges.get(site, 0.0) > time.time()
+
+
+def dead_edges_snapshot() -> dict:
+    now = time.time()
+    with _dead_edge_lock:
+        return {k: int(v - now) for k, v in _dead_edges.items() if v > now}
+
+
+def _info_dead_site(info: Optional[dict]) -> Optional[str]:
+    """The dead site this video's audio would come from, or None. Only
+    returns a site when EVERY audio-only format sits on dead sites, so a
+    mixed manifest still lets yt-dlp pick a live one."""
+    if not info:
+        return None
+    sites = set()
+    for f in info.get("formats") or []:
+        if f.get("vcodec") not in (None, "none") or f.get("acodec") in (None, "none"):
+            continue
+        site = edge_site(f.get("url", ""))
+        if site:
+            sites.add(site)
+    if not sites:
+        return None
+    dead = [s for s in sites if is_edge_dead(s)]
+    return dead[0] if len(dead) == len(sites) else None
+
+
+def _dead_edge_skip_error(site: str) -> Exception:
+    return yt_dlp.utils.DownloadError(
+        f"[download] Got error: Connection to rr0---{site}.googlevideo.com "
+        f"timed out ({DEAD_EDGE_SKIP_MARKER}: site marked unreachable, not dialled)"
+    )
 
 
 def reset_cdn_breaker():
@@ -2070,7 +2152,15 @@ def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
       - PostProcessingError: ffmpeg/disk, nothing to do with the network
       - is_permanent_error(): the video itself is the blocker
     """
+    dead_site = _info_dead_site(info) if extract_opts.get("proxy") else None
+    if dead_site:
+        logger.info(
+            f"[SPLIT] Media assigned to dead edge site {dead_site} - skipping "
+            f"the direct fetch, going straight to the extraction exit."
+        )
     try:
+        if dead_site:
+            raise _dead_edge_skip_error(dead_site)
         with yt_dlp.YoutubeDL(media_opts) as ydl:
             result = ydl.process_ie_result(info, download=True)
         record_path_attempt("direct_media", True)
@@ -2091,14 +2181,19 @@ def _process_media_split(info: dict, extract_opts: dict, media_opts: dict):
         raise
 
     except Exception as media_error:
-        record_path_attempt("direct_media", False)
         media_error_text = str(media_error)
+        skipped = DEAD_EDGE_SKIP_MARKER in media_error_text
+        if not skipped:
+            record_path_attempt("direct_media", False)
 
         if is_permanent_error(media_error_text):
             # Also not counted - see above. The video is the blocker.
             raise
 
-        record_split_media_result(False)
+        if not skipped:
+            record_split_media_result(False)
+            if is_cdn_connect_timeout_error(media_error_text):
+                record_dead_edge(edge_site(media_error_text))
 
         fallback_proxy = extract_opts.get("proxy")
         if not fallback_proxy:
@@ -2231,6 +2326,14 @@ def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] =
                     raise ProxyTooLongError(duration, PROXY_MAX_DURATION_SECONDS)
 
                 if media_opts is None:
+                    if not ydl_opts.get("proxy"):
+                        dead_site = _info_dead_site(info)
+                        if dead_site:
+                            logger.info(
+                                f"[CDN] Audio assigned to dead edge site {dead_site} - "
+                                f"not dialling it, handing off to the fallback."
+                            )
+                            raise _dead_edge_skip_error(dead_site)
                     info = ydl.process_ie_result(info, download=True)
                 else:
                     # Extraction survived, so the proxy already did its one
@@ -2321,6 +2424,9 @@ def _extract_with_backoff(ydl_opts: dict, url: str, media_opts: Optional[dict] =
                 # a different, reachable edge. Fail fast here instead of
                 # burning ~4.5s of pointless backoff on a guaranteed
                 # repeat timeout.
+                if (media_opts is None and not ydl_opts.get("proxy")
+                        and DEAD_EDGE_SKIP_MARKER not in error_text):
+                    record_dead_edge(edge_site(error_text))
                 logger.warning(
                     f"Attempt {attempt}: CDN connect-timeout to a googlevideo "
                     f"edge - not retrying on the same IP: {error_text}"
@@ -2619,6 +2725,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 media_opts = dict(proxied_opts)
                 media_opts.pop("proxy", None)
                 media_opts["socket_timeout"] = MEDIA_SOCKET_TIMEOUT_SECONDS
+                media_opts["retries"] = MEDIA_DIRECT_RETRIES
 
             try:
                 # Capped: each rung here is a PAID extraction, unlike
@@ -2721,6 +2828,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     last_error = None
     for account_path in accounts:
         opts = dict(base_ydl_opts)
+        opts["socket_timeout"] = DIRECT_SOCKET_TIMEOUT_SECONDS
+        opts["retries"] = DIRECT_RETRIES
         if account_path:
             opts["cookiefile"] = account_path
         else:
@@ -2758,7 +2867,8 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # stops future requests from paying the same cost. Only
                 # recorded here (direct path); the proxy attempt below
                 # deliberately doesn't count toward it.
-                record_cdn_timeout()
+                if DEAD_EDGE_SKIP_MARKER not in error_text:
+                    record_cdn_timeout()
 
                 # DO NOT fall through to the cookie-disable check below.
                 #
@@ -2970,21 +3080,52 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 _events_lock = threading.Lock()
 _recorded_events: list = []
 _record_events_enabled = False
+_events_stream_path: Optional[str] = None
 
 
-def enable_event_recording():
+def enable_event_recording(stream_path: Optional[str] = None):
     """Called ONCE by download_worker.py at startup. The parent process
     never calls this, so _record_event is a no-op there and apply_events
-    below cannot recurse into the recorder."""
-    global _record_events_enabled
+    below cannot recurse into the recorder.
+
+    stream_path: every event is also appended there as it happens, so a
+    worker SIGKILLed on the wall clock still reports what it learned.
+    Before this, every killed job's CDN timeouts were lost and the
+    breaker stayed CLOSED through the 2026-09-24 outage."""
+    global _record_events_enabled, _events_stream_path
     _record_events_enabled = True
+    _events_stream_path = stream_path
 
 
 def _record_event(kind: str, **payload):
     if not _record_events_enabled:
         return
+    event = {"kind": kind, **payload}
     with _events_lock:
-        _recorded_events.append({"kind": kind, **payload})
+        _recorded_events.append(event)
+        if _events_stream_path:
+            try:
+                with open(_events_stream_path, "a") as f:
+                    f.write(json.dumps(event) + "\n")
+            except Exception:
+                pass
+
+
+def read_event_stream(path: str) -> list:
+    """Parent-side: events a killed or crashed worker streamed before dying."""
+    events = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        events.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return events
 
 
 def drain_events() -> list:
@@ -3027,6 +3168,8 @@ def apply_events(events: list):
                 record_path_attempt(ev.get("via", "direct"), ev.get("ok", False))
             elif kind == "split_media":
                 record_split_media_result(ev.get("ok", False))
+            elif kind == "dead_edge" and ev.get("site"):
+                record_dead_edge(ev["site"], ev.get("until"))
             elif kind == "anon_result":
                 record_anon_result(bool(ev.get("botchecked")))
             elif kind == "client_result" and ev.get("key"):
@@ -3065,6 +3208,7 @@ def export_breaker_state() -> dict:
         "account_order": plan_account_order(),
         "anon_skip_until": _anon_skip_until,
         "client_demoted": sorted(_active_client_demotions()),
+        "dead_edges": dict(_dead_edges),
     }
 
 
@@ -3093,5 +3237,10 @@ def import_breaker_state(state: dict):
         with _anon_lock:
             _anon_skip_until = float(state.get("anon_skip_until") or 0.0)
         _client_demoted_frozen = set(state.get("client_demoted") or [])
+        with _dead_edge_lock:
+            _dead_edges.clear()
+            _dead_edges.update({
+                k: float(v) for k, v in (state.get("dead_edges") or {}).items()
+            })
     except Exception as e:
         logger.warning(f"[BREAKER] Failed to import parent breaker state: {e}")

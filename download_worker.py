@@ -60,7 +60,7 @@ def main():
 
     # Order matters: recording on BEFORE any work, so nothing that trips
     # during import_breaker_state or the download itself is missed.
-    enable_event_recording()
+    enable_event_recording(payload.get("events_path"))
     import_breaker_state(payload.get("breaker_state"))
 
     # Reconstructed here, not passed in - a live logger object cannot

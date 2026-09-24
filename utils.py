@@ -407,11 +407,20 @@ async def run_in_killable_subprocess(
     """
     input_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_in.json")
     output_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_out.json")
+    events_path = os.path.join(UPLOAD_DIR, f"{job_id}_worker_events.jsonl")
 
     # Imported lazily: youtube.py does not import utils, so there is no
     # cycle today, but a module-level import here would create one the
     # moment it ever does.
-    from youtube import export_breaker_state, apply_events
+    from youtube import export_breaker_state, apply_events, read_event_stream
+
+    def _apply_streamed_events():
+        # A killed or crashed worker never writes its output file, so its
+        # breaker events only survive in the stream it appended as it went.
+        try:
+            apply_events(read_event_stream(events_path))
+        except Exception as e:
+            logger.warning(f"[DOWNLOAD_WORKER] job={job_id} failed to apply streamed events: {e}")
 
     try:
         with open(input_path, "w") as f:
@@ -427,6 +436,7 @@ async def run_in_killable_subprocess(
                     "breaker_state": export_breaker_state(),
                     "progress_label": progress_label,
                     "request_id": request_id,
+                    "events_path": events_path,
                 },
                 f,
             )
@@ -463,6 +473,7 @@ async def run_in_killable_subprocess(
                 # Process already exited between the timeout firing and us
                 # trying to kill it - harmless race, nothing left to kill.
                 pass
+            _apply_streamed_events()
             return {"ok": False, "kind": "timeout", "error": "Download timed out."}
 
         if proc.returncode != 0:
@@ -470,6 +481,7 @@ async def run_in_killable_subprocess(
                 f"[DOWNLOAD_WORKER] job={job_id} exited with code {proc.returncode} "
                 f"(see worker's own log lines above for detail)"
             )
+            _apply_streamed_events()
             return {
                 "ok": False,
                 "kind": "crashed",
@@ -484,6 +496,7 @@ async def run_in_killable_subprocess(
                 f"[DOWNLOAD_WORKER] job={job_id} produced no valid output file: {e} "
                 f"(see worker's own log lines above for detail)"
             )
+            _apply_streamed_events()
             return {
                 "ok": False,
                 "kind": "crashed",
@@ -503,3 +516,4 @@ async def run_in_killable_subprocess(
     finally:
         cleanup_file(input_path)
         cleanup_file(output_path)
+        cleanup_file(events_path)
