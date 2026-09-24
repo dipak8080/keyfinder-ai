@@ -193,6 +193,10 @@ DIRECT_SOCKET_TIMEOUT_SECONDS = int(os.environ.get("YT_DIRECT_SOCKET_TIMEOUT", "
 DIRECT_RETRIES = int(os.environ.get("YT_DIRECT_RETRIES", "1"))
 MEDIA_DIRECT_RETRIES = int(os.environ.get("YT_MEDIA_DIRECT_RETRIES", "1"))
 DEAD_EDGE_COOLDOWN_SECONDS = int(os.environ.get("YT_DEAD_EDGE_COOLDOWN_SECONDS", str(30 * 60)))
+# Cookie accounts to try direct after an anon attempt hits an already-known
+# dead edge. The skip costs no dial, and a cookie session can be handed a
+# reachable node in the same cluster, which beats the slow proxy path.
+EDGE_SKIP_ROTATIONS = int(os.environ.get("YT_EDGE_SKIP_ROTATIONS", "1"))
 
 
 def _sticky_proxy_url(proxy_url: Optional[str], session_id: str) -> Optional[str]:
@@ -2990,6 +2994,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         accounts = [None] + cookie_accounts
 
     last_error = None
+    edge_skip_rotations = 0
     for account_path in accounts:
         opts = dict(base_ydl_opts)
         opts["socket_timeout"] = DIRECT_SOCKET_TIMEOUT_SECONDS
@@ -3033,6 +3038,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # deliberately doesn't count toward it.
                 if DEAD_EDGE_SKIP_MARKER not in error_text:
                     record_cdn_timeout()
+                elif edge_skip_rotations < EDGE_SKIP_ROTATIONS:
+                    edge_skip_rotations += 1
+                    logger.info("[CDN] Known dead edge - trying the next account direct before the proxy.")
+                    continue
 
                 # DO NOT fall through to the cookie-disable check below.
                 #
