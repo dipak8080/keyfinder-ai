@@ -2953,6 +2953,16 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                     )
                     continue
 
+                if (is_proxy_outage_error(proxy_error_text)
+                        and not is_proxy_billing_error(proxy_error_text)
+                        and session_attempt < PROXY_TLS_MAX_SESSIONS):
+                    logger.warning(
+                        f"[PROXY] Exit session {session_id} refused the tunnel (attempt "
+                        f"{session_attempt}/{PROXY_TLS_MAX_SESSIONS}) - rolling a fresh "
+                        f"session. A dropped residential peer, not a gateway outage."
+                    )
+                    continue
+
                 left = seconds_left()
                 if (SLOW_TRANSFER_MARKER in proxy_error_text
                         and session_attempt < PROXY_TLS_MAX_SESSIONS
