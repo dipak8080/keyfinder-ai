@@ -141,7 +141,7 @@ AudioForges
 &nbsp;·&nbsp; Free audio tools, no sign-up.
 </p>
 <p style="margin:8px 0 0;font-family:{FONT};font-size:12px;line-height:1.7;color:{SUBTLE}">
-If you didn't request this, you can ignore this email — nothing will happen.
+If you didn't expect this email, you can safely ignore it.
 </p>
 </td></tr>
 
@@ -208,7 +208,7 @@ def magic_link_email(link: str, minutes: int) -> tuple[str, str, str]:
         "audioforges.com"
     )
     return ("Sign in to AudioForges",
-            _wrap(body, f"Your sign-in link — expires in {minutes} minutes."),
+            _wrap(body, f"Your sign-in link. It expires in {minutes} minutes."),
             text)
 
 
@@ -235,19 +235,22 @@ def receipt_email(credits: int, balance: int, link: str) -> tuple[str, str, str]
 
     body = (
         _heading(f"{credits} {word} added")
-        + _lede("Thanks for supporting AudioForges. Your credits work on every "
-                "GPU-backed tool on the site, and there is nothing recurring to "
-                "cancel.")
+        + _lede("Thanks for your purchase. Your credits work on every paid tool "
+                "on the site, and nothing renews.")
         + balance_block
         + _cta(link, "Open my account")
-        + _lede("Use that link to reach your credits on any device — phone, "
+        + _lede("Use that link to reach your credits on any device: phone, "
                 "laptop, or a browser you haven't used before.")
         + _raw_link(link)
+        + _lede("A problem with a run or your purchase? Email "
+                '<a href="mailto:contact@audioforges.com" style="color:inherit">'
+                "contact@audioforges.com</a> and we'll sort it out.")
     )
     text = (
         f"{credits} AudioForges {word} added\n\n"
         f"Balance: {balance} {bal_word}. Credits never expire.\n\n"
         f"Reach them on any device:\n{link}\n\n"
+        "A problem with a run or your purchase? Email contact@audioforges.com.\n\n"
         "audioforges.com"
     )
     return (f"{credits} AudioForges {word} added",
