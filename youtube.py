@@ -44,6 +44,7 @@ from config import (
 from monitoring import alert_now
 from yt_dlp.extractor.youtube import YoutubeIE as _YoutubeIE
 import cookie_health
+import yt_ledger
 
 
 class VideoTooLongError(Exception):
@@ -1854,6 +1855,43 @@ def _health_entry(path: str) -> dict:
     })
 
 
+def classify_failure(error_text: str) -> str:
+    if is_permanent_error(error_text):
+        return "video_unavailable"
+    if is_bot_check_error(error_text):
+        return "bot_check"
+    if is_media_forbidden_error(error_text):
+        return "media_403"
+    if is_format_unavailable_error(error_text):
+        return "format_unavailable"
+    if is_page_reload_error(error_text):
+        return "page_reload"
+    if is_age_restricted_error(error_text) or is_members_only_error(error_text) or is_music_premium_error(error_text):
+        return "account_gated"
+    if is_cdn_connect_timeout_error(error_text) or is_cdn_read_timeout_error(error_text):
+        return "cdn_timeout"
+    if is_proxy_billing_error(error_text) or is_proxy_quota_error(error_text):
+        return "proxy_billing"
+    if is_proxy_tls_error(error_text) or is_proxy_outage_error(error_text):
+        return "proxy_network"
+    if SLOW_TRANSFER_MARKER in error_text:
+        return "slow_transfer"
+    return "other"
+
+
+def _ledger_attempt(path: Optional[str], ok: bool, via: str, error_text: str):
+    account = os.path.basename(path) if path else "anon"
+    if ok:
+        yt_ledger.record_attempt(via, account, True)
+        return
+    kind = classify_failure(error_text)
+    detail = ""
+    if kind == "other":
+        detail = re.sub(r"https?://\S+", "URL", error_text)
+        detail = re.sub(r"\] [\w-]{11}:", "] ID:", detail)
+    yt_ledger.record_attempt(via, account, False, kind, failure_phase(error_text), detail)
+
+
 def record_account_result(
     path: Optional[str],
     ok: bool,
@@ -1870,6 +1908,8 @@ def record_account_result(
     single most useful signal here back into an ambiguous failure count.
     """
     _record_event("account_result", path=path, ok=ok, via=via, error_text=error_text)
+    if not _record_events_enabled:
+        _ledger_attempt(path, ok, via, error_text)
     if not path:
         return
     now = time.time()
