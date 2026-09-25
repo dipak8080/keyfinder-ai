@@ -1206,6 +1206,13 @@ YOUTUBE_ANALYZE_JOB_TTL_SECONDS = int(os.environ.get("YOUTUBE_ANALYZE_JOB_TTL_SE
 
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_DEMUCS_ENDPOINT_ID = os.environ.get("RUNPOD_DEMUCS_ENDPOINT_ID", "")
+# Optional second endpoint (same image) for credit-paid runs, so paid jobs
+# never queue behind free ones. Unset = everything uses the endpoint above.
+RUNPOD_PAID_ENDPOINT_ID = os.environ.get("RUNPOD_PAID_ENDPOINT_ID", "")
+
+# Reuse outputs when the exact same file is separated again with the same
+# settings while the earlier job is still alive (hardlinks, no GPU, no disk).
+SEPARATION_CACHE_ENABLED = os.environ.get("SEPARATION_CACHE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # ---------- GPU WORKER INTERNAL AUTH ----------
 # Shared secret both sides check for the direct HTTP file transfer

@@ -402,6 +402,7 @@ async def _queue_separation(
             })
 
     is_stems = job_type in ("stems",)
+    run_ctx = {"paid": False}
 
     if is_stems:
         # No run_blocking() here - run_stem_separation() is now `async
@@ -413,7 +414,7 @@ async def _queue_separation(
         # "why this changed" reasoning.
         work = lambda: run_stem_separation(
             file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
-            vocal_options, stem_count,
+            vocal_options, stem_count, paid=run_ctx["paid"],
         )
         on_success = lambda stems: mark_stems_complete(job_id, original_filename, stems)
         success_detail = lambda stems: f"{len(stems)} stems"
@@ -421,7 +422,7 @@ async def _queue_separation(
     else:
         work = lambda: run_separation(
             file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
-            vocal_options,
+            vocal_options, paid=run_ctx["paid"],
         )
         on_success = lambda paths: mark_complete(
             job_id, original_filename, paths[0], paths[1],
@@ -485,6 +486,7 @@ async def _queue_separation(
                 identity, job_id=job_id, tool=rule_key, input_seconds=duration,
                 extra_credits=extra_credits,
             ) as charge:
+                run_ctx["paid"] = charge.charge_type == "credit"
                 _spawn()
         except BaseException:
             metering.record_job_rejected(job_id, "blocked_at_submit")
@@ -513,6 +515,8 @@ async def _queue_separation(
 
     depth = count_processing(SEPARATION_JOB_TYPES)
     detail = f"model={model} queue={depth}/{MAX_QUEUED_SEPARATIONS}"
+    if run_ctx["paid"]:
+        detail += " lane=paid"
     if vocal_options or stem_count != 4:
         detail += f" options={','.join(vocal_options) or '-'} stems={stem_count}"
     if billing:

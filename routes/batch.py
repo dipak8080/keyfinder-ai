@@ -232,6 +232,14 @@ def _hold_state(job_id: str) -> Optional[str]:
     return row["status"] if row else None
 
 
+def _paid_with_credits(job_id: str) -> bool:
+    from credits.db import connect
+
+    with connect() as conn:
+        row = conn.execute("SELECT charge_type FROM job_charges WHERE job_id=?", (job_id,)).fetchone()
+    return bool(row) and row["charge_type"] == "credit"
+
+
 async def _run_one(batch_id: str, kind: dict, job_id: str) -> None:
     job = get_job(job_id)
     if job is None or job.get("status") != "queued":
@@ -249,12 +257,13 @@ async def _run_one(batch_id: str, kind: dict, job_id: str) -> None:
 
     title = job.get("title") or os.path.basename(input_path)
     is_stems = kind["job_type"] == "stems"
+    paid = await asyncio.to_thread(_paid_with_credits, job_id)
     set_job_context(tool="STEMS" if is_stems else "SEPARATION", tier="hq")
 
     if is_stems:
         work = lambda: run_stem_separation(
             input_path, job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
-            DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
+            DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ, paid=paid,
         )
         on_success = lambda stems: mark_stems_complete(job_id, title, stems)
         success_detail = lambda stems: f"{len(stems)} stems"
@@ -262,7 +271,7 @@ async def _run_one(batch_id: str, kind: dict, job_id: str) -> None:
     else:
         work = lambda: run_separation(
             input_path, job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
-            DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
+            DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ, paid=paid,
         )
         on_success = lambda paths: mark_complete(job_id, title, paths[0], paths[1])
         success_detail = None

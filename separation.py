@@ -102,6 +102,8 @@ metering failure must never turn a working separation into a failed one.
 --------------------------------------------------------------------------
 """
 import os
+import json
+import hashlib
 from typing import Dict, Tuple
 
 from config import (
@@ -116,10 +118,14 @@ from config import (
     FFMPEG_PATH,
     RUNPOD_API_KEY,
     RUNPOD_DEMUCS_ENDPOINT_ID,
+    RUNPOD_PAID_ENDPOINT_ID,
+    SEPARATION_CACHE_ENABLED,
+    SEPARATION_JOB_TTL_SECONDS,
 )
 from utils import run_blocking
 from runpod_client import run_worker_job, RunPodJobError
 from gpu_internal_routes import register_gpu_input, unregister_gpu_input
+from redis_store import client as _redis
 
 # Recorded, never enforced - see this module's 2026-08-25 note.
 from credits import metering
@@ -260,6 +266,7 @@ async def _run_demucs_on_gpu(
     timeout_seconds: int,
     max_duration_seconds: int,
     extra_input: dict | None = None,
+    paid: bool = False,
 ) -> dict:
     """
     Shared engine for both public entry points below. Validates, makes
@@ -325,11 +332,13 @@ async def _run_demucs_on_gpu(
         logger.info(
             f"[SEPARATION] Job {job_id}: submitting to RunPod GPU worker "
             f"(model={model}, overlap={overlap}, task={task}, duration={duration:.1f}s"
-            f"{', extras=' + str(extra_input) if extra_input else ''})"
+            f"{', extras=' + str(extra_input) if extra_input else ''}"
+            f"{', queue=paid' if paid and RUNPOD_PAID_ENDPOINT_ID else ''})"
         )
+        endpoint_id = RUNPOD_PAID_ENDPOINT_ID if (paid and RUNPOD_PAID_ENDPOINT_ID) else RUNPOD_DEMUCS_ENDPOINT_ID
         try:
             output = await run_worker_job(
-                RUNPOD_DEMUCS_ENDPOINT_ID, RUNPOD_API_KEY, input_payload, timeout_seconds,
+                endpoint_id, RUNPOD_API_KEY, input_payload, timeout_seconds,
             )
         except RunPodJobError as e:
             error_text = str(e)
@@ -396,6 +405,80 @@ async def _run_demucs_on_gpu(
     return output
 
 
+_CACHE_PREFIX = "af:sepcache:"
+
+
+def _fingerprint(input_path: str, task: str, model: str, overlap: float, extra_input: dict | None) -> str:
+    h = hashlib.sha256()
+    with open(input_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    settings = {"task": task, "model": model, "overlap": overlap, "extra": extra_input or {}}
+    h.update(json.dumps(settings, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _reuse_cached(fingerprint: str, job_id: str, expected_paths: dict) -> bool:
+    """Hardlinks a live earlier job's outputs into this job's paths."""
+    source_job = _redis.get(_CACHE_PREFIX + fingerprint)
+    if not source_job or source_job == job_id:
+        return False
+    sources = {
+        name: os.path.join(SEPARATION_DIR, f"{source_job}_{name}.wav")
+        for name in expected_paths
+    }
+    if not all(os.path.exists(p) for p in sources.values()):
+        return False
+    linked = []
+    try:
+        for name, dest in expected_paths.items():
+            if os.path.exists(dest):
+                os.remove(dest)
+            os.link(sources[name], dest)
+            linked.append(dest)
+    except OSError as e:
+        logger.warning(f"[SEPARATION] Job {job_id}: cache link from {source_job} failed ({e}), using GPU")
+        for path in linked:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return False
+    logger.info(f"[SEPARATION] Job {job_id}: reused outputs of {source_job} (same file and settings, no GPU)")
+    return True
+
+
+def _remember_outputs(fingerprint: str, job_id: str) -> None:
+    try:
+        _redis.set(_CACHE_PREFIX + fingerprint, job_id, ex=max(60, SEPARATION_JOB_TTL_SECONDS - 300))
+    except Exception:
+        logger.warning(f"[SEPARATION] Job {job_id}: could not record cache entry", exc_info=True)
+
+
+async def _separate_or_reuse(input_path: str, job_id: str, task: str, model: str, overlap: float,
+                             timeout_seconds: int, max_duration_seconds: int,
+                             extra_input: dict, expected_paths: dict, paid: bool) -> None:
+    fingerprint = None
+    if SEPARATION_CACHE_ENABLED:
+        try:
+            fingerprint = await run_blocking(_fingerprint, input_path, task, model, overlap, extra_input)
+            if _reuse_cached(fingerprint, job_id, expected_paths):
+                metering.record_job_finished(job_id, status="completed", gpu_seconds=0.0, gpu_type="cache")
+                _remember_outputs(fingerprint, job_id)
+                return
+        except Exception:
+            logger.warning(f"[SEPARATION] Job {job_id}: cache check failed, using GPU", exc_info=True)
+            fingerprint = None
+
+    await _run_demucs_on_gpu(
+        input_path, job_id, task, model, overlap, timeout_seconds, max_duration_seconds,
+        extra_input, paid,
+    )
+    _verify_output_files(job_id, expected_paths)
+    if fingerprint:
+        _remember_outputs(fingerprint, job_id)
+
+
 def _verify_output_files(job_id: str, expected_paths: dict) -> None:
     """
     By the time run_worker_job() returns success, the worker has already
@@ -432,6 +515,7 @@ async def run_separation(
     vocal_options=(),
     clip_start=None,
     clip_seconds=None,
+    paid: bool = False,
 ) -> Tuple[str, str]:
     """
     Two-stem (vocal remover) mode. Returns (vocals_path,
@@ -442,16 +526,14 @@ async def run_separation(
     final_instrumental_path = os.path.join(SEPARATION_DIR, f"{job_id}_instrumental.wav")
     extra_input = {**_studio_payload(model, vocal_options, 4), **_clip_payload(clip_start, clip_seconds)}
 
-    await _run_demucs_on_gpu(
+    await _separate_or_reuse(
         input_path, job_id, "separate", model, overlap, timeout_seconds, max_duration_seconds,
-        extra_input,
+        extra_input, {
+            "vocals": final_vocals_path,
+            "instrumental": final_instrumental_path,
+            **extra_stem_paths(job_id, vocal_options),
+        }, paid,
     )
-
-    _verify_output_files(job_id, {
-        "vocals": final_vocals_path,
-        "instrumental": final_instrumental_path,
-        **extra_stem_paths(job_id, vocal_options),
-    })
 
     logger.info(
         f"[SEPARATION] Job {job_id} complete (model={model}, GPU): "
@@ -471,6 +553,7 @@ async def run_stem_separation(
     stem_count: int = 4,
     clip_start=None,
     clip_seconds=None,
+    paid: bool = False,
 ) -> Dict[str, str]:
     """
     Full multi-stem mode. Returns a {stem_name: path} dict - identical
@@ -492,12 +575,10 @@ async def run_stem_separation(
     }
     final_paths.update(extra_stem_paths(job_id, vocal_options))
 
-    await _run_demucs_on_gpu(
+    await _separate_or_reuse(
         input_path, job_id, "stems", model, overlap, timeout_seconds, max_duration_seconds,
-        extra_input,
+        extra_input, final_paths, paid,
     )
-
-    _verify_output_files(job_id, final_paths)
 
     logger.info(
         f"[STEMS] Job {job_id} complete (model={model}, GPU, {len(final_paths)} stems): "

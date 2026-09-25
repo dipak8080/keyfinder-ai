@@ -373,11 +373,12 @@ async def _queue_upgrade(
         set_job_input(new_job_id, input_path)
 
         is_stems = job["job_type"] in ("stems", "youtube_stems")
+        run_ctx = {"paid": False}
         if is_stems:
             work = lambda: run_stem_separation(
                 input_path, new_job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
                 DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
-                vocal_options, stem_count,
+                vocal_options, stem_count, paid=run_ctx["paid"],
             )
             on_success = lambda stems: mark_stems_complete(new_job_id, original_filename, stems)
             success_detail = lambda stems: f"{len(stems)} stems (upgrade)"
@@ -386,7 +387,7 @@ async def _queue_upgrade(
             work = lambda: run_separation(
                 input_path, new_job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
                 DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
-                vocal_options,
+                vocal_options, paid=run_ctx["paid"],
             )
             on_success = lambda paths: mark_complete(
                 new_job_id, original_filename, paths[0], paths[1],
@@ -399,6 +400,7 @@ async def _queue_upgrade(
             identity, job_id=new_job_id, tool=rule_key, input_seconds=duration,
             extra_credits=extra_credits,
         ) as charge:
+            run_ctx["paid"] = charge.charge_type == "credit"
             spawn_background_task(_run_tool_job(
                 tool=tool, metric=metric_label, job_id=new_job_id,
                 semaphore=_separation_semaphore, work=work, on_success=on_success,
