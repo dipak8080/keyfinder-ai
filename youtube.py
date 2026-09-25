@@ -476,7 +476,24 @@ _client_demoted_frozen = None      # worker-side snapshot
 
 
 def _client_key(has_cookies: bool, clients) -> str:
-    return ("ck:" if has_cookies else "anon:") + "+".join(clients)
+    if has_cookies:
+        prefix = "ck:"
+    else:
+        prefix = "anon6:" if ipv4_only._allow_ipv6 else "anon:"
+    return prefix + "+".join(clients)
+
+
+def _client_alert_worthy(key: str) -> bool:
+    """Only a primary client going dark is worth a Discord ping. Backup rungs
+    demote silently, and anon on the IPv4 is already known dead while the
+    canary says so. Real user impact is caught by the canary traffic leg."""
+    prefix, _, clients = key.partition(":")
+    base = CLIENT_LADDER_WITH_COOKIES if prefix == "ck" else CLIENT_LADDER_NO_COOKIES
+    if clients != "+".join(base[0]):
+        return False
+    if prefix == "anon" and canary_says_anon_dead():
+        return False
+    return True
 
 
 def record_client_result(key: str, ok: bool):
@@ -510,14 +527,10 @@ def record_client_result(key: str, ok: bool):
                         f"the other clients. YouTube likely changed this client: check for a "
                         f"newer yt-dlp release."
                     )
-                    if key.startswith("anon:"):
-                        message += (
-                            " If several anon: clients alert together, it is the VPS IP, "
-                            "not the clients: downloads fall through to the cookie accounts."
-                        )
     if message:
         logger.warning(message)
-        alert_now(message)
+        if _client_alert_worthy(key):
+            alert_now(message)
 
 
 def _active_client_demotions() -> set:
@@ -1941,6 +1954,8 @@ def _health_entry(path: str) -> dict:
 
 
 def classify_failure(error_text: str) -> str:
+    if "which exceeds the" in error_text and "min limit" in error_text:
+        return "too_long"
     if is_permanent_error(error_text):
         return "video_unavailable"
     if is_bot_check_error(error_text):
