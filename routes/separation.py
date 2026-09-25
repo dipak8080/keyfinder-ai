@@ -107,7 +107,11 @@ from config import (
     STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
     STEMS_HQ_RATE_LIMIT_WINDOW_SECONDS,
     MAX_QUEUED_SEPARATIONS,
+    MAX_UPLOAD_BYTES,
+    MAX_VIDEO_UPLOAD_BYTES,
+    ALLOWED_VIDEO_INPUT_FORMATS,
 )
+from audio_common import AudioToolError
 from rate_limit import check_rate_limit
 from separation_limits import shared_separation_limit
 from jobs import (
@@ -139,6 +143,34 @@ from ._shared import stem_download_response, spawn_background_task, _accept_uplo
 router = APIRouter()
 
 
+_COPY_TARGET = {"aac": "m4a", "mp3": "mp3", "flac": "flac", "opus": "ogg", "vorbis": "ogg", "pcm_s16le": "wav"}
+
+
+def _is_video_upload(filename: str | None) -> bool:
+    ext = (filename or "").rsplit(".", 1)[-1].strip().lower() if "." in (filename or "") else ""
+    return ext in ALLOWED_VIDEO_INPUT_FORMATS
+
+
+async def _audio_from_video(job_id: str, video_path: str) -> tuple[str, int]:
+    """Keeps only the audio of an uploaded video, copied without re-encoding
+    when the codec allows, otherwise as lossless FLAC. The video is deleted
+    so only audio travels to the GPU worker."""
+    from video_to_audio import probe_audio_stream, extract_audio
+
+    base = video_path.rsplit(".", 1)[0]
+    try:
+        codec, _ = await run_blocking(probe_audio_stream, video_path)
+        target = _COPY_TARGET.get(codec, "flac")
+        audio_path = f"{base}_audio.{target}"
+        await run_blocking(extract_audio, video_path, audio_path, target)
+    except AudioToolError as e:
+        cleanup_file(video_path)
+        mark_failed(job_id, str(e))
+        raise HTTPException(400, {"kind": "video_unreadable", "message": str(e)})
+    cleanup_file(video_path)
+    return audio_path, os.path.getsize(audio_path)
+
+
 def youtube_studio_enabled() -> bool:
     return get_credit_settings().youtube_studio_enabled
 
@@ -157,6 +189,10 @@ def studio_config(response: Response) -> dict:
         "preview": s.studio_preview_enabled,
         "preview_seconds": s.studio_preview_seconds,
         "google_signin": bool(s.google_client_id and s.google_client_secret),
+        "video_input": {
+            "formats": sorted(ALLOWED_VIDEO_INPUT_FORMATS),
+            "max_mb": max(MAX_UPLOAD_BYTES, MAX_VIDEO_UPLOAD_BYTES) // (1024 * 1024),
+        },
         "signup_bonus_credits": s.signup_bonus_credits,
         "free_needs_account": s.free_ops_require_account,
         "studio_pass": {
@@ -358,7 +394,13 @@ async def _queue_separation(
     job_id = create_job(job_type=job_type)
 
     remember_job_tags(job_id)
-    file_path, size = await _accept_upload(file, job_id, label=tool.lower())
+    is_video = _is_video_upload(original_filename)
+    file_path, size = await _accept_upload(
+        file, job_id, label=tool.lower(),
+        max_bytes=max(MAX_UPLOAD_BYTES, MAX_VIDEO_UPLOAD_BYTES) if is_video else MAX_UPLOAD_BYTES,
+    )
+    if is_video:
+        file_path, size = await _audio_from_video(job_id, file_path)
 
     # Retain the source for this job's TTL so a completed job can be
     # upgraded to HQ without a second upload. Paired with the empty
