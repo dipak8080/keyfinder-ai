@@ -19,7 +19,7 @@ from .security import sign, unsign
 log = logging.getLogger("credits.notifications")
 
 UNSUB_PURPOSE = "email_unsubscribe"
-PRIORITY = {"low_balance": 1, "free_song": 5, "update": 9}
+PRIORITY = {"low_balance": 1, "referral": 3, "free_song": 5, "update": 9}
 
 
 def unsubscribe_url(account_id: str, scope: str) -> str:
@@ -43,7 +43,7 @@ def apply_unsubscribe(account_id: str, scope: str) -> None:
         conn.execute(f"UPDATE accounts SET {fields} WHERE id=?", (account_id,))
         conn.execute("UPDATE email_outbox SET status='skipped' WHERE account_id=? AND status='queued'"
                      + ("" if scope == "all" else
-                        " AND kind IN ('free_song','update')" if scope == "updates" else " AND kind='low_balance'"),
+                        " AND kind IN ('free_song','update')" if scope == "updates" else " AND kind IN ('low_balance','referral')"),
                      (account_id,))
     log.info("account %s unsubscribed from %s", account_id, scope)
 
@@ -104,6 +104,17 @@ def maybe_low_balance(identity: Identity, balance_after: int | None) -> bool:
     except Exception:  # noqa: BLE001
         log.warning("low balance email not queued", exc_info=True)
         return False
+
+
+def queue_referral_reward(conn, account_id: str, payment_id: str) -> None:
+    s = get_settings()
+    acc = conn.execute("SELECT email, email_notices FROM accounts WHERE id=?", (account_id,)).fetchone()
+    if acc is None or not acc["email_notices"]:
+        return
+    unsub = unsubscribe_url(account_id, "notices")
+    subject, html, text = mailer.referral_reward_email(s.referral_reward_credits, f"{s.frontend_url}/account", unsub)
+    _enqueue(conn, account_id=account_id, email=acc["email"], kind="referral",
+             dedupe_key=f"referral:{account_id}:{payment_id}", subject=subject, html=html, text=text, unsub=unsub)
 
 
 def queue_monthly_free_song(now: datetime | None = None) -> int:
@@ -173,7 +184,7 @@ async def send_queued(max_batch: int = 20) -> dict:
                FROM email_outbox o LEFT JOIN accounts a ON a.id=o.account_id
                WHERE o.status='queued' ORDER BY o.priority, o.id LIMIT ?""", (room,)).fetchall()
     for r in rows:
-        allowed = r["email_notices"] if r["kind"] == "low_balance" else r["email_updates"]
+        allowed = r["email_notices"] if r["kind"] in ("low_balance", "referral") else r["email_updates"]
         if not allowed:
             status, error, sent_at = "skipped", None, None
         else:

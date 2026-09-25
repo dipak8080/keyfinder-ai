@@ -44,6 +44,10 @@ def _reverse(payment_id: str, fraction: float, *, key: str, status: str, reason:
                          kind="chargeback", idempotency_key=key, order_id=order["id"],
                          note=f"{reason}: {taken} of {target} credits taken back")
         conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order["id"]))
+        from . import referrals
+        referral_taken = referrals.reverse_for_payment(conn, payment_id)
+        if referral_taken:
+            log.warning("%s for %s: took back %s referral credits", reason, payment_id, referral_taken)
 
     short = target - taken
     log.warning("%s for %s (%s): took back %s of %s credits", reason, payment_id, order["email"], taken, target)

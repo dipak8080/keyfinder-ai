@@ -183,3 +183,24 @@ def unsubscribe_one_click(t: str = "") -> dict:
     if not ok:
         raise HTTPException(status_code=400, detail={"error": "invalid_token"})
     return {"ok": True}
+
+class ReferralClaim(BaseModel):
+    code: str = Field(..., min_length=4, max_length=16, pattern=r"^[A-Za-z0-9]+$")
+
+
+def _claim_limit(request: Request) -> None:
+    check_rate_limit(request, max_requests=30, window_seconds=3600)
+
+
+@router.get("/referral")
+def referral_info(response: Response, identity: Identity = Depends(paywall.get_identity)) -> dict:
+    from . import referrals
+    response.headers["Cache-Control"] = "no-store"
+    return referrals.summary(_require_account(identity))
+
+
+@router.post("/referral/claim", dependencies=[Depends(_claim_limit)])
+def referral_claim(body: ReferralClaim, identity: Identity = Depends(paywall.get_identity)) -> dict:
+    from . import referrals
+    result = referrals.claim(identity, body.code)
+    return {"ok": result == "ok", "result": result}

@@ -195,6 +195,7 @@ def studio_config(response: Response) -> dict:
         },
         "signup_bonus_credits": s.signup_bonus_credits,
         "free_needs_account": s.free_ops_require_account,
+        "referral": {"enabled": s.referral_enabled, "reward_credits": s.referral_reward_credits},
         "studio_pass": {
             "available": s.studio_pass_enabled,
             "price_usd": s.studio_pass_price_usd,

@@ -402,6 +402,11 @@ class Settings:
     email_monthly_free_song_enabled: bool
     email_daily_cap: int
 
+    # referrals
+    referral_enabled: bool
+    referral_reward_credits: int
+    referral_monthly_cap: int
+
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
 
@@ -578,6 +583,9 @@ def build_settings() -> Settings:
         low_balance_threshold=max(0, _int("LOW_BALANCE_THRESHOLD", 2)),
         email_monthly_free_song_enabled=_bool("EMAIL_MONTHLY_FREE_SONG_ENABLED", False),
         email_daily_cap=max(0, _int("EMAIL_DAILY_CAP", 60)),
+        referral_enabled=_bool("REFERRAL_ENABLED", False),
+        referral_reward_credits=max(0, _int("REFERRAL_REWARD_CREDITS", 5)),
+        referral_monthly_cap=max(0, _int("REFERRAL_MONTHLY_CAP", 20)),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

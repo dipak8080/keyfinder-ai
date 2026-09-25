@@ -129,6 +129,8 @@ def _complete_sign_in(conn: sqlite3.Connection, request: Request, *, email: str,
         else:
             link_subject_to_account(conn, subject_id, account_id)
         ledger_mod.merge_free_usage(conn, subject_id, account_id)
+        from . import referrals
+        referrals.attach(conn, account_id)
 
     bonus = _grant_signup_bonus(conn, account_id, ip_hash, method) if is_new else 0
 

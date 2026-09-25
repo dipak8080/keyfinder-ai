@@ -368,6 +368,15 @@ def free_song_email(month: str, url: str, unsubscribe_url: str) -> tuple[str, st
     return f"Your free {month} Studio song is ready", _wrap(body, lede[:110]), text
 
 
+def referral_reward_email(credits: int, url: str, unsubscribe_url: str) -> tuple[str, str, str]:
+    lede = (f"A friend you invited just made their first purchase, so {credits} credits were added "
+            "to your account. They got the same. Credits never expire.")
+    body = (_heading(f"{credits} credits from your invite") + _lede(lede) + _cta(url, "Share my link again")
+            + _footer(unsubscribe_url, "You get this when an invite pays off."))
+    text = f"{credits} credits from your invite\n\n{lede}\n\n{url}\n\nUnsubscribe: {unsubscribe_url}"
+    return f"You earned {credits} AudioForges credits", _wrap(body, lede[:110]), text
+
+
 def update_email(subject: str, message: str, url: str, unsubscribe_url: str) -> tuple[str, str, str]:
     import html as _html
     paragraphs = [p.strip() for p in message.split("\n\n") if p.strip()]

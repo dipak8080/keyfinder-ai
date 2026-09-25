@@ -160,6 +160,9 @@ KNOWN_KEYS: dict[str, dict] = {
     "LOW_BALANCE_THRESHOLD": {"type": "int", "group": "email", "min": 0, "max": 20},
     "EMAIL_MONTHLY_FREE_SONG_ENABLED": {"type": "bool", "group": "email"},
     "EMAIL_DAILY_CAP": {"type": "int", "group": "email", "min": 0, "max": 5000},
+    "REFERRAL_ENABLED": {"type": "bool", "group": "referrals"},
+    "REFERRAL_REWARD_CREDITS": {"type": "int", "group": "referrals", "min": 0, "max": 50},
+    "REFERRAL_MONTHLY_CAP": {"type": "int", "group": "referrals", "min": 0, "max": 500},
 }
 
 _TOOLS = (

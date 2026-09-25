@@ -60,6 +60,9 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
             else:
                 link_subject_to_account(conn, subject_id, account_id)
 
+        from . import referrals
+        referrals.attach(conn, account_id)
+
         conn.execute(
             """INSERT OR IGNORE INTO orders (id, provider, provider_order_id, provider_ref,
                account_id, subject_id, email, pack, credits, amount_cents, currency,
@@ -79,6 +82,11 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
             order_id=event.provider_txid,
             note=",".join(event.pack_keys) or f"{event.provider} order",
         )
+        if granted:
+            referrer = referrals.on_paid_order(conn, account_id, event.provider_txid)
+            if referrer:
+                from .notifications import queue_referral_reward
+                queue_referral_reward(conn, referrer, event.provider_txid)
 
         balance = conn.execute(
             """SELECT COALESCE(SUM(delta),0) AS b FROM credit_ledger
