@@ -28,6 +28,7 @@ import logging
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from rate_limit import check_rate_limit
@@ -120,3 +121,65 @@ async def turnstile_verify(
                                                      "message": "That check didn't pass. Try again."})
     await asyncio.to_thread(turnstile.mark_passed, identity.ip_hash)
     return {"ok": True, "passed": True}
+
+class EmailPreferences(BaseModel):
+    updates: bool | None = None
+    account_notices: bool | None = None
+
+
+def _require_account(identity: Identity) -> str:
+    if not identity.account_id:
+        raise HTTPException(status_code=401, detail={"error": "sign_in_required"})
+    return identity.account_id
+
+
+@router.get("/email-preferences")
+def get_email_preferences(response: Response, identity: Identity = Depends(paywall.get_identity)) -> dict:
+    from . import notifications
+    response.headers["Cache-Control"] = "no-store"
+    return notifications.preferences(_require_account(identity))
+
+
+@router.post("/email-preferences")
+def update_email_preferences(body: EmailPreferences, identity: Identity = Depends(paywall.get_identity)) -> dict:
+    from . import notifications
+    return notifications.set_preferences(_require_account(identity), updates=body.updates,
+                                         notices=body.account_notices)
+
+
+_UNSUB_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} | AudioForges</title></head>
+<body style="margin:0;background:#0b0b0c;color:#e8e8ea;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif">
+<div style="max-width:460px;margin:80px auto;padding:32px;background:#151517;border:1px solid #26262a;border-radius:14px">
+<h1 style="margin:0 0 12px;font-size:22px">{title}</h1><p style="color:#b6b6bd;line-height:1.6">{message}</p>
+<p><a href="https://www.audioforges.com" style="color:#f59e0b">Back to AudioForges</a></p></div></body></html>"""
+
+
+def _unsubscribe(token: str) -> tuple[bool, str]:
+    from . import notifications
+    parsed = notifications.read_unsubscribe_token(token)
+    if parsed is None:
+        return False, ""
+    notifications.apply_unsubscribe(*parsed)
+    return True, parsed[1]
+
+
+@router.get("/email/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_page(t: str = "") -> HTMLResponse:
+    ok, scope = _unsubscribe(t)
+    if not ok:
+        return HTMLResponse(_UNSUB_PAGE.format(title="Link not valid",
+                            message="This unsubscribe link is broken or incomplete. Email "
+                                    "contact@audioforges.com and we'll remove you by hand."), status_code=400)
+    what = "low-balance emails" if scope == "notices" else "AudioForges updates" if scope == "updates" else "all AudioForges emails"
+    return HTMLResponse(_UNSUB_PAGE.format(title="You're unsubscribed",
+                        message=f"You won't get {what} anymore. Receipts and sign-in links still arrive, "
+                                "since those are needed to use your account."))
+
+
+@router.post("/email/unsubscribe")
+def unsubscribe_one_click(t: str = "") -> dict:
+    ok, _ = _unsubscribe(t)
+    if not ok:
+        raise HTTPException(status_code=400, detail={"error": "invalid_token"})
+    return {"ok": True}

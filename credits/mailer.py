@@ -15,39 +15,51 @@ from .config import get_settings
 log = logging.getLogger("credits.mailer")
 
 
-async def send_email(to: str, subject: str, html: str, text: str) -> None:
+def unsubscribe_headers(url: str | None) -> dict | None:
+    """One-click unsubscribe headers (RFC 8058) for non-transactional mail."""
+    if not url:
+        return None
+    return {"List-Unsubscribe": f"<{url}>", "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}
+
+
+async def send_email(to: str, subject: str, html: str, text: str, headers: dict | None = None) -> None:
     s = get_settings()
     if s.mail_provider == "resend" and s.resend_api_key:
-        await _send_resend(to, subject, html, text)
+        await _send_resend(to, subject, html, text, headers)
     elif s.mail_provider == "smtp" and s.smtp_host:
         from starlette.concurrency import run_in_threadpool
-        await run_in_threadpool(_send_smtp, to, subject, html, text)
+        await run_in_threadpool(_send_smtp, to, subject, html, text, headers)
     else:
         log.warning("MAIL[console] to=%s subject=%s\n%s", to, subject, text)
 
 
-async def _send_resend(to: str, subject: str, html: str, text: str) -> None:
+async def _send_resend(to: str, subject: str, html: str, text: str, headers: dict | None = None) -> None:
     import httpx
 
     s = get_settings()
+    body = {"from": f"{s.mail_from_name} <{s.mail_from}>", "to": [to],
+            "subject": subject, "html": html, "text": text}
+    if headers:
+        body["headers"] = headers
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {s.resend_api_key}"},
-            json={"from": f"{s.mail_from_name} <{s.mail_from}>", "to": [to],
-                 "subject": subject, "html": html, "text": text},
+            json=body,
         )
     if resp.status_code >= 300:
         log.error("resend failed %s %s", resp.status_code, resp.text[:400])
         raise RuntimeError("email_send_failed")
 
 
-def _send_smtp(to: str, subject: str, html: str, text: str) -> None:
+def _send_smtp(to: str, subject: str, html: str, text: str, headers: dict | None = None) -> None:
     s = get_settings()
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{s.mail_from_name} <{s.mail_from}>"
     msg["To"] = to
+    for name, value in (headers or {}).items():
+        msg[name] = value
     msg.set_content(text)
     msg.add_alternative(html, subtype="html")
     with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=20) as server:
@@ -329,3 +341,40 @@ def pass_email(kind: str, *, credits: int, price_usd: float, date: str | None,
     text = f"{heading}\n\n{lede}\n\n" + (f"{extra}\n\n" if extra else "") + \
         f"{label}: {manage_url}\n\nQuestions? Email contact@audioforges.com.\n\naudioforges.com"
     return subject, _wrap(body, lede[:110]), text
+
+def _footer(unsubscribe_url: str, why: str) -> str:
+    return (f'<tr><td style="padding:8px 32px 28px">'
+            f'<p style="margin:0;font-family:{FONT};font-size:12px;line-height:1.6;color:{SUBTLE}">'
+            f'{why} <a href="{unsubscribe_url}" style="color:{SUBTLE}">Unsubscribe</a></p></td></tr>')
+
+
+def low_balance_email(balance: int, buy_url: str, unsubscribe_url: str) -> tuple[str, str, str]:
+    word = "credit" if balance == 1 else "credits"
+    lede = (f"You have {balance} {word} left. Top up now so your next Studio run "
+            "doesn't stop halfway through a session. Credits never expire.")
+    body = (_heading(f"{balance} {word} left") + _lede(lede) + _cta(buy_url, "Get more credits")
+            + _footer(unsubscribe_url, "You get this when your balance runs low."))
+    text = (f"{balance} AudioForges {word} left\n\n{lede}\n\nGet more credits: {buy_url}\n\n"
+            f"Unsubscribe: {unsubscribe_url}")
+    return f"You have {balance} AudioForges {word} left", _wrap(body, lede[:110]), text
+
+
+def free_song_email(month: str, url: str, unsubscribe_url: str) -> tuple[str, str, str]:
+    lede = (f"Your free Studio Quality song for {month} is on your account. Drop in any "
+            "track and get studio-grade vocals and instrumental back as full-length WAV.")
+    body = (_heading(f"Your free {month} song is ready") + _lede(lede) + _cta(url, "Use my free song")
+            + _footer(unsubscribe_url, "You're getting this because you asked for AudioForges updates."))
+    text = f"Your free {month} song is ready\n\n{lede}\n\n{url}\n\nUnsubscribe: {unsubscribe_url}"
+    return f"Your free {month} Studio song is ready", _wrap(body, lede[:110]), text
+
+
+def update_email(subject: str, message: str, url: str, unsubscribe_url: str) -> tuple[str, str, str]:
+    import html as _html
+    paragraphs = [p.strip() for p in message.split("\n\n") if p.strip()]
+    body = _heading(_html.escape(subject))
+    for p in paragraphs:
+        body += _lede(_html.escape(p).replace("\n", "<br>"))
+    body += _cta(url, "Open AudioForges")
+    body += _footer(unsubscribe_url, "You're getting this because you asked for AudioForges updates.")
+    text = f"{subject}\n\n" + "\n\n".join(paragraphs) + f"\n\n{url}\n\nUnsubscribe: {unsubscribe_url}"
+    return subject, _wrap(body, (paragraphs[0] if paragraphs else subject)[:110]), text

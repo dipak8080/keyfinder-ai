@@ -1184,3 +1184,29 @@ def studio_pass_subscriptions() -> dict:
 def studio_pass_sync_now() -> dict:
     from . import subscriptions
     return subscriptions.sync_with_dodo()
+
+
+class UpdateEmail(BaseModel):
+    subject: str = Field(..., min_length=3, max_length=120)
+    message: str = Field(..., min_length=10, max_length=5000)
+    campaign: str = Field(..., min_length=3, max_length=64, pattern=r"^[a-z0-9-]+$")
+    test_to: str | None = Field(default=None, max_length=254)
+
+
+@router.post("/email/update", dependencies=ADMIN_WRITE)
+async def send_update_email(body: UpdateEmail) -> dict:
+    """Test first with test_to, then send without it to queue every opted-in account."""
+    from . import mailer, notifications
+    s = get_settings()
+    if body.test_to:
+        subject, html, text = mailer.update_email(body.subject, body.message, s.frontend_url,
+                                                  f"{s.frontend_url}/account")
+        await mailer.send_email(body.test_to, "[TEST] " + subject, html, text)
+        return {"ok": True, "test_sent_to": body.test_to}
+    return {"ok": True, "queued": notifications.queue_update(body.subject, body.message, body.campaign)}
+
+
+@router.get("/email/outbox", dependencies=ADMIN)
+def email_outbox() -> dict:
+    from . import notifications
+    return {**notifications.outbox_stats(), "slot": slot_info()}

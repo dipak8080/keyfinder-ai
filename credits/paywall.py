@@ -283,6 +283,10 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
             },
         )
 
+    if charge.charge_type == "credit":
+        from .notifications import maybe_low_balance
+        await asyncio.to_thread(maybe_low_balance, identity, charge.balance_after)
+
     try:
         yield charge
     except BaseException:

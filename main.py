@@ -209,6 +209,30 @@ async def _studio_pass_sync_loop():
             logger.error(f"[CREDITS] Studio Pass sync failed: {e}", exc_info=True)
 
 
+EMAIL_OUTBOX_INTERVAL_SECONDS = 5 * 60
+
+
+async def _email_outbox_loop():
+    """Queues the monthly free-song emails in the first days of a month and
+    sends queued lifecycle email under the daily cap. Live slot only."""
+    from credits.admin import slot_info
+    from credits import notifications
+
+    while True:
+        try:
+            await asyncio.sleep(EMAIL_OUTBOX_INTERVAL_SECONDS)
+            if slot_info().get("is_active") is False:
+                continue
+            await asyncio.get_running_loop().run_in_executor(None, notifications.queue_monthly_free_song)
+            report = await notifications.send_queued()
+            if report["sent"] or report["failed"]:
+                logger.info(f"[CREDITS] Email outbox: {report}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[CREDITS] Email outbox failed: {e}", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -276,6 +300,7 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
     credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
     pass_sync_task = asyncio.create_task(_studio_pass_sync_loop())
+    email_outbox_task = asyncio.create_task(_email_outbox_loop())
     log_prune_task = asyncio.create_task(_log_prune_loop())
     from routes.batch import batch_reaper_loop
     batch_reaper_task = asyncio.create_task(batch_reaper_loop())
@@ -297,9 +322,10 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     credit_sweep_task.cancel()
     pass_sync_task.cancel()
+    email_outbox_task.cancel()
     log_prune_task.cancel()
     batch_reaper_task.cancel()
-    for task in (cleanup_task, credit_sweep_task, pass_sync_task, log_prune_task, batch_reaper_task):
+    for task in (cleanup_task, credit_sweep_task, pass_sync_task, email_outbox_task, log_prune_task, batch_reaper_task):
         try:
             await task
         except asyncio.CancelledError:

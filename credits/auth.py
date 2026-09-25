@@ -33,20 +33,22 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 class MagicLinkRequest(BaseModel):
     email: EmailStr
+    updates: bool = False
 
 
 def issue_magic_link(conn: sqlite3.Connection, *, email: str, subject_id: str | None,
                      ip_hash: str | None, ttl_minutes: int | None = None,
-                     purpose: str = "login") -> str:
+                     purpose: str = "login", updates: bool = False) -> str:
     """Create a one-time token, return the full verify URL. Caller emails it."""
     s = get_settings()
     token = new_token(32)
     ttl = ttl_minutes if ttl_minutes is not None else s.magic_link_ttl_minutes
     expires = (utcnow() + timedelta(minutes=ttl)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     conn.execute(
-        """INSERT INTO magic_links (token_hash, email, subject_id, purpose, ip_hash, created_at, expires_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (hash_token(token), email.strip().lower(), subject_id, purpose, ip_hash, now_iso(), expires),
+        """INSERT INTO magic_links (token_hash, email, subject_id, purpose, ip_hash, created_at, expires_at,
+               email_updates) VALUES (?,?,?,?,?,?,?,?)""",
+        (hash_token(token), email.strip().lower(), subject_id, purpose, ip_hash, now_iso(), expires,
+         1 if updates else 0),
     )
     return f"{s.api_base_url}/auth/verify?token={quote(token)}"
 
@@ -66,7 +68,8 @@ async def request_magic_link(body: MagicLinkRequest, identity: Identity = Depend
             raise HTTPException(status_code=429, detail={"error": "too_many_requests",
                                                          "message": "Too many sign-in emails. Try again in an hour."})
         with tx(conn):
-            link = issue_magic_link(conn, email=email, subject_id=identity.subject_id, ip_hash=identity.ip_hash)
+            link = issue_magic_link(conn, email=email, subject_id=identity.subject_id, ip_hash=identity.ip_hash,
+                                    updates=body.updates)
 
     subject, html, text = mailer.magic_link_email(link, s.magic_link_ttl_minutes)
     try:
@@ -106,12 +109,14 @@ def _grant_signup_bonus(conn: sqlite3.Connection, account_id: str, ip_hash: str 
 
 def _complete_sign_in(conn: sqlite3.Connection, request: Request, *, email: str,
                       fallback_subject_id: str | None, ip_hash: str | None,
-                      method: str) -> tuple[str, int]:
+                      method: str, updates: bool = False) -> tuple[str, int]:
     """Shared by every sign-in method. Returns (session_id, bonus_credits)."""
     s = get_settings()
     is_new = conn.execute("SELECT 1 FROM accounts WHERE email=?", (email,)).fetchone() is None
     account_id = get_or_create_account(conn, email)
     conn.execute("UPDATE accounts SET last_login_at=? WHERE id=?", (now_iso(), account_id))
+    if updates:
+        conn.execute("UPDATE accounts SET email_updates=1 WHERE id=?", (account_id,))
 
     subject_id = unsign(request.cookies.get(SUBJECT_COOKIE), purpose=SUBJECT_PURPOSE) or fallback_subject_id
     if subject_id:
@@ -173,7 +178,7 @@ async def verify(request: Request, token: str = "") -> RedirectResponse:
         conn.execute("UPDATE magic_links SET used_at=? WHERE token_hash=?", (now_iso(), token_h))
         session_id, bonus = _complete_sign_in(
             conn, request, email=row["email"], fallback_subject_id=row["subject_id"],
-            ip_hash=row["ip_hash"], method="email",
+            ip_hash=row["ip_hash"], method="email", updates=bool(row["email_updates"]),
         )
 
     query = "status=ok" + (f"&bonus={bonus}" if bonus else "")
@@ -216,7 +221,8 @@ def _decode_state(cookie: str | None) -> dict | None:
 
 
 @router.get("/google/start")
-async def google_start(next: str = "/", identity: Identity = Depends(paywall.get_identity)) -> RedirectResponse:
+async def google_start(next: str = "/", updates: bool = False,
+                       identity: Identity = Depends(paywall.get_identity)) -> RedirectResponse:
     s = get_settings()
     if not s.google_client_id or not s.google_client_secret:
         raise HTTPException(status_code=503, detail={"error": "google_signin_unavailable"})
@@ -232,7 +238,7 @@ async def google_start(next: str = "/", identity: Identity = Depends(paywall.get
     resp = RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}", status_code=303)
     resp.set_cookie(
         GOOGLE_STATE_COOKIE,
-        _encode_state({"n": nonce, "next": _safe_next(next), "sub": identity.subject_id}),
+        _encode_state({"n": nonce, "next": _safe_next(next), "sub": identity.subject_id, "u": 1 if updates else 0}),
         max_age=GOOGLE_STATE_MAX_AGE, httponly=True, secure=s.cookie_secure,
         samesite="lax", path="/auth/google",
     )
@@ -283,7 +289,7 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     with connect() as conn, tx(conn):
         session_id, bonus = _complete_sign_in(
             conn, request, email=email, fallback_subject_id=saved.get("sub"),
-            ip_hash=ip_hash, method="google",
+            ip_hash=ip_hash, method="google", updates=bool(saved.get("u")),
         )
 
     query = f"status=ok&method=google&next={next_path}" + (f"&bonus={bonus}" if bonus else "")
