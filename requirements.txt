@@ -142,3 +142,5 @@ pretty_midi>=0.2.10
 # see redis_store.py. Pinned like everything else here because the deploy
 # workflow prunes the build cache before every build.
 redis==6.4.0
+# R2 (S3-compatible) client for the account library.
+boto3==1.43.102

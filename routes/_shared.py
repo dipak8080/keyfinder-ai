@@ -280,6 +280,29 @@ import job_tasks
 _background_tasks: set = set()
 
 
+_library_semaphore = asyncio.Semaphore(1)
+
+
+def _maybe_archive(job_id: str) -> None:
+    """Saves a finished Studio job to its owner's library, off the request path."""
+    try:
+        job = get_job(job_id) or {}
+        if not job.get("library_account"):
+            return
+        import library
+
+        async def _run():
+            async with _library_semaphore:
+                try:
+                    await run_blocking(library.archive, job_id, get_job(job_id) or job)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[LIBRARY] job={job_id} not saved: {e}")
+
+        spawn_background_task(_run())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[LIBRARY] job={job_id} archive not scheduled: {e}")
+
+
 def spawn_background_task(coro) -> asyncio.Task:
     """
     asyncio.create_task() plus a strong reference held until completion.
@@ -462,6 +485,7 @@ async def _run_tool_job(
             result = await work()
             on_success(result)
             succeeded = True
+            _maybe_archive(job_id)
             detail = ""
             if success_detail is not None:
                 try:

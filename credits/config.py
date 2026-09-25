@@ -407,6 +407,11 @@ class Settings:
     referral_reward_credits: int
     referral_monthly_cap: int
 
+    # library
+    library_enabled: bool
+    library_retention_days: int
+    library_max_total_gb: float
+
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
 
@@ -586,6 +591,9 @@ def build_settings() -> Settings:
         referral_enabled=_bool("REFERRAL_ENABLED", False),
         referral_reward_credits=max(0, _int("REFERRAL_REWARD_CREDITS", 5)),
         referral_monthly_cap=max(0, _int("REFERRAL_MONTHLY_CAP", 20)),
+        library_enabled=_bool("LIBRARY_ENABLED", False),
+        library_retention_days=max(1, _int("LIBRARY_RETENTION_DAYS", 30)),
+        library_max_total_gb=max(1.0, _float("LIBRARY_MAX_TOTAL_GB", 50.0)),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

@@ -196,6 +196,7 @@ def studio_config(response: Response) -> dict:
         "signup_bonus_credits": s.signup_bonus_credits,
         "free_needs_account": s.free_ops_require_account,
         "referral": {"enabled": s.referral_enabled, "reward_credits": s.referral_reward_credits},
+        "library": {"enabled": s.library_enabled, "retention_days": s.library_retention_days},
         "studio_pass": {
             "available": s.studio_pass_enabled,
             "price_usd": s.studio_pass_price_usd,
@@ -408,6 +409,9 @@ async def _queue_separation(
     # cleanup_paths below - from here the TTL sweep owns this file, not
     # the background task. See jobs.py's set_job_input() docstring.
     set_job_input(job_id, file_path)
+    if rule_key is not None:
+        import library
+        library.mark_owner(job_id, identity)
 
     preview_id = None
     preview_skip = None

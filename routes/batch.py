@@ -432,6 +432,8 @@ async def batch_add(
     remember_job_tags(job_id)
     file_path, size = await _accept_upload(file, job_id, label=kind["tool"].lower())
     set_job_input(job_id, file_path)
+    import library
+    library.mark_owner(job_id, identity)
 
     metering.record_job_created(
         job_id=job_id, tool=kind["rule"],

@@ -167,6 +167,7 @@ from .admin import router as _admin_router
 from .cancel import router as _cancel_router
 from .batch import router as _batch_router
 from .dj_export import router as _dj_export_router
+from .library import router as _library_router
 
 router = APIRouter()
 
@@ -187,3 +188,4 @@ router.include_router(_admin_router)
 router.include_router(_cancel_router)
 router.include_router(_batch_router)
 router.include_router(_dj_export_router)
+router.include_router(_library_router)

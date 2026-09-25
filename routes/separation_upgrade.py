@@ -333,6 +333,8 @@ async def _queue_upgrade(
     # Same type as the source, so a YouTube upgrade stays pollable and
     # downloadable through the /youtube/separate* routes the page already uses.
     new_job_id = create_job(job_type=job["job_type"])
+    import library
+    library.mark_owner(new_job_id, identity)
 
     # Claim the source BEFORE charging. If two clicks race here, exactly
     # one wins the PRIMARY KEY and the loser returns the winner's job.

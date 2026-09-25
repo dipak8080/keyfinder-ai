@@ -1600,6 +1600,8 @@ async def youtube_separate_hq_route(
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_separate")
+    import library
+    library.mark_owner(job_id, identity)
     remember_job_tags(job_id)
 
     metering.record_job_created(
@@ -1803,6 +1805,8 @@ async def youtube_stems_hq_route(
     _reject_if_separation_queue_full()
 
     job_id = create_job(job_type="youtube_stems")
+    import library
+    library.mark_owner(job_id, identity)
     remember_job_tags(job_id)
 
     metering.record_job_created(
