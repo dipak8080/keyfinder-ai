@@ -382,6 +382,13 @@ class Settings:
     studio_preview_daily_per_subject: int
     studio_preview_daily_per_ip: int
 
+    # accounts
+    google_client_id: str
+    google_client_secret: str
+    signup_bonus_credits: int
+    signup_bonus_per_ip_30d: int
+    free_ops_require_account: bool
+
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
 
@@ -539,6 +546,12 @@ def build_settings() -> Settings:
         studio_preview_seconds=min(60, max(5, _int("STUDIO_PREVIEW_SECONDS", 30))),
         studio_preview_daily_per_subject=max(0, _int("STUDIO_PREVIEW_DAILY_PER_SUBJECT", 3)),
         studio_preview_daily_per_ip=max(0, _int("STUDIO_PREVIEW_DAILY_PER_IP", 6)),
+
+        google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
+        google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip(),
+        signup_bonus_credits=max(0, _int("SIGNUP_BONUS_CREDITS", 0)),
+        signup_bonus_per_ip_30d=max(0, _int("SIGNUP_BONUS_PER_IP_30D", 2)),
+        free_ops_require_account=_bool("FREE_OPS_REQUIRE_ACCOUNT", False),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

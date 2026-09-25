@@ -111,6 +111,8 @@ class InsufficientCredits(Exception):
             "balance": self.balance,
             "free_remaining": self.free_remaining,
             "free_resets_at": next_period_start_iso(),
+            "signup_bonus_credits": s.signup_bonus_credits,
+            "free_needs_account": s.free_ops_require_account,
             "packs": [
                 {"key": p.key, "credits": p.credits, "price_usd": p.price_usd, "label": p.label}
                 for p in s.packs_sorted()
@@ -199,6 +201,8 @@ def free_remaining(conn: sqlite3.Connection, identity: Identity, period: str | N
     the IP key bounds one network. Both apply.
     """
     s = get_settings()
+    if s.free_ops_require_account and not identity.account_id:
+        return 0
     period = period or period_key()
     owner_type, owner_id = identity.owner
     owner_used = max(
