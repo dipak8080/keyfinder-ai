@@ -359,18 +359,41 @@ def record_anon_result(botchecked: bool):
         _anon_skip_until = time.time() + ANON_SKIP_SECONDS if botchecked else 0.0
 
 
+# CANARY-DRIVEN SKIP (2026-09-25). While the canary's latest run says no
+# anon client works, users never probe anon; the canary does. Stale state
+# (canary not running) is ignored so a dead cron can't pin anon off.
+CANARY_STATE_PATH = os.environ.get("CANARY_STATE_PATH", "/app/data/canary_state.json")
+CANARY_FRESH_SECONDS = int(os.environ.get("CANARY_FRESH_SECONDS", "2700"))
+
+
+def canary_says_anon_dead() -> bool:
+    try:
+        if time.time() - os.stat(CANARY_STATE_PATH).st_mtime > CANARY_FRESH_SECONDS:
+            return False
+        with open(CANARY_STATE_PATH) as f:
+            return f.read().startswith("direct=BOTCHECKED")
+    except OSError:
+        return False
+
+
 def anon_skipped() -> bool:
     with _anon_lock:
-        return time.time() < _anon_skip_until
+        if time.time() < _anon_skip_until:
+            return True
+    return canary_says_anon_dead()
 
 
 def anon_status() -> dict:
     with _anon_lock:
         left = max(0, int(_anon_skip_until - time.time()))
-    return {
-        "state": "skipped (VPS IP blocked for no-cookie requests)" if left else "trying",
-        "seconds_until_probe": left,
-    }
+    canary_dead = canary_says_anon_dead()
+    if canary_dead:
+        state = "skipped (canary: no anon client works from the VPS IP)"
+    elif left:
+        state = "skipped (anon failed where cookies worked)"
+    else:
+        state = "trying"
+    return {"state": state, "seconds_until_probe": left, "canary_says_dead": canary_dead}
 
 
 # CLIENT AUTO-REPAIR (2026-09-11). A rung with only client-fixable failures
@@ -3091,6 +3114,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
 
     last_error = None
     edge_skip_rotations = 0
+    anon_failed_kind = None
     for account_path in accounts:
         opts = dict(base_ydl_opts)
         opts["socket_timeout"] = DIRECT_SOCKET_TIMEOUT_SECONDS
@@ -3107,6 +3131,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             result = extract_info_with_retry(opts, url)
             if account_path:
                 logger.info(f"[COOKIES] Download succeeded using account: {account_path}")
+                if anon_failed_kind:
+                    record_anon_result(True)
+                    logger.warning(
+                        f"[ANON] No-cookie path failed ({anon_failed_kind}) on a video a cookie "
+                        f"account then downloaded - skipping anon for {ANON_SKIP_SECONDS // 60} min."
+                    )
             else:
                 record_anon_result(False)
             record_account_result(account_path, True, "direct")
@@ -3129,12 +3159,16 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # immediately.
                 raise
 
-            # 2026-09-25: every anon rung media-403'd from the VPS IP for 9+
-            # hours while cookie accounts downloaded direct fine. A media 403
-            # after the whole anon ladder is IP-shaped for no-cookie sessions,
-            # so hand off to the free cookie accounts instead of the proxy.
-            if anon_ip_blocked and cookie_accounts:
-                continue
+            # 2026-09-25: YouTube refuses the VPS IP in changing shapes
+            # (bot_check, media_403, format_unavailable). Any anon failure
+            # goes to the free cookie accounts before the paid proxy; if a
+            # cookie then downloads the same video, the skip arms above.
+            if account_path is None:
+                kind = classify_failure(error_text)
+                if kind not in ("account_gated", "video_unavailable"):
+                    anon_failed_kind = kind
+                if cookie_accounts and kind != "cdn_timeout":
+                    continue
 
             if is_cdn_connect_timeout_error(error_text):
                 # A DIRECT attempt just burned ~10s on an unreachable
