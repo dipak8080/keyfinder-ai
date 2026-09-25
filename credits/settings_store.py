@@ -168,6 +168,7 @@ KNOWN_KEYS: dict[str, dict] = {
     "LIBRARY_ENABLED": {"type": "bool", "group": "library"},
     "LIBRARY_RETENTION_DAYS": {"type": "int", "group": "library", "min": 1, "max": 365},
     "LIBRARY_MAX_TOTAL_GB": {"type": "float", "group": "library", "min": 1, "max": 5000},
+    "LIBRARY_MAX_ITEMS_PER_ACCOUNT": {"type": "int", "group": "library", "min": 1, "max": 1000},
 }
 
 _TOOLS = (

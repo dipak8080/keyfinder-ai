@@ -99,7 +99,8 @@ def on_paid_order(conn: sqlite3.Connection, account_id: str, payment_id: str) ->
         return None
     reward = s.referral_reward_credits
     rewarded_this_month = conn.execute(
-        """SELECT COUNT(*) AS n FROM referrals WHERE referrer_account_id=? AND status='rewarded'
+        """SELECT COUNT(*) AS n FROM referrals WHERE referrer_account_id=?
+           AND (status='rewarded' OR (status='reversed' AND COALESCE(referrer_paid, 1)=1))
            AND rewarded_at >= strftime('%Y-%m-01T00:00:00','now')""", (ref["referrer_account_id"],)).fetchone()["n"]
     referrer_paid = rewarded_this_month < s.referral_monthly_cap
     ledger_mod.grant(conn, owner_type="account", owner_id=account_id, amount=reward, kind="bonus",
@@ -109,8 +110,11 @@ def on_paid_order(conn: sqlite3.Connection, account_id: str, payment_id: str) ->
         ledger_mod.grant(conn, owner_type="account", owner_id=ref["referrer_account_id"], amount=reward,
                          kind="bonus", idempotency_key=f"referral_referrer:{account_id}", order_id=payment_id,
                          note="referral: friend's first purchase")
-    conn.execute("UPDATE referrals SET status=?, order_id=?, rewarded_at=? WHERE referee_account_id=?",
-                 ("rewarded" if referrer_paid else "capped", payment_id, now_iso(), account_id))
+    conn.execute(
+        """UPDATE referrals SET status=?, order_id=?, rewarded_at=?, reward_credits=?, referrer_paid=?
+           WHERE referee_account_id=?""",
+        ("rewarded" if referrer_paid else "capped", payment_id, now_iso(), reward,
+         1 if referrer_paid else 0, account_id))
     log.info("referral %s -> %s rewarded (%s credits each, referrer paid=%s)",
              ref["referrer_account_id"], account_id, reward, referrer_paid)
     return ref["referrer_account_id"] if referrer_paid else None
@@ -146,6 +150,10 @@ def summary(account_id: str) -> dict:
         counts = {r["status"]: r["n"] for r in conn.execute(
             "SELECT status, COUNT(*) AS n FROM referrals WHERE referrer_account_id=? GROUP BY status",
             (account_id,)).fetchall()}
+        earned = conn.execute(
+            """SELECT COALESCE(SUM(COALESCE(reward_credits, ?)), 0) AS n FROM referrals
+               WHERE referrer_account_id=? AND status='rewarded'""",
+            (s.referral_reward_credits, account_id)).fetchone()["n"]
     return {
         "enabled": s.referral_enabled,
         "code": code,
@@ -153,5 +161,5 @@ def summary(account_id: str) -> dict:
         "reward_credits": s.referral_reward_credits,
         "friends_rewarded": counts.get("rewarded", 0),
         "friends_pending": counts.get("pending", 0),
-        "credits_earned": counts.get("rewarded", 0) * s.referral_reward_credits,
+        "credits_earned": int(earned),
     }

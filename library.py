@@ -3,8 +3,11 @@
 A finished Studio job owned by an account is re-encoded to lossless FLAC
 and stored in R2 under <account_id>/<job_id>/<stem>.flac. Downloads and
 playback go straight to R2 through short-lived signed URLs, so library
-traffic never touches the VPS. Items expire after LIBRARY_RETENTION_DAYS,
-and the oldest are dropped first if the bucket passes LIBRARY_MAX_TOTAL_GB."""
+traffic never touches the VPS. Items expire after LIBRARY_RETENTION_DAYS.
+Each account keeps at most LIBRARY_MAX_ITEMS_PER_ACCOUNT items, dropping its
+own oldest first. The global LIBRARY_MAX_TOTAL_GB cap only ever evicts the
+saving account's own items; if that is not enough, the new item is not
+saved and the owner is alerted."""
 
 import json
 import os
@@ -68,19 +71,35 @@ def _delete_prefix(prefix: str) -> None:
         s3.delete_objects(Bucket=bucket(), Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True})
 
 
-def _evict_for(incoming: int) -> None:
-    limit = int(get_settings().library_max_total_gb * 1024 ** 3)
+def _alert(message: str) -> None:
+    try:
+        from monitoring import alert_now
+        alert_now(message)
+    except Exception:  # noqa: BLE001
+        logger.error(message)
+
+
+def _make_room(account_id: str, incoming: int) -> bool:
+    """Frees space for one new item using only this account's own items.
+    Returns False if the global cap still cannot fit it."""
+    s = get_settings()
+    per_account = s.library_max_items_per_account
+    limit = int(s.library_max_total_gb * 1024 ** 3)
     with connect() as conn:
+        own = conn.execute("SELECT job_id, size_bytes FROM library_items WHERE account_id=? ORDER BY created_at",
+                           (account_id,)).fetchall()
         total = conn.execute("SELECT COALESCE(SUM(size_bytes),0) AS t FROM library_items").fetchone()["t"]
-        if total + incoming <= limit:
-            return
-        rows = conn.execute("SELECT job_id, account_id, size_bytes FROM library_items ORDER BY created_at").fetchall()
-    for r in rows:
-        if total + incoming <= limit:
-            break
-        remove(r["job_id"], r["account_id"])
-        total -= r["size_bytes"]
-        logger.warning(f"[LIBRARY] evicted {r['job_id']} to stay under {get_settings().library_max_total_gb} GB")
+    own = list(own)
+    while own and (len(own) >= per_account or total + incoming > limit):
+        oldest = own.pop(0)
+        remove(oldest["job_id"], account_id)
+        total -= oldest["size_bytes"]
+        logger.info(f"[LIBRARY] evicted {oldest['job_id']} from {account_id} to make room")
+    if total + incoming > limit:
+        _alert(f"Library is full ({s.library_max_total_gb} GB): a new item for {account_id} was not saved. "
+               f"Raise LIBRARY_MAX_TOTAL_GB or shorten retention.")
+        return False
+    return True
 
 
 def archive(job_id: str, job: dict) -> bool:
@@ -92,8 +111,9 @@ def archive(job_id: str, job: dict) -> bool:
     if job.get("vocals_path"):
         stems["vocals"] = job["vocals_path"]
         stems["instrumental"] = job.get("instrumental_path")
-    stems = {k: v for k, v in stems.items() if v and os.path.exists(v)}
-    if not stems:
+    missing = sorted(k for k, v in stems.items() if not v or not os.path.exists(v))
+    if missing or not stems:
+        logger.warning(f"[LIBRARY] job={job_id} not saved: stems missing {missing or 'all'}")
         return False
 
     s3 = client()
@@ -105,7 +125,8 @@ def archive(job_id: str, job: dict) -> bool:
             _to_flac(path, dest)
             encoded[stem] = dest
             total += os.path.getsize(dest)
-        _evict_for(total)
+        if not _make_room(account_id, total):
+            return False
         title = os.path.splitext(os.path.basename(job.get("title") or job_id))[0][:120]
         for stem, dest in encoded.items():
             key = f"{account_id}/{job_id}/{stem}.flac"
@@ -155,9 +176,18 @@ def signed_url(row: dict, stem: str, download: bool, ttl: int = 3600) -> str | N
         return None
     params = {"Bucket": bucket(), "Key": stems[stem]["key"]}
     if download:
-        safe = "".join(ch for ch in (row["title"] or "track") if ch.isalnum() or ch in " -_()").strip() or "track"
-        params["ResponseContentDisposition"] = f'attachment; filename="{safe} - {stem}.flac"'
+        params["ResponseContentDisposition"] = content_disposition(f"{row['title'] or 'track'} - {stem}.flac")
     return client().generate_presigned_url("get_object", Params=params, ExpiresIn=ttl)
+
+
+def content_disposition(filename: str) -> str:
+    """ASCII fallback plus RFC 5987 filename* so non-Latin titles survive."""
+    from urllib.parse import quote
+    cleaned = "".join(ch for ch in filename if ch.isprintable() and ch not in '"\\/').strip() or "track.flac"
+    ascii_name = "".join(ch for ch in cleaned if ch.isascii() and (ch.isalnum() or ch in " -_().")).strip()
+    if not ascii_name or ascii_name.startswith("."):
+        ascii_name = "track" + (ascii_name if ascii_name.startswith(".") else ".flac")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(cleaned, safe="")}'
 
 
 def remove(job_id: str, account_id: str) -> bool:

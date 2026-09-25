@@ -406,6 +406,9 @@ async def _run_demucs_on_gpu(
 
 
 _CACHE_PREFIX = "af:sepcache:"
+# Bump whenever the GPU worker's models or pipeline change, so results made
+# by the old worker are never reused for the new one.
+SEPARATION_PIPELINE_VERSION = os.environ.get("SEPARATION_PIPELINE_VERSION", "worker-v12")
 
 
 def _fingerprint(input_path: str, task: str, model: str, overlap: float, extra_input: dict | None) -> str:
@@ -413,7 +416,8 @@ def _fingerprint(input_path: str, task: str, model: str, overlap: float, extra_i
     with open(input_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    settings = {"task": task, "model": model, "overlap": overlap, "extra": extra_input or {}}
+    settings = {"task": task, "model": model, "overlap": overlap, "extra": extra_input or {},
+                "pipeline": SEPARATION_PIPELINE_VERSION}
     h.update(json.dumps(settings, sort_keys=True).encode())
     return h.hexdigest()
 
@@ -463,6 +467,12 @@ async def _separate_or_reuse(input_path: str, job_id: str, task: str, model: str
         try:
             fingerprint = await run_blocking(_fingerprint, input_path, task, model, overlap, extra_input)
             if _reuse_cached(fingerprint, job_id, expected_paths):
+                try:
+                    duration = await run_blocking(get_audio_duration_seconds, input_path)
+                    clip = (extra_input or {}).get("clip_seconds")
+                    metering.record_input_duration(job_id, min(duration, clip) if clip else duration)
+                except Exception:  # noqa: BLE001
+                    logger.warning(f"[SEPARATION] Job {job_id}: could not meter cached input", exc_info=True)
                 metering.record_job_finished(job_id, status="completed", gpu_seconds=0.0, gpu_type="cache")
                 _remember_outputs(fingerprint, job_id)
                 return

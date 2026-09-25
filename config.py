@@ -1035,7 +1035,13 @@ ALLOWED_VIDEO_INPUT_FORMATS = frozenset({
 # rather than read whole into memory (see upload.py). Reading 200MB via
 # `await file.read()` on a 6GB box with no swap would be reckless;
 # writing it in 1MB chunks costs almost nothing.
-MAX_VIDEO_UPLOAD_BYTES = int(os.environ.get("MAX_VIDEO_UPLOAD_BYTES", str(200 * 1024 * 1024)))  # 200 MB
+# Cloudflare Free and Pro reject request bodies over 100 MB, so video uploads
+# stop at 95 MB whatever the env says.
+CLOUDFLARE_BODY_CEILING_BYTES = 95 * 1024 * 1024
+MAX_VIDEO_UPLOAD_BYTES = min(
+    int(os.environ.get("MAX_VIDEO_UPLOAD_BYTES", str(CLOUDFLARE_BODY_CEILING_BYTES))),
+    CLOUDFLARE_BODY_CEILING_BYTES,
+)
 
 # Separate from MAX_VIDEO_DURATION_SECONDS (which caps YouTube
 # DOWNLOADS) - same units, completely different purpose. Audio-only

@@ -151,41 +151,53 @@ def update_email_preferences(body: EmailPreferences, identity: Identity = Depend
 
 
 _UNSUB_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} | AudioForges</title></head>
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>{title} | AudioForges</title></head>
 <body style="margin:0;background:#0b0b0c;color:#e8e8ea;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif">
 <div style="max-width:460px;margin:80px auto;padding:32px;background:#151517;border:1px solid #26262a;border-radius:14px">
 <h1 style="margin:0 0 12px;font-size:22px">{title}</h1><p style="color:#b6b6bd;line-height:1.6">{message}</p>
-<p><a href="https://www.audioforges.com" style="color:#f59e0b">Back to AudioForges</a></p></div></body></html>"""
+{extra}<p><a href="https://www.audioforges.com" style="color:#f59e0b">Back to AudioForges</a></p></div></body></html>"""
+
+_UNSUB_WHAT = {"notices": "low-balance emails", "updates": "AudioForges updates", "all": "all AudioForges emails"}
 
 
-def _unsubscribe(token: str) -> tuple[bool, str]:
-    from . import notifications
-    parsed = notifications.read_unsubscribe_token(token)
-    if parsed is None:
-        return False, ""
-    notifications.apply_unsubscribe(*parsed)
-    return True, parsed[1]
+def _unsub_html(title: str, message: str, extra: str = "", status: int = 200) -> HTMLResponse:
+    return HTMLResponse(_UNSUB_PAGE.format(title=title, message=message, extra=extra), status_code=status,
+                        headers={"Cache-Control": "no-store"})
+
+
+def _invalid_unsub() -> HTMLResponse:
+    return _unsub_html("Link not valid", "This unsubscribe link is broken or incomplete. Email "
+                       "contact@audioforges.com and we'll remove you by hand.", status=400)
 
 
 @router.get("/email/unsubscribe", response_class=HTMLResponse)
 def unsubscribe_page(t: str = "") -> HTMLResponse:
-    ok, scope = _unsubscribe(t)
-    if not ok:
-        return HTMLResponse(_UNSUB_PAGE.format(title="Link not valid",
-                            message="This unsubscribe link is broken or incomplete. Email "
-                                    "contact@audioforges.com and we'll remove you by hand."), status_code=400)
-    what = "low-balance emails" if scope == "notices" else "AudioForges updates" if scope == "updates" else "all AudioForges emails"
-    return HTMLResponse(_UNSUB_PAGE.format(title="You're unsubscribed",
-                        message=f"You won't get {what} anymore. Receipts and sign-in links still arrive, "
-                                "since those are needed to use your account."))
+    """Only asks. Mail scanners open links on their own, so a GET must
+    never unsubscribe anyone."""
+    import html
+    from . import notifications
+    parsed = notifications.read_unsubscribe_token(t)
+    if parsed is None:
+        return _invalid_unsub()
+    button = (f'<form method="post" action="/credits/email/unsubscribe?t={html.escape(t, quote=True)}">'
+              '<button type="submit" style="background:#f59e0b;color:#0b0b0c;border:0;border-radius:8px;'
+              'padding:10px 18px;font-size:15px;font-weight:600;cursor:pointer">Unsubscribe</button></form>')
+    return _unsub_html("Unsubscribe?", f"Stop getting {_UNSUB_WHAT[parsed[1]]}? Receipts and sign-in "
+                       "links still arrive, since those are needed to use your account.", button)
 
 
-@router.post("/email/unsubscribe")
-def unsubscribe_one_click(t: str = "") -> dict:
-    ok, _ = _unsubscribe(t)
-    if not ok:
-        raise HTTPException(status_code=400, detail={"error": "invalid_token"})
-    return {"ok": True}
+@router.post("/email/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_confirm(t: str = "") -> HTMLResponse:
+    """The button on the page above, and RFC 8058 one-click from mail apps."""
+    from . import notifications
+    parsed = notifications.read_unsubscribe_token(t)
+    if parsed is None:
+        return _invalid_unsub()
+    notifications.apply_unsubscribe(*parsed)
+    return _unsub_html("You're unsubscribed", f"You won't get {_UNSUB_WHAT[parsed[1]]} anymore. Receipts "
+                       "and sign-in links still arrive, since those are needed to use your account.")
+
 
 class ReferralClaim(BaseModel):
     code: str = Field(..., min_length=4, max_length=16, pattern=r"^[A-Za-z0-9]+$")

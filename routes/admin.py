@@ -1380,11 +1380,7 @@ async def root():
 
     return {
         "status": "AudioForges API",
-        "engine": (
-            "Essentia (key/BPM) + Demucs (separation) + ffmpeg (conversion, trim, "
-            "volume, reverse, fade, channels, resample, denoise, echo, silence) + "
-            "rubberband (pitch, tempo) + Silero VAD (speech silence)"
-        ),
+        "engine": "Forge One and Forge Studio separation, plus key, BPM and audio tools",
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
             "youtube_hq_enabled": _youtube_studio_enabled(),

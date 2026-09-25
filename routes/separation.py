@@ -145,31 +145,61 @@ router = APIRouter()
 
 
 _COPY_TARGET = {"aac": "m4a", "mp3": "mp3", "flac": "flac", "opus": "ogg", "vorbis": "ogg", "pcm_s16le": "wav"}
+MAX_SEPARATION_UPLOAD_BYTES = max(MAX_UPLOAD_BYTES, MAX_VIDEO_UPLOAD_BYTES)
+VIDEO_EXTRACT_CONCURRENCY = 2
+_video_extract_semaphore = asyncio.Semaphore(VIDEO_EXTRACT_CONCURRENCY)
 
 
-def _is_video_upload(filename: str | None) -> bool:
-    ext = (filename or "").rsplit(".", 1)[-1].strip().lower() if "." in (filename or "") else ""
-    return ext in ALLOWED_VIDEO_INPUT_FORMATS
-
-
-async def _audio_from_video(job_id: str, video_path: str) -> tuple[str, int]:
-    """Keeps only the audio of an uploaded video, copied without re-encoding
-    when the codec allows, otherwise as lossless FLAC. The video is deleted
-    so only audio travels to the GPU worker."""
-    from video_to_audio import probe_audio_stream, extract_audio
-
-    base = video_path.rsplit(".", 1)[0]
+def _has_video_stream(path: str) -> bool:
+    """True when the file really carries video. Cover art inside an audio
+    file (attached_pic) does not count."""
+    import json as _json
+    import subprocess
+    from config import FFPROBE_PATH, FFPROBE_TIMEOUT_SECONDS
     try:
-        codec, _ = await run_blocking(probe_audio_stream, video_path)
-        target = _COPY_TARGET.get(codec, "flac")
-        audio_path = f"{base}_audio.{target}"
-        await run_blocking(extract_audio, video_path, audio_path, target)
-    except AudioToolError as e:
+        result = subprocess.run(
+            [FFPROBE_PATH, "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=codec_type:stream_disposition=attached_pic", "-of", "json", path],
+            capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+        streams = _json.loads(result.stdout or "{}").get("streams") or []
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return False
+    return any(not (st.get("disposition") or {}).get("attached_pic") for st in streams)
+
+
+def _extract_video_audio(video_path: str) -> str:
+    """Blocking. Keeps only the audio, stream-copied when the codec allows,
+    otherwise lossless FLAC."""
+    from video_to_audio import probe_audio_stream, extract_audio
+    codec, _ = probe_audio_stream(video_path)
+    target = _COPY_TARGET.get(codec, "flac")
+    audio_path = f"{video_path.rsplit('.', 1)[0]}_audio.{target}"
+    extract_audio(video_path, audio_path, target)
+    return audio_path
+
+
+async def _extract_then_run(job_id: str, video_path: str, paths: dict, runner) -> None:
+    """Pulls the audio out of an uploaded video off the request path, then
+    starts the separation. A video with no usable audio fails the job and
+    returns any credit."""
+    from credits.ledger import settle_or_refund
+    try:
+        async with _video_extract_semaphore:
+            audio_path = await run_blocking(_extract_video_audio, video_path)
+    except Exception as e:  # noqa: BLE001
+        message = str(e) if isinstance(e, AudioToolError) else "We couldn't read the audio in this video."
+        logger.info(f"[VIDEO_INPUT] job={job_id} extraction failed: {e}")
         cleanup_file(video_path)
-        mark_failed(job_id, str(e))
-        raise HTTPException(400, {"kind": "video_unreadable", "message": str(e)})
+        mark_failed(job_id, message)
+        await asyncio.to_thread(settle_or_refund, job_id, False, "video_unreadable")
+        await asyncio.to_thread(metering.record_job_finished, job_id, status="failed", error=message,
+                                client_side=True)
+        return
     cleanup_file(video_path)
-    return audio_path, os.path.getsize(audio_path)
+    paths["input"] = audio_path
+    set_job_input(job_id, audio_path)
+    await runner()
 
 
 def youtube_studio_enabled() -> bool:
@@ -195,7 +225,8 @@ def studio_config(response: Response) -> dict:
         "google_signin": bool(s.google_client_id and s.google_client_secret),
         "video_input": {
             "formats": sorted(ALLOWED_VIDEO_INPUT_FORMATS),
-            "max_mb": max(MAX_UPLOAD_BYTES, MAX_VIDEO_UPLOAD_BYTES) // (1024 * 1024),
+            "max_mb": MAX_VIDEO_UPLOAD_BYTES // (1024 * 1024),
+            "audio_max_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
         },
         "signup_bonus_credits": s.signup_bonus_credits,
         "free_needs_account": s.free_ops_require_account,
@@ -468,13 +499,15 @@ async def _queue_separation(
     job_id = create_job(job_type=job_type)
 
     remember_job_tags(job_id)
-    is_video = _is_video_upload(original_filename)
-    file_path, size = await _accept_upload(
-        file, job_id, label=tool.lower(),
-        max_bytes=max(MAX_UPLOAD_BYTES, MAX_VIDEO_UPLOAD_BYTES) if is_video else MAX_UPLOAD_BYTES,
-    )
-    if is_video:
-        file_path, size = await _audio_from_video(job_id, file_path)
+    file_path, size = await _accept_upload(file, job_id, label=tool.lower(), max_bytes=MAX_SEPARATION_UPLOAD_BYTES)
+    is_video = await run_blocking(_has_video_stream, file_path)
+    if not is_video and size > MAX_UPLOAD_BYTES:
+        cleanup_file(file_path)
+        message = f"Audio files can be up to {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+        mark_failed(job_id, message)
+        raise HTTPException(413, {"kind": "file_too_large", "message": message,
+                                  "max_mb": MAX_UPLOAD_BYTES // (1024 * 1024)})
+    paths = {"input": file_path}
 
     # Retain the source for this job's TTL so a completed job can be
     # upgraded to HQ without a second upload. Paired with the empty
@@ -554,7 +587,7 @@ async def _queue_separation(
         # choice - see separation.py's own module docstring for the full
         # "why this changed" reasoning.
         work = lambda: run_stem_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+            paths["input"], job_id, model, overlap, timeout_seconds, max_duration_seconds,
             vocal_options, stem_count, paid=run_ctx["paid"],
         )
         on_success = lambda stems: mark_stems_complete(job_id, original_filename, stems)
@@ -562,7 +595,7 @@ async def _queue_separation(
         generic_error = "Stem separation failed unexpectedly."
     else:
         work = lambda: run_separation(
-            file_path, job_id, model, overlap, timeout_seconds, max_duration_seconds,
+            paths["input"], job_id, model, overlap, timeout_seconds, max_duration_seconds,
             vocal_options, paid=run_ctx["paid"],
         )
         on_success = lambda paths: mark_complete(
@@ -573,7 +606,7 @@ async def _queue_separation(
         generic_error = "Separation failed unexpectedly."
 
     def _spawn():
-        standard = _run_tool_job(
+        runner = lambda: _run_tool_job(
             tool=tool,
             metric=metric_label,
             job_id=job_id,
@@ -600,7 +633,10 @@ async def _queue_separation(
             # precise values survive this later write.
             metered_tool=rule_key or metric_label.lstrip("/"),
         )
-        spawn_background_task(standard)
+        if is_video:
+            spawn_background_task(_extract_then_run(job_id, file_path, paths, runner))
+        else:
+            spawn_background_task(runner())
 
     billing = None
     if rule_key is not None:
@@ -651,6 +687,8 @@ async def _queue_separation(
     _log_queued(tool, job_id, original_filename, size, detail)
 
     payload = {"job_id": job_id, "status": "processing"}
+    if is_video:
+        payload["video"] = True
     if vocal_options or stem_count != 4:
         payload["studio"] = {"vocal_options": list(vocal_options), "stem_count": stem_count}
     if billing:

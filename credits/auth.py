@@ -202,8 +202,15 @@ def _google_redirect_uri() -> str:
 
 
 def _safe_next(path: str | None) -> str:
-    if not path or not path.startswith("/") or path.startswith("//") or "\\" in path:
+    """A same-site path only. Control characters, backslashes and
+    protocol-relative forms are refused, raw or percent-encoded."""
+    from urllib.parse import unquote
+    if not path:
         return "/"
+    for candidate in (path, unquote(path), unquote(unquote(path))):
+        if (not candidate.startswith("/") or candidate.startswith("//") or "\\" in candidate
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in candidate)):
+            return "/"
     return path[:300]
 
 

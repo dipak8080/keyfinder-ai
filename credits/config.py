@@ -413,6 +413,7 @@ class Settings:
     library_enabled: bool
     library_retention_days: int
     library_max_total_gb: float
+    library_max_items_per_account: int
 
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
@@ -597,7 +598,8 @@ def build_settings() -> Settings:
         referral_monthly_cap=max(0, _int("REFERRAL_MONTHLY_CAP", 20)),
         library_enabled=_bool("LIBRARY_ENABLED", False),
         library_retention_days=max(1, _int("LIBRARY_RETENTION_DAYS", 30)),
-        library_max_total_gb=max(1.0, _float("LIBRARY_MAX_TOTAL_GB", 50.0)),
+        library_max_total_gb=max(1.0, _float("LIBRARY_MAX_TOTAL_GB", 200.0)),
+        library_max_items_per_account=max(1, _int("LIBRARY_MAX_ITEMS_PER_ACCOUNT", 50)),
     )
 
     # ---- Resolve derived free rate limits -------------------------------
