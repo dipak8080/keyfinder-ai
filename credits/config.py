@@ -373,6 +373,15 @@ class Settings:
     monthly_fixed_cost_usd: float
     admin_token: str
 
+    # Studio extras (gpu-worker v3). Off until the frontend ships them.
+    studio_vocal_options_enabled: bool
+    studio_six_stems_enabled: bool
+    studio_option_credits: int
+    studio_preview_enabled: bool
+    studio_preview_seconds: int
+    studio_preview_daily_per_subject: int
+    studio_preview_daily_per_ip: int
+
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
 
@@ -522,6 +531,14 @@ def build_settings() -> Settings:
         turnstile_pass_hours=_int("TURNSTILE_PASS_HOURS", 12),
         monthly_fixed_cost_usd=_float("MONTHLY_FIXED_COST_USD", 18.0),
         admin_token=os.getenv("CREDITS_ADMIN_TOKEN", ""),
+
+        studio_vocal_options_enabled=_bool("STUDIO_VOCAL_OPTIONS_ENABLED", False),
+        studio_six_stems_enabled=_bool("STUDIO_SIX_STEMS_ENABLED", False),
+        studio_option_credits=max(0, _int("STUDIO_OPTION_CREDITS", 1)),
+        studio_preview_enabled=_bool("STUDIO_PREVIEW_ENABLED", False),
+        studio_preview_seconds=min(60, max(5, _int("STUDIO_PREVIEW_SECONDS", 30))),
+        studio_preview_daily_per_subject=max(0, _int("STUDIO_PREVIEW_DAILY_PER_SUBJECT", 3)),
+        studio_preview_daily_per_ip=max(0, _int("STUDIO_PREVIEW_DAILY_PER_IP", 6)),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

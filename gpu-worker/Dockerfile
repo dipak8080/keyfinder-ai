@@ -81,6 +81,7 @@ tone = os.path.join(work, 'warmup.wav'); \
 subprocess.run(['ffmpeg', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10', '-ac', '2', tone], check=True); \
 subprocess.run(['demucs', '-n', 'htdemucs', '-d', 'cpu', '-o', work, tone], check=True); \
 subprocess.run(['demucs', '-n', 'htdemucs_ft', '-d', 'cpu', '-o', work, tone], check=True); \
+subprocess.run(['demucs', '-n', 'htdemucs_6s', '-d', 'cpu', '-o', work, tone], check=True); \
 "
 
 # Same bake-the-weights treatment for the RoFormer model: one CPU
@@ -96,6 +97,17 @@ sep_mod = __import__('audio_separator.separator', fromlist=['Separator']); \
 sep = sep_mod.Separator(model_file_dir='/worker/models', output_dir=work, output_format='WAV'); \
 sep.load_model(model_filename='vocals_mel_band_roformer.ckpt'); \
 sep.separate(tone); \
+"
+
+# Studio vocal options: De-Reverb-Echo and lead/backing karaoke weights.
+RUN python -c "\
+import subprocess, tempfile, os; \
+work = tempfile.mkdtemp(); \
+tone = os.path.join(work, 'warmup.wav'); \
+subprocess.run(['ffmpeg', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10', '-ac', '2', tone], check=True); \
+sep_mod = __import__('audio_separator.separator', fromlist=['Separator']); \
+[(lambda s: (s.load_model(model_filename=m), s.separate(tone)))(sep_mod.Separator(model_file_dir='/worker/models', output_dir=work, output_format='WAV')) \
+ for m in ('dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt', 'mel_band_roformer_karaoke_becruily.ckpt')]; \
 "
 
 COPY handler.py .

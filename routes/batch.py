@@ -516,10 +516,10 @@ def _job_view(index: int, job_id: str) -> dict:
         return {"job_id": job_id, "index": index, "status": "expired", "title": None, "error": None, "stems": []}
     stems: list = []
     if job.get("status") == "complete":
-        if job.get("stems"):
-            stems = sorted(job["stems"].keys())
-        elif job.get("vocals_path"):
-            stems = ["vocals", "instrumental"]
+        names = set((job.get("stems") or {}).keys())
+        if job.get("vocals_path"):
+            names |= {"vocals", "instrumental"}
+        stems = sorted(names)
     return {
         "job_id": job_id,
         "index": index,
@@ -609,10 +609,9 @@ def _collect_entries(batch: dict, fmt: str) -> list:
         if not job or job.get("status") != "complete":
             continue
         title = _safe_name(job.get("title") or job_id)
-        if job.get("stems"):
-            files = dict(job["stems"])
-        else:
-            files = {"vocals": job.get("vocals_path"), "instrumental": job.get("instrumental_path")}
+        files = dict(job.get("stems") or {})
+        if job.get("vocals_path"):
+            files.update({"vocals": job.get("vocals_path"), "instrumental": job.get("instrumental_path")})
         for stem, path in sorted(files.items()):
             if path and os.path.exists(path):
                 entries.append((f"{i:02d} - {title} - {stem}.{fmt}", path))

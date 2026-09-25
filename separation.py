@@ -212,6 +212,45 @@ def get_audio_duration_seconds(file_path: str) -> float:
         raise SeparationError(f"Could not read audio duration: {e}")
 
 
+# Extra stems each Studio vocal option adds (gpu-worker v3 names).
+VOCAL_OPTION_STEMS = {
+    "dereverb": ("vocals_dry",),
+    "lead_back": ("lead_vocals", "backing_vocals"),
+}
+SIX_STEM_EXTRAS = ("guitar", "piano")
+
+
+def extra_stem_paths(job_id: str, vocal_options=()) -> Dict[str, str]:
+    """Where the worker lands the option stems for this job."""
+    return {
+        name: os.path.join(SEPARATION_DIR, f"{job_id}_{name}.wav")
+        for option in vocal_options
+        for name in VOCAL_OPTION_STEMS[option]
+    }
+
+
+def _clip_payload(clip_start, clip_seconds) -> dict:
+    if clip_seconds is None:
+        return {}
+    return {"clip_start": round(float(clip_start or 0), 3), "clip_seconds": round(float(clip_seconds), 3)}
+
+
+def _studio_payload(model: str, vocal_options, stem_count: int) -> dict:
+    if not vocal_options and stem_count == 4:
+        return {}
+    if model != "melband_roformer":
+        raise SeparationError("Studio options need the Studio Quality model.")
+    unknown = [o for o in vocal_options if o not in VOCAL_OPTION_STEMS]
+    if unknown or stem_count not in (4, 6):
+        raise SeparationError("Separation failed: unsupported Studio option requested.")
+    extra = {}
+    if vocal_options:
+        extra["vocal_options"] = list(vocal_options)
+    if stem_count == 6:
+        extra["stem_count"] = 6
+    return extra
+
+
 async def _run_demucs_on_gpu(
     input_path: str,
     job_id: str,
@@ -220,6 +259,7 @@ async def _run_demucs_on_gpu(
     overlap: float,
     timeout_seconds: int,
     max_duration_seconds: int,
+    extra_input: dict | None = None,
 ) -> dict:
     """
     Shared engine for both public entry points below. Validates, makes
@@ -237,7 +277,8 @@ async def _run_demucs_on_gpu(
     # billable routes. Without this line input_minutes in the cost report
     # would describe paid jobs only, which is the subset most likely to
     # mislead when setting a price. See metering.record_input_duration().
-    metering.record_input_duration(job_id, duration)
+    clip_seconds = (extra_input or {}).get("clip_seconds")
+    metering.record_input_duration(job_id, min(duration, clip_seconds) if clip_seconds else duration)
 
     if duration > max_duration_seconds:
         message = (
@@ -278,10 +319,13 @@ async def _run_demucs_on_gpu(
             "overlap": overlap,
             "max_duration_seconds": max_duration_seconds,
         }
+        if extra_input:
+            input_payload.update(extra_input)
 
         logger.info(
             f"[SEPARATION] Job {job_id}: submitting to RunPod GPU worker "
-            f"(model={model}, overlap={overlap}, task={task}, duration={duration:.1f}s)"
+            f"(model={model}, overlap={overlap}, task={task}, duration={duration:.1f}s"
+            f"{', extras=' + str(extra_input) if extra_input else ''})"
         )
         try:
             output = await run_worker_job(
@@ -385,21 +429,28 @@ async def run_separation(
     overlap: float = SEPARATION_OVERLAP,
     timeout_seconds: int = DEMUCS_TIMEOUT_SECONDS,
     max_duration_seconds: int = MAX_SEPARATION_DURATION_SECONDS,
+    vocal_options=(),
+    clip_start=None,
+    clip_seconds=None,
 ) -> Tuple[str, str]:
     """
     Two-stem (vocal remover) mode. Returns (vocals_path,
-    instrumental_path) - identical shape to every prior version.
+    instrumental_path) - identical shape to every prior version. Studio
+    vocal option stems land at extra_stem_paths(job_id, vocal_options).
     """
     final_vocals_path = os.path.join(SEPARATION_DIR, f"{job_id}_vocals.wav")
     final_instrumental_path = os.path.join(SEPARATION_DIR, f"{job_id}_instrumental.wav")
+    extra_input = {**_studio_payload(model, vocal_options, 4), **_clip_payload(clip_start, clip_seconds)}
 
     await _run_demucs_on_gpu(
         input_path, job_id, "separate", model, overlap, timeout_seconds, max_duration_seconds,
+        extra_input,
     )
 
     _verify_output_files(job_id, {
         "vocals": final_vocals_path,
         "instrumental": final_instrumental_path,
+        **extra_stem_paths(job_id, vocal_options),
     })
 
     logger.info(
@@ -416,23 +467,34 @@ async def run_stem_separation(
     overlap: float = SEPARATION_OVERLAP,
     timeout_seconds: int = DEMUCS_TIMEOUT_SECONDS,
     max_duration_seconds: int = MAX_SEPARATION_DURATION_SECONDS,
+    vocal_options=(),
+    stem_count: int = 4,
+    clip_start=None,
+    clip_seconds=None,
 ) -> Dict[str, str]:
     """
     Full multi-stem mode. Returns a {stem_name: path} dict - identical
-    shape to every prior version.
+    shape to every prior version, plus guitar/piano when stem_count is 6
+    and any Studio vocal option stems.
     """
     expected_stems = MODEL_STEM_NAMES.get(model)
     if not expected_stems:
         logger.error(f"[STEMS] Job {job_id} rejected - no stem list configured for model '{model}'")
         raise SeparationError("Separation failed: unsupported model requested.")
 
+    extra_input = {**_studio_payload(model, vocal_options, stem_count), **_clip_payload(clip_start, clip_seconds)}
+    if stem_count == 6:
+        expected_stems = tuple(expected_stems) + SIX_STEM_EXTRAS
+
     final_paths = {
         stem: os.path.join(SEPARATION_DIR, f"{job_id}_{stem}.wav")
         for stem in expected_stems
     }
+    final_paths.update(extra_stem_paths(job_id, vocal_options))
 
     await _run_demucs_on_gpu(
         input_path, job_id, "stems", model, overlap, timeout_seconds, max_duration_seconds,
+        extra_input,
     )
 
     _verify_output_files(job_id, final_paths)

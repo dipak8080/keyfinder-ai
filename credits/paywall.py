@@ -53,7 +53,15 @@ class Decision:
     reason: str  # paywall_disabled | tool_free | under_free_duration | billable
 
 
-def decide(tool: str, input_seconds: float | None) -> Decision:
+STUDIO_VOCAL_OPTIONS = ("dereverb", "lead_back")
+
+
+def option_credits(vocal_options) -> int:
+    """Extra credits a Studio run costs for its vocal options."""
+    return get_settings().studio_option_credits * len(set(vocal_options or ()))
+
+
+def decide(tool: str, input_seconds: float | None, extra_credits: int = 0) -> Decision:
     s = get_settings()
     rule = s.rule_for(tool)
 
@@ -66,7 +74,7 @@ def decide(tool: str, input_seconds: float | None) -> Decision:
     # Unknown duration on a metered tool is billable — never fail open.
     # free_ops is allowance, not credits: one job costs one free op
     # regardless of credit cost, so any credit price stays coverable.
-    return Decision(tool, True, rule.credits, 1, "billable")
+    return Decision(tool, True, rule.credits + max(0, extra_credits), 1, "billable")
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +136,9 @@ async def _record_gate_event_async(identity: Identity, **kwargs) -> None:
         log.warning("gate event not recorded", exc_info=True)
 
 
-def preview(identity: Identity, tool: str, input_seconds: float | None) -> dict:
-    decision = decide(tool, input_seconds)
+def preview(identity: Identity, tool: str, input_seconds: float | None,
+            extra_credits: int = 0) -> dict:
+    decision = decide(tool, input_seconds, extra_credits)
     from .db import connect
 
     with connect() as conn:
@@ -187,7 +196,7 @@ async def free_gate(identity: Identity, *, tool: str) -> None:
 
 @asynccontextmanager
 async def guard(identity: Identity, *, job_id: str, tool: str,
-                input_seconds: float | None) -> AsyncIterator[Charge]:
+                input_seconds: float | None, extra_credits: int = 0) -> AsyncIterator[Charge]:
     """Charge, run the body, auto-refund if the body raises.
 
         async with paywall.guard(identity, job_id=jid, tool="stem-separation",
@@ -203,7 +212,7 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
     times out and retries, since that retry arrives with a fresh job_id -
     see idempotency.py for the layer that closes that.
     """
-    decision = decide(tool, input_seconds)
+    decision = decide(tool, input_seconds, extra_credits)
     try:
         charge = await asyncio.to_thread(
             ledger_mod.charge_for_job, identity,

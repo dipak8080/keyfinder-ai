@@ -51,7 +51,7 @@ breaks the first time someone rewords the copy.
 import datetime
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response
 
 from config import (
     logger,
@@ -77,7 +77,7 @@ from jobs import (
     count_processing,
     SEPARATION_JOB_TYPES,
 )
-from separation import run_separation, run_stem_separation, get_audio_duration_seconds, SeparationError
+from separation import run_separation, run_stem_separation, get_audio_duration_seconds, SeparationError, extra_stem_paths
 from utils import _separation_semaphore, run_blocking
 from log_stream import remember_job_tags, set_job_context, tag_from_job
 
@@ -87,6 +87,7 @@ from credits.identity import Identity
 from credits.limits import tiered_rate_limit
 
 from ._shared import spawn_background_task, _log_queued, _reject_if_separation_queue_full, _run_tool_job
+from .separation import studio_options
 
 router = APIRouter()
 
@@ -103,6 +104,7 @@ router = APIRouter()
 #   tool_disabled         this route's own flag is off
 #   hq_disabled           SEPARATION_HQ_ENABLED kill switch
 #   already_upgraded      this source already has an HQ child
+#   options_unavailable   Studio extras asked for on a YouTube-sourced job
 #
 # hq_disabled and tool_disabled are deliberately SEPARATE: the first is
 # "HQ is off for everyone right now", the second is "this route is not
@@ -214,7 +216,14 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
     return (state, None)
 
 
-async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, rule_key: str) -> dict:
+def _options_blocked_for(job: dict, vocal_options, stem_count: int) -> bool:
+    """Studio extras run on uploads only, never on YouTube-sourced jobs."""
+    return bool(vocal_options or stem_count != 4) and job.get("job_type") in _YOUTUBE_RULE
+
+
+async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, rule_key: str,
+                        vocal_options: tuple = (), stem_count: int = 4,
+                        extra_credits: int = 0) -> dict:
     """Never 404s. This is called to RENDER a page, and a 404 here would
     be indistinguishable from the status poll itself failing."""
     tag_from_job(job_id)
@@ -226,6 +235,8 @@ async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, ru
     rule_key = state["rule_key"]
     job = state["job"]
     input_path = job["input_path"]
+    if _options_blocked_for(job, vocal_options, stem_count):
+        return {"eligible": False, "tool": rule_key, "reason": "options_unavailable"}
 
     try:
         duration = await run_blocking(get_audio_duration_seconds, input_path)
@@ -239,7 +250,7 @@ async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, ru
             "max_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
         }
 
-    preview = paywall.preview(identity, rule_key, duration)
+    preview = paywall.preview(identity, rule_key, duration, extra_credits)
     return {
         "eligible": True,
         "reason": None,
@@ -259,6 +270,7 @@ async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, ru
 async def _queue_upgrade(
     job_id: str, identity: Identity, *, source_type: str, rule_key: str,
     tool: str, metric_label: str,
+    vocal_options: tuple = (), stem_count: int = 4, extra_credits: int = 0,
 ) -> dict:
     tag_from_job(job_id)
     state, blocker = _eligibility(job_id, source_type, rule_key)
@@ -287,6 +299,9 @@ async def _queue_upgrade(
     rule_key = state["rule_key"]
     job = state["job"]
     input_path = job["input_path"]
+    if _options_blocked_for(job, vocal_options, stem_count):
+        raise HTTPException(400, {"kind": "options_unavailable",
+                                  "message": "Studio options work on uploaded files only."})
     original_filename = job.get("title") or os.path.basename(input_path)
     if job["job_type"] in _YOUTUBE_RULE:
         tool = "YOUTUBE_" + tool
@@ -362,6 +377,7 @@ async def _queue_upgrade(
             work = lambda: run_stem_separation(
                 input_path, new_job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
                 DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
+                vocal_options, stem_count,
             )
             on_success = lambda stems: mark_stems_complete(new_job_id, original_filename, stems)
             success_detail = lambda stems: f"{len(stems)} stems (upgrade)"
@@ -370,13 +386,18 @@ async def _queue_upgrade(
             work = lambda: run_separation(
                 input_path, new_job_id, SEPARATION_MODEL_HQ, SEPARATION_OVERLAP_HQ,
                 DEMUCS_TIMEOUT_SECONDS_HQ, MAX_SEPARATION_DURATION_SECONDS_HQ,
+                vocal_options,
             )
-            on_success = lambda paths: mark_complete(new_job_id, original_filename, paths[0], paths[1])
+            on_success = lambda paths: mark_complete(
+                new_job_id, original_filename, paths[0], paths[1],
+                extra_stem_paths(new_job_id, vocal_options) or None,
+            )
             success_detail = None
             generic_error = "Separation failed unexpectedly."
 
         async with paywall.guard(
-            identity, job_id=new_job_id, tool=rule_key, input_seconds=duration
+            identity, job_id=new_job_id, tool=rule_key, input_seconds=duration,
+            extra_credits=extra_credits,
         ) as charge:
             spawn_background_task(_run_tool_job(
                 tool=tool, metric=metric_label, job_id=new_job_id,
@@ -436,15 +457,19 @@ async def _queue_upgrade(
 async def upgrade_separation(
     response: Response,
     job_id: str = Path(...),
+    dereverb: bool = Query(False),
+    lead_back: bool = Query(False),
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
     """Re-runs a completed /separate job through htdemucs_ft. Costs one
     credit. Returns a NEW job_id - poll at /separate/status/{id}, fetch
     stems from the standard /separate/preview and /separate/download
     routes. Idempotent per source job."""
+    vocal_options, _, extra_credits = studio_options(dereverb, lead_back)
     return await _queue_upgrade(
         job_id, identity, source_type="separation", rule_key="separate-hq",
         tool="SEPARATION_HQ", metric_label="/separate/upgrade",
+        vocal_options=vocal_options, extra_credits=extra_credits,
     )
 
 
@@ -459,13 +484,18 @@ async def upgrade_separation(
 async def upgrade_stems(
     response: Response,
     job_id: str = Path(...),
+    dereverb: bool = Query(False),
+    lead_back: bool = Query(False),
+    stem_count: int = Query(4),
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
     """Re-runs a completed /stems job through htdemucs_ft. Costs one
     credit. Poll the new id at /stems/status/{id}. Idempotent per source."""
+    vocal_options, stem_count, extra_credits = studio_options(dereverb, lead_back, stem_count)
     return await _queue_upgrade(
         job_id, identity, source_type="stems", rule_key="stems-hq",
         tool="STEMS_HQ", metric_label="/stems/upgrade",
+        vocal_options=vocal_options, stem_count=stem_count, extra_credits=extra_credits,
     )
 
 
@@ -473,20 +503,30 @@ async def upgrade_stems(
 async def separate_upgrade_info(
     response: Response,
     job_id: str = Path(...),
+    dereverb: bool = Query(False),
+    lead_back: bool = Query(False),
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
     """Should the Studio Quality CTA show on this result, and what will
     it cost? Never 404s - returns eligible=false with a reason."""
     response.headers["Cache-Control"] = "no-store"
-    return await _upgrade_info(job_id, identity, source_type="separation", rule_key="separate-hq")
+    vocal_options, _, extra_credits = studio_options(dereverb, lead_back)
+    return await _upgrade_info(job_id, identity, source_type="separation", rule_key="separate-hq",
+                               vocal_options=vocal_options, extra_credits=extra_credits)
 
 
 @router.get("/stems/upgrade-info/{job_id}")
 async def stems_upgrade_info(
     response: Response,
     job_id: str = Path(...),
+    dereverb: bool = Query(False),
+    lead_back: bool = Query(False),
+    stem_count: int = Query(4),
     identity: Identity = Depends(paywall.get_identity),
 ) -> dict:
     """Same as /separate/upgrade-info, for 4-stem jobs."""
     response.headers["Cache-Control"] = "no-store"
-    return await _upgrade_info(job_id, identity, source_type="stems", rule_key="stems-hq")
+    vocal_options, stem_count, extra_credits = studio_options(dereverb, lead_back, stem_count)
+    return await _upgrade_info(job_id, identity, source_type="stems", rule_key="stems-hq",
+                               vocal_options=vocal_options, stem_count=stem_count,
+                               extra_credits=extra_credits)

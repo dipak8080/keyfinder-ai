@@ -189,15 +189,26 @@ def set_job_input(job_id: str, input_path: str):
     _update(job_id, input_path=input_path)
 
 
-def mark_complete(job_id: str, title: str, vocals_path: str, instrumental_path: str):
-    """Marks a SEPARATION-shaped job complete with its two stem paths."""
-    _update(
-        job_id,
+def mark_complete(job_id: str, title: str, vocals_path: str, instrumental_path: str,
+                  extra_stems: Optional[dict] = None):
+    """Marks a SEPARATION-shaped job complete with its two stem paths.
+
+    Studio option stems (vocals_dry, lead_vocals, ...) go in the `stems`
+    field, which cleanup_expired_jobs() already sweeps."""
+    fields = dict(
         status="complete",
         title=title,
         vocals_path=vocals_path,
         instrumental_path=instrumental_path,
     )
+    if extra_stems:
+        fields["stems"] = extra_stems
+    _update(job_id, **fields)
+
+
+def set_job_fields(job_id: str, **fields) -> bool:
+    """Writes extra fields onto an existing job record."""
+    return _update(job_id, **fields)
 
 
 def mark_stems_complete(job_id: str, title: str, stems: dict):

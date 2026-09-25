@@ -49,6 +49,13 @@ INPUT (job["input"]):
   model                 one of ALLOWED_SEPARATION_MODELS below
   overlap                float, Demucs --overlap value
   max_duration_seconds  reject cleanly if the fetched audio exceeds this
+  stem_count            optional, 4 (default) or 6; 6 = RoFormer vocals +
+                         htdemucs_6s on the instrumental (adds guitar, piano)
+  vocal_options         optional list: "dereverb" adds vocals_dry,
+                         "lead_back" adds lead_vocals + backing_vocals
+                         (melband_roformer only)
+  clip_start, clip_seconds  optional preview window; only that slice is
+                         separated and max_duration_seconds is not applied
 
 OUTPUT (small, always well under RunPod's payload limit):
   {"uploaded_stems": [...], "duration_seconds": ..., "gpu_seconds": ...}
@@ -99,99 +106,120 @@ MODEL_STEM_NAMES = {
 ROFORMER_MODEL_FILENAME = "vocals_mel_band_roformer.ckpt"
 ROFORMER_STEMS_SECOND_STAGE = "htdemucs_ft"
 
-# Loaded once per worker process and kept warm - model init is the
-# expensive part, and RunPod serverless workers handle one job at a
-# time, so a single global instance is both safe and the fast path for
-# warm requests.
-#
-# The separator writes into ONE fixed directory for the life of the
-# process, and each job MOVES its outputs into its own work_dir. The
-# obvious-looking alternative - retargeting output_dir per job - does
-# not work: the loaded model instance snapshots its config (including
-# output_dir) at load_model() time, so a mutated attribute on the
-# wrapper is silently ignored on warm reuse and files land in a
-# previous job's already-deleted directory.
-_ROFORMER = None
-ROFORMER_OUTPUT_DIR = "/worker/roformer_out"
+# Extra passes on the RoFormer vocal stem, requested via "vocal_options".
+# Each option ADDS stems; the original vocals stem is always kept.
+#   dereverb -> "vocals_dry"                      (Sucial De-Reverb-Echo v2)
+#   lead_back -> "lead_vocals" + "backing_vocals"  (becruily MelBand karaoke)
+DEREVERB_MODEL_FILENAME = "dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt"
+KARAOKE_MODEL_FILENAME = "mel_band_roformer_karaoke_becruily.ckpt"
+ALLOWED_VOCAL_OPTIONS = ("dereverb", "lead_back")
+
+ROFORMER_STEMS_SECOND_STAGE_6 = "htdemucs_6s"
+ALLOWED_STEM_COUNTS = (4, 6)
+
+MIN_CLIP_SECONDS = 5.0
+MAX_CLIP_SECONDS = 60.0
+
+# One loaded Separator per model file, kept warm for the life of the
+# process. Each gets its own fixed output dir: a loaded model snapshots
+# output_dir at load_model() time, so retargeting it per job does not work.
+_SEPARATORS = {}
+SEPARATOR_OUTPUT_ROOT = "/worker/as_out"
 
 
-def _get_roformer():
-    global _ROFORMER
+def _get_separator(model_filename: str):
     from audio_separator.separator import Separator
 
-    if _ROFORMER is None:
-        os.makedirs(ROFORMER_OUTPUT_DIR, exist_ok=True)
-        sep = Separator(
-            model_file_dir=os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "/worker/models"),
-            output_dir=ROFORMER_OUTPUT_DIR,
-            output_format="WAV",
-            use_autocast=True,
-        )
-        sep.load_model(model_filename=ROFORMER_MODEL_FILENAME)
-        _ROFORMER = sep
-    return _ROFORMER
+    cached = _SEPARATORS.get(model_filename)
+    if cached is not None:
+        return cached
+    out_dir = os.path.join(SEPARATOR_OUTPUT_ROOT, os.path.splitext(model_filename)[0])
+    os.makedirs(out_dir, exist_ok=True)
+    sep = Separator(
+        model_file_dir=os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "/worker/models"),
+        output_dir=out_dir,
+        output_format="WAV",
+        use_autocast=True,
+    )
+    sep.load_model(model_filename=model_filename)
+    _SEPARATORS[model_filename] = (sep, out_dir)
+    return _SEPARATORS[model_filename]
 
 
-def _run_roformer_gpu(input_path: str, work_dir: str):
+def _run_separator(model_filename: str, input_path: str, work_dir: str, names: dict):
     """
-    Returns ({"vocals": path, "instrumental": path}, gpu_seconds).
+    Runs one audio-separator model and returns ({basename: path}, gpu_seconds).
 
-    Trusts separate()'s RETURN VALUE (the fully written output paths)
-    rather than predicting filenames - stem naming varies per model
-    config, and a custom_output_names key that doesn't match a stem is
-    silently ignored, producing a default-named file instead.
+    `names` maps the model config's stem names (matched case-insensitively)
+    to output basenames. Outputs are matched by EXACT basename from
+    separate()'s return value, never by substring: an unmatched stem falls
+    back to a default filename that embeds the model name, which is how
+    vocals and instrumental once shipped swapped.
     """
-    sep = _get_roformer()
-
-    # One job at a time per worker, so the shared dir only ever holds
-    # the current job's outputs - clear leftovers from the previous one.
-    for stale in os.listdir(ROFORMER_OUTPUT_DIR):
+    sep, out_dir = _get_separator(model_filename)
+    for stale in os.listdir(out_dir):
         try:
-            os.remove(os.path.join(ROFORMER_OUTPUT_DIR, stale))
+            os.remove(os.path.join(out_dir, stale))
         except OSError:
             pass
 
     started = time.monotonic()
-    # Keys are matched case-insensitively against the model config's own
-    # stem names. This checkpoint names its stems "vocals" and "other"
-    # (verified empirically); "Instrumental" is included for any future
-    # checkpoint that uses it. Unmatched keys are ignored, so covering
-    # both costs nothing and guarantees deterministic filenames either
-    # way. NEVER classify by substring: an unmatched stem falls back to
-    # a default filename that embeds the MODEL name - which for this
-    # model contains the word "vocals" - and that is exactly the bug
-    # that shipped vocals and instrumental swapped.
-    returned = sep.separate(
-        input_path,
-        custom_output_names={
+    returned = sep.separate(input_path, custom_output_names=names)
+    gpu_seconds = time.monotonic() - started
+
+    by_name = {}
+    for path in returned or []:
+        full = path if os.path.isabs(path) else os.path.join(out_dir, path)
+        if os.path.exists(full):
+            by_name[os.path.basename(full)] = full
+
+    results = {}
+    for base in sorted(set(names.values())):
+        src = by_name.get(f"{base}.wav")
+        if not src:
+            raise RuntimeError(
+                f"{model_filename}: expected {base}.wav, got {sorted(by_name)} (returned: {returned})"
+            )
+        dest = os.path.join(work_dir, f"{base}.wav")
+        shutil.move(src, dest)
+        results[base] = dest
+    return results, gpu_seconds
+
+
+def _run_roformer_gpu(input_path: str, work_dir: str):
+    """Returns ({"vocals": path, "instrumental": path}, gpu_seconds)."""
+    out, gpu_seconds = _run_separator(
+        ROFORMER_MODEL_FILENAME, input_path, work_dir,
+        {
             "Vocals": "roformer_vocals",
             "Instrumental": "roformer_instrumental",
             "Other": "roformer_instrumental",
         },
     )
-    gpu_seconds = time.monotonic() - started
+    return {"vocals": out["roformer_vocals"], "instrumental": out["roformer_instrumental"]}, gpu_seconds
 
-    by_name = {}
-    for path in returned or []:
-        full = path if os.path.isabs(path) else os.path.join(ROFORMER_OUTPUT_DIR, path)
-        if os.path.exists(full):
-            by_name[os.path.basename(full)] = full
 
-    vocals_src = by_name.get("roformer_vocals.wav")
-    instrumental_src = by_name.get("roformer_instrumental.wav")
-    if not vocals_src or not instrumental_src:
-        raise RuntimeError(
-            f"RoFormer outputs missing or unrecognised - expected roformer_vocals.wav "
-            f"and roformer_instrumental.wav, got: {sorted(by_name)} (returned: {returned})"
+def _run_vocal_options(vocals_path: str, work_dir: str, options):
+    """Returns ({stem_name: path}, gpu_seconds) for the requested extras."""
+    extra = {}
+    gpu_seconds = 0.0
+    if "dereverb" in options:
+        out, secs = _run_separator(
+            DEREVERB_MODEL_FILENAME, vocals_path, work_dir,
+            {"dry": "dry_vocals", "No dry": "reverb_tail"},
         )
+        extra["vocals_dry"] = out["dry_vocals"]
+        gpu_seconds += secs
+    if "lead_back" in options:
+        out, secs = _run_separator(
+            KARAOKE_MODEL_FILENAME, vocals_path, work_dir,
+            {"Vocals": "karaoke_lead", "Instrumental": "karaoke_backing"},
+        )
+        extra["lead_vocals"] = out["karaoke_lead"]
+        extra["backing_vocals"] = out["karaoke_backing"]
+        gpu_seconds += secs
+    return extra, gpu_seconds
 
-    sources = {
-        "vocals": os.path.join(work_dir, "roformer_vocals.wav"),
-        "instrumental": os.path.join(work_dir, "roformer_instrumental.wav"),
-    }
-    shutil.move(vocals_src, sources["vocals"])
-    shutil.move(instrumental_src, sources["instrumental"])
-    return sources, gpu_seconds
 
 MAX_EXTENSION_LENGTH = 10
 
@@ -438,7 +466,7 @@ class _RetryTransfer(Exception):
 MIN_DURATION_SECONDS = 3.0
 
 
-def _normalise_input(input_path: str, work_dir: str) -> str:
+def _normalise_input(input_path: str, work_dir: str, clip_start=None, clip_seconds=None) -> str:
     """Re-encode whatever the user uploaded into plain stereo 44.1k PCM.
 
     Demucs crashes with an opaque AssertionError in reflect padding when
@@ -448,11 +476,11 @@ def _normalise_input(input_path: str, work_dir: str) -> str:
     user-facing error instead of a GPU-side traceback.
     """
     clean_path = os.path.join(work_dir, "input_clean.wav")
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", input_path,
-         "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", clean_path],
-        capture_output=True, text=True,
-    )
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if clip_seconds is not None:
+        cmd += ["-ss", f"{clip_start:.3f}", "-t", f"{clip_seconds:.3f}"]
+    cmd += ["-i", input_path, "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", clean_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not os.path.exists(clean_path) or os.path.getsize(clean_path) == 0:
         raise ValueError(
             "This file could not be decoded as audio. It may be corrupted "
@@ -502,6 +530,14 @@ def handler(job):
     model = inp.get("model", "htdemucs")
     overlap = float(inp.get("overlap", 0.25))
     max_duration_seconds = int(inp.get("max_duration_seconds", 600))
+    vocal_options = inp.get("vocal_options") or []
+    try:
+        stem_count = int(inp.get("stem_count", 4))
+        clip_seconds = inp.get("clip_seconds")
+        clip_seconds = float(clip_seconds) if clip_seconds is not None else None
+        clip_start = float(inp.get("clip_start", 0) or 0)
+    except (TypeError, ValueError):
+        return {"error": "Invalid stem_count or clip parameters."}
 
     if not VPS_BASE_URL or not GPU_SHARED_SECRET:
         # Configuration error, not a per-job problem - fails every job
@@ -517,6 +553,18 @@ def handler(job):
         return {"error": f"Unsupported model '{model}'."}
     if task == "stems" and model not in MODEL_STEM_NAMES:
         return {"error": f"No stem list configured for model '{model}'."}
+    if not isinstance(vocal_options, list) or any(o not in ALLOWED_VOCAL_OPTIONS for o in vocal_options):
+        return {"error": f"vocal_options must be a list drawn from {ALLOWED_VOCAL_OPTIONS}."}
+    if vocal_options and model != "melband_roformer":
+        return {"error": "vocal_options require the melband_roformer model."}
+    if stem_count not in ALLOWED_STEM_COUNTS:
+        return {"error": f"stem_count must be one of {ALLOWED_STEM_COUNTS}."}
+    if stem_count == 6 and (task != "stems" or model != "melband_roformer"):
+        return {"error": "stem_count 6 is only for task 'stems' on melband_roformer (use htdemucs_6s for Standard)."}
+    if clip_seconds is not None and not (MIN_CLIP_SECONDS <= clip_seconds <= MAX_CLIP_SECONDS):
+        return {"error": f"clip_seconds must be between {MIN_CLIP_SECONDS:.0f} and {MAX_CLIP_SECONDS:.0f}."}
+    if clip_start < 0:
+        return {"error": "clip_start cannot be negative."}
 
     work_dir = tempfile.mkdtemp(prefix="job_")
     ext = _safe_extension(filename)
@@ -533,7 +581,10 @@ def handler(job):
         except Exception as e:
             return {"error": f"Could not read audio duration: {e}"}
 
-        if duration > max_duration_seconds:
+        if clip_seconds is not None:
+            clip_seconds = min(clip_seconds, duration)
+            clip_start = max(0.0, min(clip_start, duration - clip_seconds))
+        elif duration > max_duration_seconds:
             return {
                 "error": (
                     f"Track is {int(duration // 60)} min long, which exceeds the "
@@ -550,7 +601,7 @@ def handler(job):
             }
 
         try:
-            clean_path = _normalise_input(input_path, work_dir)
+            clean_path = _normalise_input(input_path, work_dir, clip_start, clip_seconds)
         except ValueError as e:
             return {"error": str(e)}
         except Exception as e:
@@ -560,20 +611,23 @@ def handler(job):
             if model == "melband_roformer":
                 roformer_sources, gpu_seconds = _run_roformer_gpu(clean_path, work_dir)
                 if task == "separate":
-                    sources = roformer_sources
+                    sources = dict(roformer_sources)
                 else:
                     # Stage 2: Demucs on the vocal-free instrumental.
+                    second_stage = ROFORMER_STEMS_SECOND_STAGE_6 if stem_count == 6 else ROFORMER_STEMS_SECOND_STAGE
                     track_dir, demucs_seconds = _run_demucs_gpu(
                         roformer_sources["instrumental"], work_dir,
-                        ROFORMER_STEMS_SECOND_STAGE, overlap, two_stems=False,
+                        second_stage, overlap, two_stems=False,
                     )
                     gpu_seconds += demucs_seconds
-                    sources = {
-                        "vocals": roformer_sources["vocals"],
-                        "drums": os.path.join(track_dir, "drums.wav"),
-                        "bass": os.path.join(track_dir, "bass.wav"),
-                        "other": os.path.join(track_dir, "other.wav"),
-                    }
+                    sources = {"vocals": roformer_sources["vocals"]}
+                    for s in MODEL_STEM_NAMES[second_stage]:
+                        if s != "vocals":
+                            sources[s] = os.path.join(track_dir, f"{s}.wav")
+                if vocal_options:
+                    extra, extra_seconds = _run_vocal_options(roformer_sources["vocals"], work_dir, vocal_options)
+                    gpu_seconds += extra_seconds
+                    sources.update(extra)
             else:
                 track_dir, gpu_seconds = _run_demucs_gpu(
                     clean_path, work_dir, model, overlap, two_stems=(task == "separate"),
@@ -600,11 +654,14 @@ def handler(job):
             except Exception as e:
                 return {"error": f"Separation succeeded but uploading '{name}' back to the VPS failed: {e}"}
 
-        return {
+        result = {
             "uploaded_stems": uploaded,
-            "duration_seconds": duration,
+            "duration_seconds": clip_seconds if clip_seconds is not None else duration,
             "gpu_seconds": gpu_seconds,
         }
+        if clip_seconds is not None:
+            result["clip"] = {"start": clip_start, "seconds": clip_seconds, "source_duration": duration}
+        return result
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
