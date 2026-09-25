@@ -367,7 +367,7 @@ def anon_status() -> dict:
     with _anon_lock:
         left = max(0, int(_anon_skip_until - time.time()))
     return {
-        "state": "skipped (VPS IP bot-checked)" if left else "trying",
+        "state": "skipped (VPS IP blocked for no-cookie requests)" if left else "trying",
         "seconds_until_probe": left,
     }
 
@@ -424,6 +424,11 @@ def record_client_result(key: str, ok: bool):
                         f"the other clients. YouTube likely changed this client: check for a "
                         f"newer yt-dlp release."
                     )
+                    if key.startswith("anon:"):
+                        message += (
+                            " If several anon: clients alert together, it is the VPS IP, "
+                            "not the clients: downloads fall through to the cookie accounts."
+                        )
     if message:
         logger.warning(message)
         alert_now(message)
@@ -3039,7 +3044,7 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     # what testing showed actually works for public videos.
     cookie_accounts = get_cookie_accounts()
     if cookie_accounts and anon_skipped():
-        logger.info("[ANON] VPS IP bot-checked recently - skipping the no-cookie attempt.")
+        logger.info("[ANON] VPS IP blocked for no-cookie requests recently - skipping the no-cookie attempt.")
         accounts = list(cookie_accounts)
     else:
         accounts = [None] + cookie_accounts
@@ -3072,7 +3077,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             error_text = str(e)
             record_account_result(account_path, False, "direct", error_text)
             record_path_attempt("direct", False)
-            if account_path is None and is_bot_check_error(error_text):
+            anon_ip_blocked = account_path is None and (
+                is_bot_check_error(error_text) or is_media_forbidden_error(error_text)
+            )
+            if anon_ip_blocked:
                 record_anon_result(True)
 
             if isinstance(e, VideoTooLongError) or is_permanent_error(error_text):
@@ -3080,6 +3088,13 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # too long or genuinely unavailable - stop everywhere,
                 # immediately.
                 raise
+
+            # 2026-09-25: every anon rung media-403'd from the VPS IP for 9+
+            # hours while cookie accounts downloaded direct fine. A media 403
+            # after the whole anon ladder is IP-shaped for no-cookie sessions,
+            # so hand off to the free cookie accounts instead of the proxy.
+            if anon_ip_blocked and cookie_accounts:
+                continue
 
             if is_cdn_connect_timeout_error(error_text):
                 # A DIRECT attempt just burned ~10s on an unreachable
