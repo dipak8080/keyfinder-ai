@@ -45,6 +45,8 @@ from monitoring import alert_now
 from yt_dlp.extractor.youtube import YoutubeIE as _YoutubeIE
 import cookie_health
 import yt_ledger
+import random
+import ipv4_only
 
 
 class VideoTooLongError(Exception):
@@ -393,7 +395,67 @@ def anon_status() -> dict:
         state = "skipped (anon failed where cookies worked)"
     else:
         state = "trying"
-    return {"state": state, "seconds_until_probe": left, "canary_says_dead": canary_dead}
+    with _anon_lock:
+        left6 = max(0, int(_anon6_skip_until - time.time()))
+    return {
+        "state": state,
+        "seconds_until_probe": left,
+        "canary_says_dead": canary_dead,
+        "ipv6": {"available": ipv6_available(), "share_pct": IPV6_SHARE, "skipped_for_seconds": left6},
+    }
+
+
+# IPV6 ANON PATH (2026-09-25). The host has one IPv6 address, and YouTube
+# served anon downloads over it while the IPv4 was refused for anon. The
+# container reaches it through the audioforges-net6 Docker network (NAT66).
+# Traffic is split with the IPv4 cookie path so neither identity carries
+# it all; each is the other's free fallback before the paid proxy.
+IPV6_MODE = os.environ.get("YT_IPV6", "auto").lower()
+IPV6_SHARE = int(os.environ.get("YT_IPV6_SHARE", "50"))
+_ipv6_route = None
+_ipv6_checked_at = 0.0
+_anon6_skip_until = 0.0
+
+
+def ipv6_available() -> bool:
+    global _ipv6_route, _ipv6_checked_at
+    if IPV6_MODE in ("0", "off", "false", "no"):
+        return False
+    if _ipv6_route is None or time.time() - _ipv6_checked_at > 300:
+        _ipv6_checked_at = time.time()
+        try:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                s.connect(("2001:4860:4860::8888", 53))
+                _ipv6_route = not s.getsockname()[0].lower().startswith("fe80")
+            finally:
+                s.close()
+        except OSError:
+            _ipv6_route = False
+    return _ipv6_route
+
+
+def record_anon6_result(failed: bool):
+    _record_event("anon6_result", failed=failed)
+    global _anon6_skip_until
+    with _anon_lock:
+        _anon6_skip_until = time.time() + ANON_SKIP_SECONDS if failed else 0.0
+
+
+def anon6_skipped() -> bool:
+    with _anon_lock:
+        return time.time() < _anon6_skip_until
+
+
+def _extract_direct(opts: dict, url: str, use_v6: bool):
+    if not use_v6:
+        return extract_info_with_retry(opts, url)
+    opts["source_address"] = "::"
+    ipv4_only.allow_ipv6(True)
+    try:
+        return extract_info_with_retry(opts, url)
+    finally:
+        ipv4_only.allow_ipv6(False)
 
 
 # CLIENT AUTO-REPAIR (2026-09-11). A rung with only client-fixable failures
@@ -3106,16 +3168,34 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
     # attempt 1 whenever any account was healthy - exactly backwards from
     # what testing showed actually works for public videos.
     cookie_accounts = get_cookie_accounts()
+    attempts = []
     if cookie_accounts and anon_skipped():
         logger.info("[ANON] VPS IP blocked for no-cookie requests recently - skipping the no-cookie attempt.")
-        accounts = list(cookie_accounts)
     else:
-        accounts = [None] + cookie_accounts
+        attempts.append((None, False))
+    cookie_attempts = [(p, False) for p in cookie_accounts]
+    v6_attempts = [(None, True)] if ipv6_available() and not anon6_skipped() else []
+    if v6_attempts and random.random() * 100 < IPV6_SHARE:
+        attempts += v6_attempts + cookie_attempts
+    else:
+        attempts += cookie_attempts + v6_attempts
+
+    def _untried_v6():
+        for j, (p, v6) in enumerate(attempts):
+            if v6 and j not in tried:
+                return j
+        return None
 
     last_error = None
     edge_skip_rotations = 0
-    anon_failed_kind = None
-    for account_path in accounts:
+    anon_failed = {}
+    tried = set()
+    i = 0
+    while i < len(attempts):
+        account_path, use_v6 = attempts[i]
+        tried.add(i)
+        i += 1
+        via = "direct6" if use_v6 else "direct"
         opts = dict(base_ydl_opts)
         opts["socket_timeout"] = DIRECT_SOCKET_TIMEOUT_SECONDS
         opts["retries"] = DIRECT_RETRIES
@@ -3128,30 +3208,40 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
         _reset_cookie_flag()
         _set_active_account(account_path)
         try:
-            result = extract_info_with_retry(opts, url)
+            result = _extract_direct(opts, url, use_v6)
             if account_path:
                 logger.info(f"[COOKIES] Download succeeded using account: {account_path}")
-                if anon_failed_kind:
-                    record_anon_result(True)
-                    logger.warning(
-                        f"[ANON] No-cookie path failed ({anon_failed_kind}) on a video a cookie "
-                        f"account then downloaded - skipping anon for {ANON_SKIP_SECONDS // 60} min."
-                    )
+            elif use_v6:
+                logger.info("[IPV6] Download succeeded on the IPv6 no-cookie path.")
+                record_anon6_result(False)
             else:
                 record_anon_result(False)
-            record_account_result(account_path, True, "direct")
-            record_path_attempt("direct", True)
+            for fam, kind in anon_failed.items():
+                if fam == "v6":
+                    record_anon6_result(True)
+                else:
+                    record_anon_result(True)
+                logger.warning(
+                    f"[ANON] {'IPv6' if fam == 'v6' else 'IPv4'} no-cookie path failed ({kind}) on a "
+                    f"video another path then downloaded - skipping it for {ANON_SKIP_SECONDS // 60} min."
+                )
+            record_account_result(account_path, True, via)
+            record_path_attempt(via, True)
             return result
         except Exception as e:
-            last_error = e
+            if not use_v6 or last_error is None:
+                last_error = e
             error_text = str(e)
-            record_account_result(account_path, False, "direct", error_text)
-            record_path_attempt("direct", False)
+            record_account_result(account_path, False, via, error_text)
+            record_path_attempt(via, False)
             anon_ip_blocked = account_path is None and (
                 is_bot_check_error(error_text) or is_media_forbidden_error(error_text)
             )
             if anon_ip_blocked:
-                record_anon_result(True)
+                if use_v6:
+                    record_anon6_result(True)
+                else:
+                    record_anon_result(True)
 
             if isinstance(e, VideoTooLongError) or is_permanent_error(error_text):
                 # No cookie swap, no proxy, no retry fixes a video that's
@@ -3166,8 +3256,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             if account_path is None:
                 kind = classify_failure(error_text)
                 if kind not in ("account_gated", "video_unavailable"):
-                    anon_failed_kind = kind
-                if cookie_accounts and kind != "cdn_timeout":
+                    anon_failed["v6" if use_v6 else "v4"] = kind
+                if use_v6:
+                    if i < len(attempts):
+                        continue
+                    break
+                if i < len(attempts) and kind != "cdn_timeout":
                     continue
 
             if is_cdn_connect_timeout_error(error_text):
@@ -3208,6 +3302,10 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # another ~10s), go straight to the proxy tier - which is
                 # the one thing that CAN fix this, and which now still
                 # has healthy cookies to use when it gets there.
+                j = _untried_v6()
+                if j is not None:
+                    i = j
+                    continue
                 break
 
             if account_path and _was_cookie_flagged():
@@ -3256,7 +3354,12 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
             # Failure wasn't confirmed as THIS account's identity being
             # rejected (could be IP-block, transient, or cookie-less) -
             # rotating accounts further won't help. Stop here and let the
-            # proxy tier below handle it instead.
+            # proxy tier below handle it instead. The free IPv6 path, if
+            # not tried yet, goes first: it is a different IP.
+            j = _untried_v6()
+            if j is not None:
+                i = j
+                continue
             break
 
     first_error = str(last_error)
@@ -3485,6 +3588,8 @@ def apply_events(events: list):
                 record_dead_edge(ev["site"], ev.get("until"))
             elif kind == "anon_result":
                 record_anon_result(bool(ev.get("botchecked")))
+            elif kind == "anon6_result":
+                record_anon6_result(bool(ev.get("failed")))
             elif kind == "client_result" and ev.get("key"):
                 record_client_result(ev["key"], bool(ev.get("ok")))
             elif kind == "cookie_warning":
@@ -3520,6 +3625,7 @@ def export_breaker_state() -> dict:
         "cookie_disabled": disabled,
         "account_order": plan_account_order(),
         "anon_skip_until": _anon_skip_until,
+        "anon6_skip_until": _anon6_skip_until,
         "client_demoted": sorted(_active_client_demotions()),
         "dead_edges": dict(_dead_edges),
     }
@@ -3529,6 +3635,7 @@ def import_breaker_state(state: dict):
     """Worker-side: adopt the parent's breakers before doing any work."""
     global _proxy_disabled_until, _direct_degraded_until, _proxy_botcheck_until
     global _split_disabled_until, _account_order, _anon_skip_until, _client_demoted_frozen
+    global _anon6_skip_until
     if not state:
         return
     try:
@@ -3549,6 +3656,7 @@ def import_breaker_state(state: dict):
         _account_order = list(state.get("account_order") or [])
         with _anon_lock:
             _anon_skip_until = float(state.get("anon_skip_until") or 0.0)
+            _anon6_skip_until = float(state.get("anon6_skip_until") or 0.0)
         _client_demoted_frozen = set(state.get("client_demoted") or [])
         with _dead_edge_lock:
             _dead_edges.clear()

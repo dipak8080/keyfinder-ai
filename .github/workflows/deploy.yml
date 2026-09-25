@@ -48,6 +48,13 @@ jobs:
             echo "Ensuring internal Docker network exists..."
             docker network create audioforges-net || true
 
+            # IPv6 egress for the API (2026-09-25): a ULA subnet NATed out
+            # through the host's IPv6 address. Only the IPv6 download attempt
+            # uses it (see ipv4_only.py); everything else stays IPv4.
+            docker network inspect audioforges-net6 >/dev/null 2>&1 \
+              || docker network create --ipv6 --subnet fd00:af6::/64 audioforges-net6 \
+              || echo "WARNING: could not create audioforges-net6 - IPv6 download path stays off."
+
             # ============================================================
             # MIDI-WORKER (isolated sidecar) - built and deployed FIRST,
             # and DELIBERATELY NON-FATAL to this whole workflow.
@@ -182,6 +189,9 @@ jobs:
               -v /home/deploy/app/data:/app/data \
               -p 127.0.0.1:$NEW_PORT:8000 \
               audioforges-api:latest
+
+            docker network connect audioforges-net6 audioforges-api-next \
+              || echo "WARNING: IPv6 network attach failed - downloads stay on IPv4."
 
             echo "Waiting for the new container to become healthy..."
             HEALTHY=false
