@@ -2035,7 +2035,7 @@ def record_account_result(
             else:
                 kind = "other"
             entry["last_failure_kind"] = kind
-            if kind == "bot_check":
+            if kind == "bot_check" or (via == "direct" and is_media_forbidden_error(error_text)):
                 _push_recent(path, False, now)
 
 
@@ -3343,6 +3343,13 @@ def download_with_fallback(base_ydl_opts: dict, url: str, proxy_url: Optional[st
                 # android/android_vr), so keep rotating WITHOUT disabling
                 # this one (it's not dead, just unprivileged/early/
                 # client-mismatched for this particular video).
+                continue
+
+            if account_path and is_media_forbidden_error(error_text):
+                # 2026-09-25: one stale session (cookies_2) media-403'd 17
+                # times in 3 h and each one went to the paid proxy while five
+                # other accounts downloaded direct. Rotate first; the proxy
+                # still catches it if every account 403s.
                 continue
 
             if is_bot_check_error(error_text):
