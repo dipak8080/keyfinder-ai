@@ -247,6 +247,74 @@ if [ "$tt" != "$tt_prev" ]; then
   esac
 fi
 
+# TRAFFIC LEG (2026-09-25). The legs above test paths; this one watches
+# what real users got. On 2026-09-24 anon died in a new error shape and
+# every request fell to the paid proxy for hours: success stayed ~94%, so
+# nothing alerted, while DataImpulse spend climbed. Reads request_logs and
+# the attempt ledger (yt_ledger.py). Alerts on state change only.
+TRAFFIC_STATE="/home/deploy/app/data/canary_traffic_state"
+traffic=$(timeout 60 docker exec -i audioforges-api python3 - 2>/dev/null <<'PY'
+import sqlite3, time, datetime
+W = 30
+dl, tot, ok, pct = "OK", 0, 0, 100.0
+try:
+    c = sqlite3.connect("/app/data/logs.db", timeout=5)
+    since_iso = (datetime.datetime.utcnow() - datetime.timedelta(minutes=W)).isoformat()
+    tot, ok = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(status_code < 400), 0) FROM request_logs "
+        "WHERE path = '/download' AND timestamp >= ? AND (status_code < 400 OR status_code >= 500)",
+        (since_iso,),
+    ).fetchone()
+    if tot >= 8:
+        pct = 100.0 * ok / tot
+        dl = "DOWN" if pct < 80 else "DEGRADED" if pct < 93 else "OK"
+except Exception:
+    pass
+proxy, n, px, unknown, udetail, ucount = "LOW", 0, 0, "NONE", "", 0
+try:
+    l = sqlite3.connect("/app/data/yt_ledger.db", timeout=5)
+    since = time.time() - W * 60
+    n, px = l.execute(
+        "SELECT COUNT(*), COALESCE(SUM(via = 'proxy'), 0) FROM attempts WHERE ts >= ?", (since,)
+    ).fetchone()
+    if px >= 10 and px / max(n, 1) >= 0.25:
+        proxy = "HIGH"
+    row = l.execute(
+        "SELECT detail, COUNT(*) FROM attempts WHERE ts >= ? AND kind = 'other' "
+        "GROUP BY detail ORDER BY COUNT(*) DESC LIMIT 1", (since,)
+    ).fetchone()
+    if row and row[1] >= 3:
+        unknown, udetail, ucount = "NEW", (row[0] or "")[:200], row[1]
+except Exception:
+    pass
+share = round(100.0 * px / n) if n else 0
+print(f"STATE=download:{dl} proxy:{proxy} unknown:{unknown}")
+parts = []
+if dl != "OK":
+    parts.append(f"YouTube downloads {dl}: {ok}/{tot} succeeded in the last {W} min ({pct:.0f}%).")
+if proxy == "HIGH":
+    parts.append(f"{px} of {n} YouTube attempts in the last {W} min went through the paid proxy ({share}%): a free path is failing and DataImpulse spend is up.")
+if unknown == "NEW":
+    parts.append(f"New YouTube error shape, {ucount}x in {W} min, matches no known kind: {udetail}")
+if parts:
+    parts.append("Which path broke: docker exec audioforges-api python3 -c \"import json, yt_ledger; print(json.dumps(yt_ledger.summary(1), indent=1))\"")
+    print("MSG=[TRAFFIC] " + " ".join(parts))
+else:
+    print(f"MSG=[TRAFFIC] YouTube downloads back to normal: {ok}/{tot} in the last {W} min, proxy share {share}%.")
+PY
+)
+t_state=$(printf '%s\n' "$traffic" | sed -n 's/^STATE=//p')
+t_msg=$(printf '%s\n' "$traffic" | sed -n 's/^MSG=//p')
+if [ -n "$t_state" ]; then
+  t_prev=$(cat "$TRAFFIC_STATE" 2>/dev/null || echo "")
+  echo "$t_state" > "$TRAFFIC_STATE"
+  if [ "$t_state" != "$t_prev" ]; then
+    if [ -n "$t_prev" ] || [ "$t_state" != "download:OK proxy:LOW unknown:NONE" ]; then
+      send "$t_msg"
+    fi
+  fi
+fi
+
 current="${direct_state} | ${cookie_state} | ${proxy_state}"
 previous=$(cat "$STATE" 2>/dev/null || echo "")
 echo "$current" > "$STATE"
