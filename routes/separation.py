@@ -85,7 +85,7 @@ import time
 import asyncio
 from functools import partial
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query, Response
 from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
@@ -137,6 +137,29 @@ from credits.limits import tiered_rate_limit
 from ._shared import stem_download_response, spawn_background_task, _accept_upload, _log_queued, _reject_if_separation_queue_full, _run_tool_job
 
 router = APIRouter()
+
+
+def youtube_studio_enabled() -> bool:
+    return get_credit_settings().youtube_studio_enabled
+
+
+@router.get("/studio/config")
+def studio_config(response: Response) -> dict:
+    """Which Studio features are switched on right now. Read at runtime by
+    the frontend so an admin toggle takes effect without a redeploy."""
+    response.headers["Cache-Control"] = "no-store"
+    s = get_credit_settings()
+    return {
+        "youtube_studio": s.youtube_studio_enabled,
+        "vocal_options": s.studio_vocal_options_enabled,
+        "six_stems": s.studio_six_stems_enabled,
+        "option_credits": s.studio_option_credits,
+        "preview": s.studio_preview_enabled,
+        "preview_seconds": s.studio_preview_seconds,
+        "google_signin": bool(s.google_client_id and s.google_client_secret),
+        "signup_bonus_credits": s.signup_bonus_credits,
+        "free_needs_account": s.free_ops_require_account,
+    }
 
 
 def studio_options(dereverb: bool = False, lead_back: bool = False, stem_count: int = 4):

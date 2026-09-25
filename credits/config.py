@@ -388,6 +388,7 @@ class Settings:
     signup_bonus_credits: int
     signup_bonus_per_ip_30d: int
     free_ops_require_account: bool
+    youtube_studio_enabled: bool
 
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
@@ -552,6 +553,7 @@ def build_settings() -> Settings:
         signup_bonus_credits=max(0, _int("SIGNUP_BONUS_CREDITS", 0)),
         signup_bonus_per_ip_30d=max(0, _int("SIGNUP_BONUS_PER_IP_30D", 2)),
         free_ops_require_account=_bool("FREE_OPS_REQUIRE_ACCOUNT", False),
+        youtube_studio_enabled=_bool("YOUTUBE_STUDIO_ENABLED", _bool("YOUTUBE_HQ_ENABLED", False)),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

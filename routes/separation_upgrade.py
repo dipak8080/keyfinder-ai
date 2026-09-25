@@ -60,7 +60,6 @@ from config import (
     DEMUCS_TIMEOUT_SECONDS_HQ,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     SEPARATION_HQ_ENABLED,
-    YOUTUBE_HQ_ENABLED,
     SEPARATION_HQ_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_HQ_RATE_LIMIT_WINDOW_SECONDS,
     STEMS_HQ_RATE_LIMIT_MAX_REQUESTS,
@@ -87,7 +86,7 @@ from credits.identity import Identity
 from credits.limits import tiered_rate_limit
 
 from ._shared import spawn_background_task, _log_queued, _reject_if_separation_queue_full, _run_tool_job
-from .separation import studio_options
+from .separation import studio_options, youtube_studio_enabled
 
 router = APIRouter()
 
@@ -104,7 +103,7 @@ router = APIRouter()
 #   tool_disabled         this route's own flag is off
 #   hq_disabled           SEPARATION_HQ_ENABLED kill switch
 #   already_upgraded      this source already has an HQ child
-#   options_unavailable   Studio extras asked for on a YouTube-sourced job
+#   options_unavailable   Studio extras on a YouTube job while YouTube Studio is off
 #
 # hq_disabled and tool_disabled are deliberately SEPARATE: the first is
 # "HQ is off for everyone right now", the second is "this route is not
@@ -191,7 +190,7 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
     rule = settings.rule_for(rule_key)
     state = {"job": job, "settings": settings, "rule": rule, "rule_key": rule_key}
 
-    if job["job_type"] == youtube_type and not YOUTUBE_HQ_ENABLED:
+    if job["job_type"] == youtube_type and not youtube_studio_enabled():
         return (state, {"reason": "tool_disabled"})
 
     existing = _existing_upgrade(job_id)
@@ -217,8 +216,9 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
 
 
 def _options_blocked_for(job: dict, vocal_options, stem_count: int) -> bool:
-    """Studio extras run on uploads only, never on YouTube-sourced jobs."""
-    return bool(vocal_options or stem_count != 4) and job.get("job_type") in _YOUTUBE_RULE
+    """Studio extras on YouTube-sourced jobs follow the YouTube Studio switch."""
+    return (bool(vocal_options or stem_count != 4) and job.get("job_type") in _YOUTUBE_RULE
+            and not youtube_studio_enabled())
 
 
 async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, rule_key: str,
@@ -301,7 +301,7 @@ async def _queue_upgrade(
     input_path = job["input_path"]
     if _options_blocked_for(job, vocal_options, stem_count):
         raise HTTPException(400, {"kind": "options_unavailable",
-                                  "message": "Studio options work on uploaded files only."})
+                                  "message": "Studio options for links are switched off right now."})
     original_filename = job.get("title") or os.path.basename(input_path)
     if job["job_type"] in _YOUTUBE_RULE:
         tool = "YOUTUBE_" + tool

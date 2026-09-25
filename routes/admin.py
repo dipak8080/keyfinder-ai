@@ -216,7 +216,6 @@ from config import (
     MIDI_RATE_LIMIT_WINDOW_SECONDS,
     MIDI_HQ_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_HQ_ENABLED,
-    YOUTUBE_HQ_ENABLED,
     MAX_SEPARATION_DURATION_SECONDS_HQ,
     MAX_QUEUED_SEPARATIONS,
     MAX_CONCURRENT_SEPARATIONS,
@@ -273,6 +272,11 @@ from tiktok import maintenance as tiktok_maintenance
 from log_stream import get_endpoint_counts, get_tool_counts
 
 router = APIRouter()
+
+
+def _youtube_studio_enabled() -> bool:
+    from credits.config import get_settings
+    return get_settings().youtube_studio_enabled
 
 
 @router.post("/admin/clear-cache")
@@ -1249,7 +1253,7 @@ def limits():
         },
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
-            "youtube_hq_enabled": YOUTUBE_HQ_ENABLED,
+            "youtube_hq_enabled": _youtube_studio_enabled(),
             # ADDED 2026-08-25. The HQ input cap is TIGHTER than the
             # standard one (6 min vs 10) - counterintuitive, and
             # deliberately so per config.py: at ~5x the per-minute cost a
@@ -1383,7 +1387,7 @@ async def root():
         ),
         "features": {
             "separation_hq_enabled": SEPARATION_HQ_ENABLED,
-            "youtube_hq_enabled": YOUTUBE_HQ_ENABLED,
+            "youtube_hq_enabled": _youtube_studio_enabled(),
             # ADDED 2026-08-29. It was in /limits and NOT here, and the
             # difference matters because getFeatureFlags() reads THIS
             # route, not /limits.

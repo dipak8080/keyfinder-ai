@@ -141,6 +141,17 @@ KNOWN_KEYS: dict[str, dict] = {
     "SEPARATION_SHARED_RATE_LIMIT_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 60, "max": 86400},
     "SEPARATION_SHARED_DAILY_MAX_REQUESTS": {"type": "int", "group": "separation limits", "min": 1, "max": 500},
     "SEPARATION_SHARED_DAILY_WINDOW_SECONDS": {"type": "int", "group": "separation limits", "min": 3600, "max": 604800},
+    "YOUTUBE_STUDIO_ENABLED": {"type": "bool", "group": "studio"},
+    "STUDIO_VOCAL_OPTIONS_ENABLED": {"type": "bool", "group": "studio"},
+    "STUDIO_SIX_STEMS_ENABLED": {"type": "bool", "group": "studio"},
+    "STUDIO_OPTION_CREDITS": {"type": "int", "group": "studio", "min": 0, "max": 10},
+    "STUDIO_PREVIEW_ENABLED": {"type": "bool", "group": "studio"},
+    "STUDIO_PREVIEW_SECONDS": {"type": "int", "group": "studio", "min": 5, "max": 60},
+    "STUDIO_PREVIEW_DAILY_PER_SUBJECT": {"type": "int", "group": "studio", "min": 0, "max": 50},
+    "STUDIO_PREVIEW_DAILY_PER_IP": {"type": "int", "group": "studio", "min": 0, "max": 100},
+    "SIGNUP_BONUS_CREDITS": {"type": "int", "group": "accounts", "min": 0, "max": 20},
+    "SIGNUP_BONUS_PER_IP_30D": {"type": "int", "group": "accounts", "min": 0, "max": 20},
+    "FREE_OPS_REQUIRE_ACCOUNT": {"type": "bool", "group": "accounts"},
 }
 
 _TOOLS = (
