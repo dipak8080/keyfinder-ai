@@ -377,6 +377,7 @@ class Settings:
     studio_vocal_options_enabled: bool
     studio_six_stems_enabled: bool
     studio_option_credits: int
+    studio_six_stem_credits: int
     studio_preview_enabled: bool
     studio_preview_seconds: int
     studio_preview_daily_per_subject: int
@@ -570,15 +571,16 @@ def build_settings() -> Settings:
         studio_vocal_options_enabled=_bool("STUDIO_VOCAL_OPTIONS_ENABLED", False),
         studio_six_stems_enabled=_bool("STUDIO_SIX_STEMS_ENABLED", False),
         studio_option_credits=max(0, _int("STUDIO_OPTION_CREDITS", 1)),
+        studio_six_stem_credits=max(0, _int("STUDIO_SIX_STEM_CREDITS", 1)),
         studio_preview_enabled=_bool("STUDIO_PREVIEW_ENABLED", False),
         studio_preview_seconds=min(60, max(5, _int("STUDIO_PREVIEW_SECONDS", 30))),
         studio_preview_daily_per_subject=max(0, _int("STUDIO_PREVIEW_DAILY_PER_SUBJECT", 3)),
-        studio_preview_daily_per_ip=max(0, _int("STUDIO_PREVIEW_DAILY_PER_IP", 6)),
+        studio_preview_daily_per_ip=max(0, _int("STUDIO_PREVIEW_DAILY_PER_IP", 30)),
 
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
         google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", "").strip(),
         signup_bonus_credits=max(0, _int("SIGNUP_BONUS_CREDITS", 0)),
-        signup_bonus_per_ip_30d=max(0, _int("SIGNUP_BONUS_PER_IP_30D", 2)),
+        signup_bonus_per_ip_30d=max(0, _int("SIGNUP_BONUS_PER_IP_30D", 10)),
         free_ops_require_account=_bool("FREE_OPS_REQUIRE_ACCOUNT", False),
         youtube_studio_enabled=_bool("YOUTUBE_STUDIO_ENABLED", _bool("YOUTUBE_HQ_ENABLED", False)),
         studio_pass_enabled=_bool("STUDIO_PASS_ENABLED", False),

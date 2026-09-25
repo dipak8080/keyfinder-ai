@@ -145,6 +145,7 @@ KNOWN_KEYS: dict[str, dict] = {
     "STUDIO_VOCAL_OPTIONS_ENABLED": {"type": "bool", "group": "studio"},
     "STUDIO_SIX_STEMS_ENABLED": {"type": "bool", "group": "studio"},
     "STUDIO_OPTION_CREDITS": {"type": "int", "group": "studio", "min": 0, "max": 10},
+    "STUDIO_SIX_STEM_CREDITS": {"type": "int", "group": "studio", "min": 0, "max": 10},
     "STUDIO_PREVIEW_ENABLED": {"type": "bool", "group": "studio"},
     "STUDIO_PREVIEW_SECONDS": {"type": "int", "group": "studio", "min": 5, "max": 60},
     "STUDIO_PREVIEW_DAILY_PER_SUBJECT": {"type": "int", "group": "studio", "min": 0, "max": 50},

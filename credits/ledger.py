@@ -95,7 +95,9 @@ ChargeType = Literal["free", "credit", "none"]
 
 
 class InsufficientCredits(Exception):
-    def __init__(self, *, balance: int, free_remaining: int, tool: str, needed: int):
+    def __init__(self, *, balance: int, free_remaining: int, tool: str, needed: int,
+                 extras_need_credits: bool = False):
+        self.extras_need_credits = extras_need_credits
         self.balance = balance
         self.free_remaining = free_remaining
         self.tool = tool
@@ -111,6 +113,7 @@ class InsufficientCredits(Exception):
             "credits_needed": self.needed,
             "balance": self.balance,
             "free_remaining": self.free_remaining,
+            "extras_need_credits": self.extras_need_credits,
             "free_resets_at": next_period_start_iso(),
             "signup_bonus_credits": s.signup_bonus_credits,
             "free_needs_account": s.free_ops_require_account,
@@ -351,7 +354,7 @@ def _bump_free(conn: sqlite3.Connection, period: str, scope: str, key: str, delt
 
 
 def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed: int = 1,
-                   free_ops_needed: int = 1, billable: bool = True) -> Charge:
+                   free_ops_needed: int = 1, billable: bool = True, free_eligible: bool = True) -> Charge:
     """Reserve payment BEFORE the GPU work is enqueued.
 
     billable=False records a 'none' charge (paywall off, or under the free
@@ -381,7 +384,7 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
             charge_type, credits = "none", 0
         else:
             remaining = free_remaining(conn, identity, period)
-            if remaining >= free_ops_needed:
+            if free_eligible and remaining >= free_ops_needed:
                 # Allowance, not credits: a job spends free_ops_needed free
                 # ops (1 per job) whatever its credit_needed cost. Coupling
                 # these put every >1-credit tool out of reach of the pool.
@@ -400,7 +403,8 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
                 balance = get_balance(conn, identity)
                 if balance < credits_needed:
                     raise InsufficientCredits(balance=balance, free_remaining=remaining,
-                                             tool=tool, needed=credits_needed)
+                                             tool=tool, needed=credits_needed,
+                                             extras_need_credits=not free_eligible and remaining >= free_ops_needed)
                 charge_type, credits = "credit", credits_needed
                 grant(conn, owner_type=owner_type, owner_id=owner_id, amount=-credits_needed,
                      kind="job_hold", idempotency_key=f"job_hold:{job_id}", job_id=job_id, note=tool)

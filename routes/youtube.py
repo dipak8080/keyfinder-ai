@@ -371,7 +371,7 @@ from credits.limits import tiered_rate_limit
 
 from ._shared import stem_download_response, spawn_background_task, _mb, _reject_if_separation_queue_full, _tool_status, _run_tool_job
 from .separation import (
-    studio_options, youtube_studio_enabled, _reserve_studio_preview, _run_studio_preview, _preview_fields,
+    studio_options, youtube_studio_enabled, _preview_fields,
 )
 
 router = APIRouter()
@@ -1288,7 +1288,6 @@ async def _run_youtube_separation(
     vocal_options: tuple = (),
     stem_count: int = 4,
     paid_ctx: Optional[dict] = None,
-    preview: Optional[dict] = None,
 ):
     """Download, then Demucs. One function for all four YouTube
     separation routes (/youtube/separate, /youtube/separate-hq,
@@ -1324,8 +1323,6 @@ async def _run_youtube_separation(
         # _run_tool_job stay unconditional.
         settle_or_refund(job_id, False, reason=f"{tool.lower()}_download_failed")
         fail_if_unfinished(job_id, "Download failed.")
-        if preview:
-            fail_if_unfinished(preview["job_id"], "The download failed, so there is no preview.")
         return
 
     file_path, title = downloaded
@@ -1342,6 +1339,7 @@ async def _run_youtube_separation(
     keep_input = not hq
     if keep_input:
         set_job_input(job_id, file_path)
+        set_job_fields(job_id, studio_previewable=True)
 
     if stems:
         # No run_blocking() - run_stem_separation()/run_separation() are
@@ -1388,35 +1386,6 @@ async def _run_youtube_separation(
         # youtube/separate-hq jobs that ended any way other than success or
         # a RunPodJobError.
         metered_tool=metric.lstrip("/"),
-    )
-
-    if preview:
-        await _run_studio_preview(
-            job_id, preview["job_id"], file_path, is_stems=stems, title=title,
-            identity=preview["identity"], vocal_options=preview["options"],
-            stem_count=preview["stem_count"],
-        )
-
-
-def _youtube_preview(identity: Identity, job_id: str, job_type: str, studio_preview: bool,
-                     dereverb: bool, lead_back: bool, stem_count: int = 4):
-    """Reserves a free Studio preview for a standard YouTube run.
-    Returns (preview dict for the runner, response block)."""
-    if not studio_preview:
-        return None, None
-    if not youtube_studio_enabled():
-        return None, {"job_id": None, "skipped": "disabled"}
-    options, count, _ = studio_options(dereverb, lead_back, stem_count)
-    skip = _reserve_studio_preview(identity)
-    if skip:
-        return None, {"job_id": None, "skipped": skip}
-    preview_id = create_job(job_type=job_type)
-    set_job_fields(preview_id, preview_of=job_id)
-    set_job_fields(job_id, preview_job_id=preview_id)
-    from credits.config import get_settings as _cs
-    return (
-        {"job_id": preview_id, "identity": identity, "options": options, "stem_count": count},
-        {"job_id": preview_id, "seconds": _cs().studio_preview_seconds},
     )
 
 
@@ -1481,9 +1450,6 @@ async def youtube_analyze_result(job_id: str):
 )
 async def youtube_separate_route(
     url: str = Form(...),
-    studio_preview: bool = Form(False),
-    dereverb: bool = Form(False),
-    lead_back: bool = Form(False),
     identity: Identity = Depends(paywall.get_identity),
 ):
     """Downloads then runs standard-tier vocal/instrumental separation.
@@ -1513,9 +1479,6 @@ async def youtube_separate_route(
         job_id=job_id, tool="youtube/separate", charge_type="none",
         subject_id=identity.subject_id, account_id=identity.account_id, ip_hash=identity.ip_hash,
     )
-    preview, preview_block = _youtube_preview(
-        identity, job_id, "youtube_separate", studio_preview, dereverb, lead_back,
-    )
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=False,
@@ -1523,14 +1486,10 @@ async def youtube_separate_route(
         overlap=SEPARATION_OVERLAP,
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
-        preview=preview,
     ))
 
     logger.info(f"[YOUTUBE_SEPARATE] job={job_id} queued for {url}")
-    payload = {"job_id": job_id, "status": "processing"}
-    if preview_block:
-        payload["studio_preview"] = preview_block
-    return JSONResponse(payload)
+    return JSONResponse({"job_id": job_id, "status": "processing"})
 
 
 @router.post(
@@ -1593,7 +1552,7 @@ async def youtube_separate_hq_route(
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
     set_job_context(tool="YOUTUBE_SEPARATE", tier="hq")
-    vocal_options, stem_count_ok, extra_credits = studio_options(dereverb, lead_back)
+    vocal_options, stem_count_ok, extra_credits, waivable_credits = studio_options(dereverb, lead_back)
     paid_ctx = {"paid": False}
 
     # Capacity before payment: a 503 must never cost a credit.
@@ -1613,7 +1572,7 @@ async def youtube_separate_hq_route(
     try:
         async with paywall.guard(
             identity, job_id=job_id, tool="youtube/separate-hq", input_seconds=None,
-            extra_credits=extra_credits,
+            extra_credits=extra_credits, waivable_credits=waivable_credits,
         ) as charge:
             paid_ctx["paid"] = charge.charge_type == "credit"
             spawn_background_task(_run_youtube_separation(
@@ -1707,10 +1666,6 @@ async def youtube_separate_download(
 )
 async def youtube_stems_route(
     url: str = Form(...),
-    studio_preview: bool = Form(False),
-    dereverb: bool = Form(False),
-    lead_back: bool = Form(False),
-    stem_count: int = Form(4),
     identity: Identity = Depends(paywall.get_identity),
 ):
     """Downloads then runs standard-tier full 4-stem separation.
@@ -1738,9 +1693,6 @@ async def youtube_stems_route(
         job_id=job_id, tool="youtube/stems", charge_type="none",
         subject_id=identity.subject_id, account_id=identity.account_id, ip_hash=identity.ip_hash,
     )
-    preview, preview_block = _youtube_preview(
-        identity, job_id, "youtube_stems", studio_preview, dereverb, lead_back, stem_count,
-    )
     spawn_background_task(_run_youtube_separation(
         job_id, url,
         stems=True,
@@ -1748,14 +1700,10 @@ async def youtube_stems_route(
         overlap=SEPARATION_OVERLAP,
         timeout_seconds=DEMUCS_TIMEOUT_SECONDS,
         max_duration_seconds=MAX_SEPARATION_DURATION_SECONDS,
-        preview=preview,
     ))
 
     logger.info(f"[YOUTUBE_STEMS] job={job_id} queued for {url}")
-    payload = {"job_id": job_id, "status": "processing"}
-    if preview_block:
-        payload["studio_preview"] = preview_block
-    return JSONResponse(payload)
+    return JSONResponse({"job_id": job_id, "status": "processing"})
 
 
 @router.post(
@@ -1799,7 +1747,7 @@ async def youtube_stems_hq_route(
         raise HTTPException(400, "Please provide a valid YouTube video URL.")
 
     set_job_context(tool="YOUTUBE_STEMS", tier="hq")
-    vocal_options, stem_count_ok, extra_credits = studio_options(dereverb, lead_back, stem_count)
+    vocal_options, stem_count_ok, extra_credits, waivable_credits = studio_options(dereverb, lead_back, stem_count)
     paid_ctx = {"paid": False}
 
     _reject_if_separation_queue_full()
@@ -1818,7 +1766,7 @@ async def youtube_stems_hq_route(
     try:
         async with paywall.guard(
             identity, job_id=job_id, tool="youtube/stems-hq", input_seconds=None,
-            extra_credits=extra_credits,
+            extra_credits=extra_credits, waivable_credits=waivable_credits,
         ) as charge:
             paid_ctx["paid"] = charge.charge_type == "credit"
             spawn_background_task(_run_youtube_separation(

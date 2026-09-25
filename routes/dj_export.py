@@ -13,17 +13,28 @@ import asyncio
 import os
 import re
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from fastapi.responses import StreamingResponse
 
 from config import logger, ANALYSIS_MAX_SECONDS
 from jobs import get_job, set_job_fields
 from log_stream import tag_from_job
+from rate_limit import check_rate_limit
 from utils import _analysis_semaphore, acquire_slot_or_503, release_memory_to_os, run_blocking, get_camelot
 
 from .batch import _zip_stream
 
 router = APIRouter()
+
+def _export_limit(request: Request) -> None:
+    check_rate_limit(request, max_requests=20, window_seconds=3600, bucket_key="/separate/export")
+
+
+def _analysis_limit(request: Request) -> None:
+    check_rate_limit(request, max_requests=60, window_seconds=3600, bucket_key="/separate/analysis")
+
+
+_analysis_locks: dict = {}
 
 EXPORT_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
 _ANALYSIS_SOURCES = ("instrumental", "other", "drums", "bass", "vocals")
@@ -71,6 +82,19 @@ def _analyze(path: str) -> dict:
 async def _key_bpm(job_id: str, job: dict) -> dict:
     if job.get("dj_analysis"):
         return job["dj_analysis"]
+    lock = _analysis_locks.setdefault(job_id, asyncio.Lock())
+    try:
+        async with lock:
+            fresh = get_job(job_id) or job
+            if fresh.get("dj_analysis"):
+                return fresh["dj_analysis"]
+            return await _analyze_once(job_id, fresh)
+    finally:
+        if not lock.locked() and not getattr(lock, "_waiters", None):
+            _analysis_locks.pop(job_id, None)
+
+
+async def _analyze_once(job_id: str, job: dict) -> dict:
     files = _stem_files(job)
     source = job.get("input_path") if job.get("input_path") and os.path.exists(job["input_path"]) else None
     source = source or next((files[s] for s in _ANALYSIS_SOURCES if s in files), None)
@@ -104,13 +128,13 @@ def _tag(analysis: dict) -> str:
     return " - ".join(parts)
 
 
-@router.get("/separate/analysis/{job_id}")
+@router.get("/separate/analysis/{job_id}", dependencies=[Depends(_analysis_limit)])
 async def dj_analysis(job_id: str = Path(..., max_length=64)) -> dict:
     job = _load_job(job_id)
     return {"job_id": job_id, **(await _key_bpm(job_id, job))}
 
 
-@router.get("/separate/export/{job_id}")
+@router.get("/separate/export/{job_id}", dependencies=[Depends(_export_limit)])
 async def dj_export(
     job_id: str = Path(..., max_length=64),
     format: str = Query("wav", pattern="^(wav|mp3)$"),

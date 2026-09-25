@@ -85,10 +85,11 @@ import time
 import asyncio
 from functools import partial
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Query, Response
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Path, Query, Request, Response
 from fastapi.responses import JSONResponse, FileResponse
 
 from config import (
+    logger,
     SEPARATION_RATE_LIMIT_MAX_REQUESTS,
     SEPARATION_RATE_LIMIT_WINDOW_SECONDS,
     SEPARATION_MODEL,
@@ -186,8 +187,11 @@ def studio_config(response: Response) -> dict:
         "vocal_options": s.studio_vocal_options_enabled,
         "six_stems": s.studio_six_stems_enabled,
         "option_credits": s.studio_option_credits,
+        "six_stem_credits": s.studio_six_stem_credits,
+        "free_run_covers_extras": False,
         "preview": s.studio_preview_enabled,
         "preview_seconds": s.studio_preview_seconds,
+        "preview_on_click": True,
         "google_signin": bool(s.google_client_id and s.google_client_secret),
         "video_input": {
             "formats": sorted(ALLOWED_VIDEO_INPUT_FORMATS),
@@ -202,6 +206,7 @@ def studio_config(response: Response) -> dict:
             "price_usd": s.studio_pass_price_usd,
             "credits_per_month": s.studio_pass_credits,
             "options_included": s.studio_pass_options_included,
+            "rollover_months": s.studio_pass_rollover_months,
         },
     }
 
@@ -209,7 +214,8 @@ def studio_config(response: Response) -> dict:
 def studio_options(dereverb: bool = False, lead_back: bool = False, stem_count: int = 4):
     """Validates Studio extras against their kill switches.
 
-    Returns (vocal_options, stem_count, extra_credits). Raises a
+    Returns (vocal_options, stem_count, extra_credits, waivable_credits),
+    where waivable_credits is the part a Studio Pass covers. Raises a
     structured 400 when an extra is requested but switched off, so the
     frontend can hide it instead of failing mid-run."""
     settings = get_credit_settings()
@@ -222,16 +228,8 @@ def studio_options(dereverb: bool = False, lead_back: bool = False, stem_count: 
     if stem_count == 6 and not settings.studio_six_stems_enabled:
         raise HTTPException(400, {"kind": "studio_option_unavailable",
                                   "message": "6-stem separation is not available yet."})
-    return vocal_options, stem_count, paywall.option_credits(vocal_options)
-
-
-def _preview_args(studio_preview: bool, dereverb: bool = False, lead_back: bool = False,
-                  stem_count: int = 4) -> dict:
-    """On the free routes the Studio options describe the preview only."""
-    if not studio_preview:
-        return {}
-    options, count, _ = studio_options(dereverb, lead_back, stem_count)
-    return {"studio_preview": True, "preview_options": options, "preview_stem_count": count}
+    extra, waivable = paywall.studio_extra(vocal_options, stem_count)
+    return vocal_options, stem_count, extra, waivable
 
 
 STUDIO_PREVIEW_TIMEOUT_SECONDS = 300
@@ -268,8 +266,8 @@ def _reserve_studio_preview(identity: Identity):
 async def _run_studio_preview(source_job_id: str, preview_id: str, file_path: str, *,
                               is_stems: bool, title: str, identity: Identity,
                               vocal_options: tuple, stem_count: int) -> None:
-    """Runs a short Studio clip of the same upload, right after the free
-    Standard job, so it lands on the still-warm GPU worker."""
+    """Runs a short Studio clip of a finished Standard job's input, when the
+    user asks for it."""
     try:
         source = get_job(source_job_id) or {}
         if source.get("status") != "complete":
@@ -333,6 +331,82 @@ async def _run_studio_preview(source_job_id: str, preview_id: str, file_path: st
         fail_if_unfinished(preview_id, "Studio preview did not finish.")
 
 
+PREVIEWABLE_JOB_TYPES = ("separation", "stems", "youtube_separate", "youtube_stems")
+
+
+def _preview_limit(request: Request) -> None:
+    check_rate_limit(request, max_requests=20, window_seconds=3600, bucket_key="/studio/preview")
+
+
+def _preview_key(vocal_options: tuple, stem_count: int) -> str:
+    return f"{','.join(sorted(vocal_options)) or 'plain'}:{stem_count}"
+
+
+def _unavailable(status: int, reason: str, message: str):
+    raise HTTPException(status, {"kind": "preview_unavailable", "reason": reason, "message": message})
+
+
+@router.post("/studio/preview/{job_id}", dependencies=[Depends(_preview_limit)])
+async def studio_preview(
+    job_id: str = Path(..., max_length=64),
+    dereverb: bool = Query(False),
+    lead_back: bool = Query(False),
+    stem_count: int = Query(4),
+    identity: Identity = Depends(paywall.get_identity),
+):
+    """Hear Studio on my song: a free clip of a finished Standard job,
+    started only when the user clicks. Same options on the same job return
+    the preview already made."""
+    tag_from_job(job_id)
+    job = get_job(job_id)
+    if job is None or job.get("job_type") not in PREVIEWABLE_JOB_TYPES or not job.get("studio_previewable"):
+        _unavailable(404, "not_previewable", "This result can't be previewed in Studio.")
+    if job["job_type"].startswith("youtube") and not youtube_studio_enabled():
+        _unavailable(403, "disabled", "Studio previews for links are switched off right now.")
+    if not get_credit_settings().studio_preview_enabled:
+        _unavailable(403, "disabled", "Studio previews are switched off right now.")
+    if job.get("status") != "complete":
+        _unavailable(409, "source_not_complete", "Wait for the free result to finish first.")
+    input_path = job.get("input_path")
+    if not input_path or not os.path.exists(input_path):
+        _unavailable(409, "input_expired", "This upload has expired. Run it again to preview.")
+
+    is_stems = job["job_type"] in ("stems", "youtube_stems")
+    options, count, _, _ = studio_options(dereverb, lead_back, stem_count if is_stems else 4)
+    key = _preview_key(options, count)
+    lock = f"af:preview:lock:{job_id}:{key}"
+    if not _redis.set(lock, "1", nx=True, ex=30):
+        _unavailable(409, "in_progress", "That preview is already starting.")
+    try:
+        previews = dict(job.get("previews") or {})
+        existing = previews.get(key)
+        if existing:
+            prior = get_job(existing)
+            if prior and prior.get("status") != "failed":
+                return {"job_id": existing, "status": prior.get("status"), "reused": True,
+                        "seconds": get_credit_settings().studio_preview_seconds}
+        skip = _reserve_studio_preview(identity)
+        if skip:
+            _unavailable(429 if skip == "daily_limit" else 403, skip,
+                         "You've used today's free Studio previews." if skip == "daily_limit"
+                         else "Studio previews are not available right now.")
+        preview_id = create_job(job_type=job["job_type"])
+        set_job_fields(preview_id, preview_of=job_id, preview_options=list(options), preview_stem_count=count)
+        previews[key] = preview_id
+        set_job_fields(job_id, previews=previews, preview_job_id=preview_id)
+    finally:
+        _redis.delete(lock)
+
+    spawn_background_task(_run_studio_preview(
+        job_id, preview_id, input_path, is_stems=is_stems,
+        title=job.get("title") or os.path.basename(input_path), identity=identity,
+        vocal_options=options, stem_count=count,
+    ))
+    logger.info(f"[STUDIO_PREVIEW] job={preview_id} for {job_id} options={key}")
+    return {"job_id": preview_id, "status": "processing", "reused": False,
+            "seconds": get_credit_settings().studio_preview_seconds}
+
+
 async def _queue_separation(
     file: UploadFile,
     *,
@@ -349,9 +423,7 @@ async def _queue_separation(
     vocal_options: tuple = (),
     stem_count: int = 4,
     extra_credits: int = 0,
-    studio_preview: bool = False,
-    preview_options: tuple = (),
-    preview_stem_count: int = 4,
+    waivable_credits: int = 0,
 ) -> JSONResponse:
     """
     Shared submit path for all four separation routes. They differ only
@@ -412,15 +484,8 @@ async def _queue_separation(
     if rule_key is not None:
         import library
         library.mark_owner(job_id, identity)
-
-    preview_id = None
-    preview_skip = None
-    if studio_preview and rule_key is None:
-        preview_skip = _reserve_studio_preview(identity)
-        if preview_skip is None:
-            preview_id = create_job(job_type=job_type)
-            set_job_fields(preview_id, preview_of=job_id)
-            set_job_fields(job_id, preview_job_id=preview_id)
+    else:
+        set_job_fields(job_id, studio_previewable=True)
 
     # Open the metrics row for EVERY separation job - paid or free,
     # metered or not. This must NOT be conditional on the paywall being
@@ -535,21 +600,7 @@ async def _queue_separation(
             # precise values survive this later write.
             metered_tool=rule_key or metric_label.lstrip("/"),
         )
-        if preview_id is None:
-            spawn_background_task(standard)
-            return
-
-        async def _standard_then_preview():
-            try:
-                await standard
-            finally:
-                await _run_studio_preview(
-                    job_id, preview_id, file_path, is_stems=is_stems,
-                    title=original_filename, identity=identity,
-                    vocal_options=preview_options, stem_count=preview_stem_count,
-                )
-
-        spawn_background_task(_standard_then_preview())
+        spawn_background_task(standard)
 
     billing = None
     if rule_key is not None:
@@ -560,7 +611,7 @@ async def _queue_separation(
         try:
             async with paywall.guard(
                 identity, job_id=job_id, tool=rule_key, input_seconds=duration,
-                extra_credits=extra_credits,
+                extra_credits=extra_credits, waivable_credits=waivable_credits,
             ) as charge:
                 run_ctx["paid"] = charge.charge_type == "credit"
                 _spawn()
@@ -600,11 +651,6 @@ async def _queue_separation(
     _log_queued(tool, job_id, original_filename, size, detail)
 
     payload = {"job_id": job_id, "status": "processing"}
-    if studio_preview:
-        payload["studio_preview"] = (
-            {"job_id": preview_id, "seconds": get_credit_settings().studio_preview_seconds}
-            if preview_id else {"job_id": None, "skipped": preview_skip}
-        )
     if vocal_options or stem_count != 4:
         payload["studio"] = {"vocal_options": list(vocal_options), "stem_count": stem_count}
     if billing:
@@ -618,9 +664,6 @@ async def _queue_separation(
 )
 async def separate_audio(
     file: UploadFile = File(...),
-    studio_preview: bool = Form(False),
-    dereverb: bool = Form(False),
-    lead_back: bool = Form(False),
     identity: Identity = Depends(paywall.get_identity),
 ):
     """
@@ -648,7 +691,6 @@ async def separate_audio(
         metric_label="/separate",
         hq=False,
         identity=identity,
-        **_preview_args(studio_preview, dereverb, lead_back),
     )
 
 
@@ -690,7 +732,7 @@ async def separate_audio_hq(
             "High quality separation is temporarily unavailable due to server load. "
             "Please use standard separation."
         )
-    vocal_options, _, extra_credits = studio_options(dereverb, lead_back)
+    vocal_options, _, extra_credits, waivable_credits = studio_options(dereverb, lead_back)
 
     return await _queue_separation(
         file,
@@ -706,6 +748,7 @@ async def separate_audio_hq(
         rule_key="separate-hq",
         vocal_options=vocal_options,
         extra_credits=extra_credits,
+        waivable_credits=waivable_credits,
     )
 
 
@@ -730,8 +773,12 @@ def _preview_fields(job: dict) -> dict:
     fields = {}
     if job.get("preview_job_id"):
         fields["studio_preview_job_id"] = job["preview_job_id"]
+    if job.get("previews"):
+        fields["studio_previews"] = job["previews"]
     if job.get("preview_of"):
         fields["preview_of"] = job["preview_of"]
+        fields["preview_options"] = job.get("preview_options") or []
+        fields["preview_stem_count"] = job.get("preview_stem_count") or 4
         fields["clip"] = job.get("clip")
         fields["preview_skip"] = job.get("preview_skip")
     return fields
@@ -787,10 +834,6 @@ async def separation_download(
 )
 async def stems_route(
     file: UploadFile = File(...),
-    studio_preview: bool = Form(False),
-    dereverb: bool = Form(False),
-    lead_back: bool = Form(False),
-    stem_count: int = Form(4),
     identity: Identity = Depends(paywall.get_identity),
 ):
     """
@@ -817,7 +860,6 @@ async def stems_route(
         metric_label="/stems",
         hq=False,
         identity=identity,
-        **_preview_args(studio_preview, dereverb, lead_back, stem_count),
     )
 
 
@@ -844,7 +886,7 @@ async def stems_route_hq(
             "High quality separation is temporarily unavailable due to server load. "
             "Please use standard stem separation."
         )
-    vocal_options, stem_count, extra_credits = studio_options(dereverb, lead_back, stem_count)
+    vocal_options, stem_count, extra_credits, waivable_credits = studio_options(dereverb, lead_back, stem_count)
 
     return await _queue_separation(
         file,
@@ -861,6 +903,7 @@ async def stems_route_hq(
         vocal_options=vocal_options,
         stem_count=stem_count,
         extra_credits=extra_credits,
+        waivable_credits=waivable_credits,
     )
 
 

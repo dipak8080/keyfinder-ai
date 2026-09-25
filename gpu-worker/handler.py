@@ -49,8 +49,9 @@ INPUT (job["input"]):
   model                 one of ALLOWED_SEPARATION_MODELS below
   overlap                float, Demucs --overlap value
   max_duration_seconds  reject cleanly if the fetched audio exceeds this
-  stem_count            optional, 4 (default) or 6; 6 = RoFormer vocals +
-                         htdemucs_6s on the instrumental (adds guitar, piano)
+  stem_count            optional, 4 (default) or 6; 6 adds guitar and piano
+                         from an htdemucs_6s pass on the htdemucs_ft "other"
+                         stem, and "other" becomes the remainder (v12)
   vocal_options         optional list: "dereverb" adds vocals_dry,
                          "lead_back" adds lead_vocals + backing_vocals
                          (melband_roformer only)
@@ -521,6 +522,32 @@ def _run_demucs_gpu(input_path: str, work_dir: str, model: str, overlap: float, 
     return track_dir, gpu_seconds
 
 
+def _split_other_six(other_path: str, work_dir: str, overlap: float):
+    """Guitar and piano from an htdemucs_6s pass on the "other" stem; the
+    new "other" is what is left, so every stem still sums to the mix."""
+    import numpy as np
+    import soundfile as sf
+
+    six_dir, seconds = _run_demucs_gpu(other_path, work_dir, ROFORMER_STEMS_SECOND_STAGE_6, overlap,
+                                       two_stems=False)
+    other, sr = sf.read(other_path, dtype="float32", always_2d=True)
+    parts = {}
+    for name in ("guitar", "piano"):
+        data, part_sr = sf.read(os.path.join(six_dir, f"{name}.wav"), dtype="float32", always_2d=True)
+        if part_sr != sr:
+            raise RuntimeError(f"htdemucs_6s {name} sample rate {part_sr} != {sr}")
+        parts[name] = data
+    frames = min(len(other), *(len(v) for v in parts.values()))
+    rest = other[:frames] - parts["guitar"][:frames] - parts["piano"][:frames]
+    out = {}
+    for name, data in (("guitar", parts["guitar"][:frames]), ("piano", parts["piano"][:frames]),
+                       ("other", rest)):
+        path = os.path.join(work_dir, f"six_{name}.wav")
+        sf.write(path, np.clip(data, -1.0, 1.0), sr, subtype="PCM_16")
+        out[name] = path
+    return out, seconds
+
+
 def handler(job):
     inp = job.get("input") or {}
 
@@ -614,16 +641,19 @@ def handler(job):
                     sources = dict(roformer_sources)
                 else:
                     # Stage 2: Demucs on the vocal-free instrumental.
-                    second_stage = ROFORMER_STEMS_SECOND_STAGE_6 if stem_count == 6 else ROFORMER_STEMS_SECOND_STAGE
                     track_dir, demucs_seconds = _run_demucs_gpu(
                         roformer_sources["instrumental"], work_dir,
-                        second_stage, overlap, two_stems=False,
+                        ROFORMER_STEMS_SECOND_STAGE, overlap, two_stems=False,
                     )
                     gpu_seconds += demucs_seconds
                     sources = {"vocals": roformer_sources["vocals"]}
-                    for s in MODEL_STEM_NAMES[second_stage]:
+                    for s in MODEL_STEM_NAMES[ROFORMER_STEMS_SECOND_STAGE]:
                         if s != "vocals":
                             sources[s] = os.path.join(track_dir, f"{s}.wav")
+                    if stem_count == 6:
+                        extra, six_seconds = _split_other_six(sources["other"], work_dir, overlap)
+                        gpu_seconds += six_seconds
+                        sources.update(extra)
                 if vocal_options:
                     extra, extra_seconds = _run_vocal_options(roformer_sources["vocals"], work_dir, vocal_options)
                     gpu_seconds += extra_seconds

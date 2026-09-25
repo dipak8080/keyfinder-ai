@@ -148,6 +148,14 @@ def _expires_at(job: dict):
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _claim_key(job_id: str, vocal_options=(), stem_count: int = 4) -> str:
+    """One upgrade per source job AND option set: a plain upgrade keeps the
+    bare job id (as before), an upgrade with options gets its own key."""
+    if not vocal_options and stem_count == 4:
+        return job_id
+    return f"{job_id}#{','.join(sorted(vocal_options)) or 'plain'}:{stem_count}"
+
+
 def _existing_upgrade(source_job_id: str):
     with connect() as conn:
         row = conn.execute(
@@ -161,7 +169,7 @@ _YOUTUBE_VARIANT = {"separation": "youtube_separate", "stems": "youtube_stems"}
 _YOUTUBE_RULE = {"youtube_separate": "youtube/separate-hq", "youtube_stems": "youtube/stems-hq"}
 
 
-def _eligibility(job_id: str, source_type: str, rule_key: str):
+def _eligibility(job_id: str, source_type: str, rule_key: str, claim_key: str | None = None):
     """Shared by the info route and the upgrade route.
 
     Returns (state, blocker). blocker is None when eligible; otherwise a
@@ -193,7 +201,7 @@ def _eligibility(job_id: str, source_type: str, rule_key: str):
     if job["job_type"] == youtube_type and not youtube_studio_enabled():
         return (state, {"reason": "tool_disabled"})
 
-    existing = _existing_upgrade(job_id)
+    existing = _existing_upgrade(claim_key or job_id)
     if existing:
         return (state, {"reason": "already_upgraded", "upgrade_job_id": existing})
     if job["status"] == "failed":
@@ -223,11 +231,11 @@ def _options_blocked_for(job: dict, vocal_options, stem_count: int) -> bool:
 
 async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, rule_key: str,
                         vocal_options: tuple = (), stem_count: int = 4,
-                        extra_credits: int = 0) -> dict:
+                        extra_credits: int = 0, waivable_credits: int = 0) -> dict:
     """Never 404s. This is called to RENDER a page, and a 404 here would
     be indistinguishable from the status poll itself failing."""
     tag_from_job(job_id)
-    state, blocker = _eligibility(job_id, source_type, rule_key)
+    state, blocker = _eligibility(job_id, source_type, rule_key, _claim_key(job_id, vocal_options, stem_count))
 
     if blocker is not None:
         return {"eligible": False, "tool": state.get("rule_key", rule_key), **blocker}
@@ -250,7 +258,7 @@ async def _upgrade_info(job_id: str, identity: Identity, *, source_type: str, ru
             "max_seconds": MAX_SEPARATION_DURATION_SECONDS_HQ,
         }
 
-    preview = paywall.preview(identity, rule_key, duration, extra_credits)
+    preview = paywall.preview(identity, rule_key, duration, extra_credits, waivable_credits)
     return {
         "eligible": True,
         "reason": None,
@@ -271,9 +279,12 @@ async def _queue_upgrade(
     job_id: str, identity: Identity, *, source_type: str, rule_key: str,
     tool: str, metric_label: str,
     vocal_options: tuple = (), stem_count: int = 4, extra_credits: int = 0,
+    waivable_credits: int = 0,
 ) -> dict:
     tag_from_job(job_id)
-    state, blocker = _eligibility(job_id, source_type, rule_key)
+    claim = _claim_key(job_id, vocal_options, stem_count)
+    studio = {"vocal_options": list(vocal_options), "stem_count": stem_count}
+    state, blocker = _eligibility(job_id, source_type, rule_key, claim)
 
     if blocker is not None:
         reason = blocker["reason"]
@@ -287,7 +298,7 @@ async def _queue_upgrade(
                         tool, job_id, existing)
             return {
                 "job_id": existing, "status": "processing", "upgraded_from": job_id,
-                "already_upgraded": True, "billing": None,
+                "already_upgraded": True, "billing": None, "studio": studio,
             }
 
         status, kind = _BLOCKER_HTTP.get(reason, (409, reason))
@@ -345,14 +356,14 @@ async def _queue_upgrade(
             conn.execute(
                 "INSERT INTO job_upgrades (source_job_id, upgrade_job_id, tool, created_at)"
                 " VALUES (?,?,?,?)",
-                (job_id, new_job_id, rule_key, now_iso()),
+                (claim, new_job_id, rule_key, now_iso()),
             )
     except Exception:  # noqa: BLE001 - IntegrityError means we lost the race
-        existing = _existing_upgrade(job_id)
+        existing = _existing_upgrade(claim)
         if existing:
             return {
                 "job_id": existing, "status": "processing", "upgraded_from": job_id,
-                "already_upgraded": True, "billing": None,
+                "already_upgraded": True, "billing": None, "studio": studio,
             }
         raise
 
@@ -365,7 +376,7 @@ async def _queue_upgrade(
             with connect() as conn, tx(conn):
                 conn.execute(
                     "DELETE FROM job_upgrades WHERE source_job_id=? AND upgrade_job_id=?",
-                    (job_id, new_job_id),
+                    (claim, new_job_id),
                 )
         except Exception:  # noqa: BLE001
             logger.exception("[%s] could not release upgrade claim for %s", tool, job_id)
@@ -400,7 +411,7 @@ async def _queue_upgrade(
 
         async with paywall.guard(
             identity, job_id=new_job_id, tool=rule_key, input_seconds=duration,
-            extra_credits=extra_credits,
+            extra_credits=extra_credits, waivable_credits=waivable_credits,
         ) as charge:
             run_ctx["paid"] = charge.charge_type == "credit"
             spawn_background_task(_run_tool_job(
@@ -437,6 +448,7 @@ async def _queue_upgrade(
         "status": "processing",
         "upgraded_from": job_id,
         "already_upgraded": False,
+        "studio": studio,
         "billing": {
             "charged": charge.charge_type,
             "credits": charge.credits,
@@ -469,11 +481,12 @@ async def upgrade_separation(
     credit. Returns a NEW job_id - poll at /separate/status/{id}, fetch
     stems from the standard /separate/preview and /separate/download
     routes. Idempotent per source job."""
-    vocal_options, _, extra_credits = studio_options(dereverb, lead_back)
+    vocal_options, _, extra_credits, waivable_credits = studio_options(dereverb, lead_back)
     return await _queue_upgrade(
         job_id, identity, source_type="separation", rule_key="separate-hq",
         tool="SEPARATION_HQ", metric_label="/separate/upgrade",
         vocal_options=vocal_options, extra_credits=extra_credits,
+        waivable_credits=waivable_credits,
     )
 
 
@@ -495,11 +508,12 @@ async def upgrade_stems(
 ) -> dict:
     """Re-runs a completed /stems job through htdemucs_ft. Costs one
     credit. Poll the new id at /stems/status/{id}. Idempotent per source."""
-    vocal_options, stem_count, extra_credits = studio_options(dereverb, lead_back, stem_count)
+    vocal_options, stem_count, extra_credits, waivable_credits = studio_options(dereverb, lead_back, stem_count)
     return await _queue_upgrade(
         job_id, identity, source_type="stems", rule_key="stems-hq",
         tool="STEMS_HQ", metric_label="/stems/upgrade",
         vocal_options=vocal_options, stem_count=stem_count, extra_credits=extra_credits,
+        waivable_credits=waivable_credits,
     )
 
 
@@ -514,9 +528,10 @@ async def separate_upgrade_info(
     """Should the Studio Quality CTA show on this result, and what will
     it cost? Never 404s - returns eligible=false with a reason."""
     response.headers["Cache-Control"] = "no-store"
-    vocal_options, _, extra_credits = studio_options(dereverb, lead_back)
+    vocal_options, _, extra_credits, waivable_credits = studio_options(dereverb, lead_back)
     return await _upgrade_info(job_id, identity, source_type="separation", rule_key="separate-hq",
-                               vocal_options=vocal_options, extra_credits=extra_credits)
+                               vocal_options=vocal_options, extra_credits=extra_credits,
+                               waivable_credits=waivable_credits)
 
 
 @router.get("/stems/upgrade-info/{job_id}")
@@ -530,7 +545,8 @@ async def stems_upgrade_info(
 ) -> dict:
     """Same as /separate/upgrade-info, for 4-stem jobs."""
     response.headers["Cache-Control"] = "no-store"
-    vocal_options, stem_count, extra_credits = studio_options(dereverb, lead_back, stem_count)
+    vocal_options, stem_count, extra_credits, waivable_credits = studio_options(dereverb, lead_back, stem_count)
     return await _upgrade_info(job_id, identity, source_type="stems", rule_key="stems-hq",
                                vocal_options=vocal_options, stem_count=stem_count,
-                               extra_credits=extra_credits)
+                               extra_credits=extra_credits,
+                               waivable_credits=waivable_credits)

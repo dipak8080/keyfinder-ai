@@ -61,6 +61,22 @@ def option_credits(vocal_options) -> int:
     return get_settings().studio_option_credits * len(set(vocal_options or ()))
 
 
+def studio_extra(vocal_options=(), stem_count: int = 4) -> tuple[int, int]:
+    """(extra credits, the part a Studio Pass waives). Vocal options are
+    waivable; 6 stems is not."""
+    options = option_credits(vocal_options)
+    six = get_settings().studio_six_stem_credits if stem_count == 6 else 0
+    return options + six, options
+
+
+def _price_extras(identity: Identity, extra_credits: int, waivable_credits: int) -> int:
+    extra = max(0, extra_credits)
+    waivable = max(0, min(waivable_credits, extra))
+    if waivable and _options_free_for(identity):
+        extra -= waivable
+    return extra
+
+
 def _options_free_for(identity: Identity) -> bool:
     """Studio Pass holders get vocal options at no extra cost."""
     if not get_settings().studio_pass_options_included:
@@ -149,10 +165,10 @@ async def _record_gate_event_async(identity: Identity, **kwargs) -> None:
 
 
 def preview(identity: Identity, tool: str, input_seconds: float | None,
-            extra_credits: int = 0) -> dict:
-    if extra_credits and _options_free_for(identity):
-        extra_credits = 0
-    decision = decide(tool, input_seconds, extra_credits)
+            extra_credits: int = 0, waivable_credits: int = 0) -> dict:
+    extra = _price_extras(identity, extra_credits, waivable_credits)
+    free_eligible = extra == 0
+    decision = decide(tool, input_seconds, extra)
     from .db import connect
 
     with connect() as conn:
@@ -161,7 +177,10 @@ def preview(identity: Identity, tool: str, input_seconds: float | None,
 
     will_use = "none"
     if decision.billable:
-        will_use = "free" if remaining >= decision.free_ops else ("credit" if balance >= decision.credits else "blocked")
+        if free_eligible and remaining >= decision.free_ops:
+            will_use = "free"
+        else:
+            will_use = "credit" if balance >= decision.credits else "blocked"
 
     if will_use == "blocked":
         record_gate_event(identity, event="preview_blocked", tool=tool,
@@ -172,6 +191,8 @@ def preview(identity: Identity, tool: str, input_seconds: float | None,
         "tool": tool, "input_seconds": input_seconds, "billable": decision.billable,
         "reason": decision.reason, "credits_required": decision.credits, "will_use": will_use,
         "balance": balance, "free_remaining": remaining, "can_run": will_use != "blocked",
+        "extra_credits": extra, "extras_waived": max(0, extra_credits) - extra,
+        "free_covers_this_run": free_eligible,
     }
 
 
@@ -210,7 +231,8 @@ async def free_gate(identity: Identity, *, tool: str) -> None:
 
 @asynccontextmanager
 async def guard(identity: Identity, *, job_id: str, tool: str,
-                input_seconds: float | None, extra_credits: int = 0) -> AsyncIterator[Charge]:
+                input_seconds: float | None, extra_credits: int = 0,
+                waivable_credits: int = 0) -> AsyncIterator[Charge]:
     """Charge, run the body, auto-refund if the body raises.
 
         async with paywall.guard(identity, job_id=jid, tool="stem-separation",
@@ -226,9 +248,8 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
     times out and retries, since that retry arrives with a fresh job_id -
     see idempotency.py for the layer that closes that.
     """
-    if extra_credits and await asyncio.to_thread(_options_free_for, identity):
-        extra_credits = 0
-    decision = decide(tool, input_seconds, extra_credits)
+    extra = await asyncio.to_thread(_price_extras, identity, extra_credits, waivable_credits)
+    decision = decide(tool, input_seconds, extra)
     try:
         charge = await asyncio.to_thread(
             ledger_mod.charge_for_job, identity,
@@ -236,6 +257,7 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
             credits_needed=max(decision.credits, 1),
             free_ops_needed=max(decision.free_ops, 1),
             billable=decision.billable,
+            free_eligible=extra == 0,
         )
     except InsufficientCredits as exc:
         await _record_gate_event_async(

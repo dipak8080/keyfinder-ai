@@ -23,6 +23,8 @@ same responses.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import logging
 
 import asyncio
@@ -45,6 +47,7 @@ class PreviewRequest(BaseModel):
     tool: str = Field(..., max_length=64)
     input_seconds: float | None = Field(default=None, ge=0, le=60 * 60 * 24)
     vocal_options: list[str] = Field(default_factory=list, max_length=4)
+    stem_count: Literal[4, 6] = 4
 
 
 @router.get("/me")
@@ -92,8 +95,8 @@ def preview(
     decide anything.
     """
     options = [o for o in body.vocal_options if o in paywall.STUDIO_VOCAL_OPTIONS]
-    return paywall.preview(identity, body.tool, body.input_seconds,
-                           paywall.option_credits(options))
+    extra, waivable = paywall.studio_extra(options, body.stem_count)
+    return paywall.preview(identity, body.tool, body.input_seconds, extra, waivable)
 
 
 class TurnstileRequest(BaseModel):
