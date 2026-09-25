@@ -68,7 +68,13 @@ def me(
     """
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
     response.headers["Pragma"] = "no-cache"
-    return ledger.summary(identity)
+    result = ledger.summary(identity)
+    try:
+        from . import subscriptions
+        result["studio_pass"] = subscriptions.summary(identity)
+    except Exception:  # noqa: BLE001
+        log.warning("studio pass summary failed", exc_info=True)
+    return result
 
 
 @router.post("/preview")

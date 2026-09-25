@@ -1173,3 +1173,14 @@ def settings_audit(
 ) -> dict:
     """Who changed what, when, and what it was before."""
     return {"entries": settings_store.audit(limit=limit, key=key)}
+
+@router.get("/subscriptions", dependencies=ADMIN)
+def studio_pass_subscriptions() -> dict:
+    from . import subscriptions
+    return {**subscriptions.admin_overview(), "slot": slot_info()}
+
+
+@router.post("/subscriptions/sync", dependencies=ADMIN_WRITE)
+def studio_pass_sync_now() -> dict:
+    from . import subscriptions
+    return subscriptions.sync_with_dodo()

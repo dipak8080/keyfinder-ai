@@ -35,7 +35,8 @@ _TIMEOUT = 20
 SIGNATURE_TOLERANCE_SECONDS = 300
 PAID_STATUSES = ("succeeded",)
 CREDIT_GRANTING_EVENTS = ("payment.succeeded",)
-LOGGED_EVENTS = ("payment.failed", "refund.succeeded", "dispute.opened", "dispute.lost")
+LOGGED_EVENTS = ("payment.failed",)
+SUBSCRIPTION_EVENT_PREFIX = "subscription."
 
 
 class DodoError(RuntimeError):
@@ -70,6 +71,10 @@ def product_id_for(pack_key: str) -> str:
     return _env(f"DODO_PRODUCT_{pack_key.upper()}")
 
 
+def pass_product_id() -> str:
+    return product_id_for("pass")
+
+
 def pack_for_product(product_id: str):
     target = (product_id or "").strip()
     if not target:
@@ -77,7 +82,16 @@ def pack_for_product(product_id: str):
     for pack in get_settings().packs_sorted():
         if product_id_for(pack.key) == target:
             return pack
+    if pass_product_id() and pass_product_id() == target:
+        return get_settings().pass_pack()
     return None
+
+
+def _pack_by_key(key: str):
+    s = get_settings()
+    if key == "pass":
+        return s.pass_pack()
+    return s.pack(key)
 
 
 def configured() -> bool:
@@ -129,6 +143,27 @@ def get_payment(payment_id: str) -> dict:
     return _call("GET", f"/payments/{payment_id}")
 
 
+def get_subscription(subscription_id: str) -> dict:
+    return _call("GET", f"/subscriptions/{subscription_id}")
+
+
+def list_subscription_payments(subscription_id: str) -> list[dict]:
+    from urllib.parse import urlencode
+    query = urlencode({"subscription_id": subscription_id, "status": "succeeded", "page_size": 100})
+    return list((_call("GET", f"/payments?{query}") or {}).get("items") or [])
+
+
+def create_portal_link(customer_id: str, return_url: str) -> str:
+    from urllib.parse import quote, urlencode
+    query = urlencode({"return_url": return_url})
+    return str(_call("POST", f"/customers/{quote(customer_id)}/customer-portal/session?{query}").get("link") or "")
+
+
+def set_cancel_at_period_end(subscription_id: str, cancel: bool) -> dict:
+    return _call("PATCH", f"/subscriptions/{subscription_id}",
+                 json_body={"cancel_at_next_billing_date": bool(cancel)})
+
+
 def event_from_payment(payment: dict, *, delivery_id: str = "", raw: dict | None = None):
     """PaymentEvent for a succeeded payment, or None if it has not succeeded yet."""
     from . import PaymentEvent, WebhookUnprocessable
@@ -160,7 +195,13 @@ def event_from_payment(payment: dict, *, delivery_id: str = "", raw: dict | None
         packs.append(pack.key)
 
     if credits <= 0:
-        pack = get_settings().pack(str(metadata.get("pack") or ""))
+        pack = _pack_by_key(str(metadata.get("pack") or ""))
+        if pack is not None:
+            credits, amount_usd, packs = pack.credits, pack.price_usd, [pack.key]
+
+    subscription_id = str(payment.get("subscription_id") or "")
+    if credits <= 0 and subscription_id:
+        pack = pack_for_product(str(get_subscription(subscription_id).get("product_id") or ""))
         if pack is not None:
             credits, amount_usd, packs = pack.credits, pack.price_usd, [pack.key]
 
@@ -238,6 +279,8 @@ def to_event(payload: dict):
     data = payload.get("data") or {}
 
     if event_type not in CREDIT_GRANTING_EVENTS:
+        if event_type.startswith(SUBSCRIPTION_EVENT_PREFIX):
+            return None
         if event_type in LOGGED_EVENTS:
             log.warning("dodo %s for payment %s - review in the dashboard",
                         event_type, data.get("payment_id"))

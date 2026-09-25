@@ -390,11 +390,21 @@ class Settings:
     free_ops_require_account: bool
     youtube_studio_enabled: bool
 
+    # studio pass
+    studio_pass_enabled: bool
+    studio_pass_credits: int
+    studio_pass_price_usd: float
+    studio_pass_options_included: bool
+
     def rule_for(self, tool: str) -> ToolRule | None:
         return self.tool_rules.get(tool)
 
     def pack(self, key: str) -> Pack | None:
         return self.packs.get(key)
+
+    def pass_pack(self) -> Pack:
+        return Pack(key="pass", credits=self.studio_pass_credits,
+                    price_usd=self.studio_pass_price_usd, label="Studio Pass")
 
     def packs_sorted(self) -> list[Pack]:
         return sorted(self.packs.values(), key=lambda p: p.credits)
@@ -554,6 +564,10 @@ def build_settings() -> Settings:
         signup_bonus_per_ip_30d=max(0, _int("SIGNUP_BONUS_PER_IP_30D", 2)),
         free_ops_require_account=_bool("FREE_OPS_REQUIRE_ACCOUNT", False),
         youtube_studio_enabled=_bool("YOUTUBE_STUDIO_ENABLED", _bool("YOUTUBE_HQ_ENABLED", False)),
+        studio_pass_enabled=_bool("STUDIO_PASS_ENABLED", False),
+        studio_pass_credits=max(1, _int("STUDIO_PASS_CREDITS", 40)),
+        studio_pass_price_usd=_float("STUDIO_PASS_PRICE_USD", 7.99),
+        studio_pass_options_included=_bool("STUDIO_PASS_OPTIONS_INCLUDED", True),
     )
 
     # ---- Resolve derived free rate limits -------------------------------

@@ -61,6 +61,18 @@ def option_credits(vocal_options) -> int:
     return get_settings().studio_option_credits * len(set(vocal_options or ()))
 
 
+def _options_free_for(identity: Identity) -> bool:
+    """Studio Pass holders get vocal options at no extra cost."""
+    if not get_settings().studio_pass_options_included:
+        return False
+    from .subscriptions import has_active_pass
+    try:
+        return has_active_pass(identity)
+    except Exception:  # noqa: BLE001
+        log.warning("pass lookup failed; charging options normally", exc_info=True)
+        return False
+
+
 def decide(tool: str, input_seconds: float | None, extra_credits: int = 0) -> Decision:
     s = get_settings()
     rule = s.rule_for(tool)
@@ -138,6 +150,8 @@ async def _record_gate_event_async(identity: Identity, **kwargs) -> None:
 
 def preview(identity: Identity, tool: str, input_seconds: float | None,
             extra_credits: int = 0) -> dict:
+    if extra_credits and _options_free_for(identity):
+        extra_credits = 0
     decision = decide(tool, input_seconds, extra_credits)
     from .db import connect
 
@@ -212,6 +226,8 @@ async def guard(identity: Identity, *, job_id: str, tool: str,
     times out and retries, since that retry arrives with a fresh job_id -
     see idempotency.py for the layer that closes that.
     """
+    if extra_credits and await asyncio.to_thread(_options_free_for, identity):
+        extra_credits = 0
     decision = decide(tool, input_seconds, extra_credits)
     try:
         charge = await asyncio.to_thread(

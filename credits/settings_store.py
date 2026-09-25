@@ -152,6 +152,10 @@ KNOWN_KEYS: dict[str, dict] = {
     "SIGNUP_BONUS_CREDITS": {"type": "int", "group": "accounts", "min": 0, "max": 20},
     "SIGNUP_BONUS_PER_IP_30D": {"type": "int", "group": "accounts", "min": 0, "max": 20},
     "FREE_OPS_REQUIRE_ACCOUNT": {"type": "bool", "group": "accounts"},
+    "STUDIO_PASS_ENABLED": {"type": "bool", "group": "studio pass"},
+    "STUDIO_PASS_CREDITS": {"type": "int", "group": "studio pass", "min": 1, "max": 500},
+    "STUDIO_PASS_PRICE_USD": {"type": "float", "group": "studio pass", "min": 1, "max": 100},
+    "STUDIO_PASS_OPTIONS_INCLUDED": {"type": "bool", "group": "studio pass"},
 }
 
 _TOOLS = (

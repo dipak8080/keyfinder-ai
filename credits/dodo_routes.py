@@ -4,6 +4,9 @@ credits/dodo_routes.py - Endpoints the Dodo checkout calls.
     GET  /credits/dodo/config     is Dodo checkout available
     POST /credits/dodo/checkout   create a hosted checkout session for one pack
     POST /credits/dodo/confirm    grant credits once Dodo reports the payment succeeded
+    POST /credits/dodo/pass/cancel   Studio Pass: stop at the end of the paid month
+    POST /credits/dodo/pass/resume   Studio Pass: undo a scheduled cancel
+    POST /credits/dodo/pass/portal   Studio Pass: Dodo billing portal link (card, invoices)
 
 The payment.succeeded webhook is the backstop. Both paths key the ledger
 on the payment id.
@@ -20,7 +23,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from rate_limit import check_rate_limit
 
-from . import claims, fulfil, paywall
+from . import claims, fulfil, paywall, subscriptions
 from .config import get_settings
 from .db import connect, now_iso, tx
 from .identity import Identity
@@ -102,7 +105,16 @@ def create_checkout(
 ) -> dict:
     _require_enabled()
 
-    pack = get_settings().pack(body.pack)
+    settings = get_settings()
+    if body.pack == "pass":
+        if not settings.studio_pass_enabled or not dd.pass_product_id():
+            raise HTTPException(status_code=400, detail={"error": "pass_unavailable"})
+        if subscriptions.has_active_pass(identity):
+            raise HTTPException(status_code=409, detail={"error": "already_subscribed",
+                                                         "message": "You already have an active Studio Pass."})
+        pack = settings.pass_pack()
+    else:
+        pack = settings.pack(body.pack)
     if pack is None:
         raise HTTPException(status_code=400, detail={"error": "unknown_pack"})
 
@@ -173,3 +185,56 @@ def confirm_payment(body: ConfirmRequest) -> dict:
         "balance": balance,
         "already_applied": not granted,
     }
+
+def _own_active_subscription(identity: Identity):
+    row = subscriptions.current_for(identity)
+    if row is None or row["status"] not in subscriptions.ACTIVE_STATUSES:
+        raise HTTPException(status_code=404, detail={"error": "no_active_pass"})
+    return row
+
+
+def _set_pass_cancel(identity: Identity, cancel: bool) -> dict:
+    _require_enabled()
+    row = _own_active_subscription(identity)
+    try:
+        dd.set_cancel_at_period_end(row["subscription_id"], cancel)
+    except dd.DodoError:
+        raise HTTPException(status_code=502, detail={"error": "dodo_unavailable"})
+    transition = subscriptions.set_cancel_flag(row["subscription_id"], cancel)
+    if transition:
+        try:
+            fresh = subscriptions.current_for(identity)
+            asyncio.run(subscriptions.notify(transition, dict(fresh) if fresh else None))
+        except Exception:  # noqa: BLE001
+            log.exception("pass %s email failed", transition)
+    log.info("studio pass %s %s by %s", row["subscription_id"],
+             "set to cancel at period end" if cancel else "resumed", identity.account_id)
+    return {"ok": True, "studio_pass": subscriptions.summary(identity)}
+
+
+@router.post("/pass/cancel", dependencies=[Depends(_rate_limited(max_requests=10, window_seconds=3600))])
+def cancel_pass(identity: Identity = Depends(paywall.get_identity)) -> dict:
+    return _set_pass_cancel(identity, True)
+
+
+@router.post("/pass/resume", dependencies=[Depends(_rate_limited(max_requests=10, window_seconds=3600))])
+def resume_pass(identity: Identity = Depends(paywall.get_identity)) -> dict:
+    return _set_pass_cancel(identity, False)
+
+
+@router.post("/pass/portal", dependencies=[Depends(_rate_limited(max_requests=20, window_seconds=3600))])
+def pass_portal(identity: Identity = Depends(paywall.get_identity)) -> dict:
+    """Dodo's hosted billing page: update card, see invoices, cancel.
+    Works for active and on-hold passes, which is how a failed renewal
+    gets fixed."""
+    _require_enabled()
+    row = subscriptions.current_for(identity)
+    if row is None or not row["customer_id"]:
+        raise HTTPException(status_code=404, detail={"error": "no_pass"})
+    try:
+        link = dd.create_portal_link(row["customer_id"], f"{get_settings().frontend_url}{subscriptions.MANAGE_PATH}")
+    except dd.DodoError:
+        raise HTTPException(status_code=502, detail={"error": "dodo_unavailable"})
+    if not link:
+        raise HTTPException(status_code=502, detail={"error": "dodo_no_portal_link"})
+    return {"url": link}

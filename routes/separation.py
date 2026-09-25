@@ -159,6 +159,12 @@ def studio_config(response: Response) -> dict:
         "google_signin": bool(s.google_client_id and s.google_client_secret),
         "signup_bonus_credits": s.signup_bonus_credits,
         "free_needs_account": s.free_ops_require_account,
+        "studio_pass": {
+            "available": s.studio_pass_enabled,
+            "price_usd": s.studio_pass_price_usd,
+            "credits_per_month": s.studio_pass_credits,
+            "options_included": s.studio_pass_options_included,
+        },
     }
 
 

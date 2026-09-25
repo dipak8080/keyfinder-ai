@@ -212,7 +212,7 @@ def magic_link_email(link: str, minutes: int) -> tuple[str, str, str]:
             text)
 
 
-def receipt_email(credits: int, balance: int, link: str) -> tuple[str, str, str]:
+def receipt_email(credits: int, balance: int, link: str, renewing: bool = False) -> tuple[str, str, str]:
     word = "credit" if credits == 1 else "credits"
     bal_word = "credit" if balance == 1 else "credits"
 
@@ -235,8 +235,10 @@ def receipt_email(credits: int, balance: int, link: str) -> tuple[str, str, str]
 
     body = (
         _heading(f"{credits} {word} added")
-        + _lede("Thanks for your purchase. Your credits work on every paid tool "
-                "on the site, and nothing renews.")
+        + _lede(("Your Studio Pass payment went through. It renews monthly until you "
+                 "cancel, and unused credits never expire.") if renewing else
+                ("Thanks for your purchase. Your credits work on every paid tool "
+                 "on the site, and nothing renews."))
         + balance_block
         + _cta(link, "Open my account")
         + _lede("Use that link to reach your credits on any device: phone, "
@@ -248,7 +250,8 @@ def receipt_email(credits: int, balance: int, link: str) -> tuple[str, str, str]
     )
     text = (
         f"{credits} AudioForges {word} added\n\n"
-        f"Balance: {balance} {bal_word}. Credits never expire.\n\n"
+        + ("Studio Pass payment received. It renews monthly until you cancel.\n\n" if renewing else "")
+        + f"Balance: {balance} {bal_word}. Credits never expire.\n\n"
         f"Reach them on any device:\n{link}\n\n"
         "A problem with a run or your purchase? Email contact@audioforges.com.\n\n"
         "audioforges.com"
@@ -256,3 +259,73 @@ def receipt_email(credits: int, balance: int, link: str) -> tuple[str, str, str]
     return (f"{credits} AudioForges {word} added",
             _wrap(body, f"Balance: {balance} {bal_word}. Credits never expire."),
             text)
+
+def _pretty_date(value: str | None) -> str:
+    if not value:
+        return ""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d %B %Y").lstrip("0")
+    except ValueError:
+        return value[:10]
+
+
+_PASS_COPY = {
+    "started": (
+        "Your Studio Pass is active",
+        "Studio Pass is active",
+        "{credits} credits are on your account, and {credits} more arrive every month. "
+        "Vocal options like de-reverb and lead/backing split cost nothing extra while "
+        "the Pass is active. Unused credits never expire.",
+        "It renews monthly at ${price} until you cancel. You can cancel anytime from your account.",
+    ),
+    "reactivated": (
+        "Your Studio Pass is back on",
+        "Studio Pass reactivated",
+        "Your payment went through and your Studio Pass is active again, with vocal "
+        "options included.",
+        "Next renewal: {date}.",
+    ),
+    "on_hold": (
+        "Action needed: your Studio Pass payment failed",
+        "Payment failed",
+        "We couldn't take this month's Studio Pass payment, so the Pass is paused. "
+        "Your existing credits still work.",
+        "Update your card to switch it back on. Nothing is charged twice.",
+    ),
+    "cancel_scheduled": (
+        "Your Studio Pass will end on {date}",
+        "Cancellation confirmed",
+        "Your Studio Pass won't renew. It stays active until {date}, and every credit "
+        "you have keeps working after that. Credits never expire.",
+        "Changed your mind? You can resume it from your account before that date.",
+    ),
+    "cancel_undone": (
+        "Your Studio Pass will keep renewing",
+        "Studio Pass resumed",
+        "Your Studio Pass is no longer set to end. It renews on {date} as usual.",
+        "",
+    ),
+    "ended": (
+        "Your Studio Pass has ended",
+        "Studio Pass ended",
+        "Your Studio Pass is no longer active. Every credit on your account still "
+        "works and never expires.",
+        "You can start a new Pass or buy a credit pack anytime.",
+    ),
+}
+
+
+def pass_email(kind: str, *, credits: int, price_usd: float, date: str | None,
+               manage_url: str) -> tuple[str, str, str]:
+    subject, heading, lede, extra = _PASS_COPY[kind]
+    values = {"credits": credits, "price": f"{price_usd:.2f}", "date": _pretty_date(date) or "the end of this billing month"}
+    subject, lede, extra = (part.format(**values) for part in (subject, lede, extra))
+    label = "Update my card" if kind == "on_hold" else "Open my account"
+    body = _heading(heading) + _lede(lede) + (_lede(extra) if extra else "") + _cta(manage_url, label)
+    body += _lede("Questions? Email "
+                  '<a href="mailto:contact@audioforges.com" style="color:inherit">'
+                  "contact@audioforges.com</a>.")
+    text = f"{heading}\n\n{lede}\n\n" + (f"{extra}\n\n" if extra else "") + \
+        f"{label}: {manage_url}\n\nQuestions? Email contact@audioforges.com.\n\naudioforges.com"
+    return subject, _wrap(body, lede[:110]), text

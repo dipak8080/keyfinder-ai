@@ -177,6 +177,38 @@ async def _credit_hold_sweep_loop():
             logger.error(f"[CREDITS] Hold sweep failed: {e}", exc_info=True)
 
 
+STUDIO_PASS_SYNC_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+def _studio_pass_sync_once() -> dict | None:
+    from credits.admin import slot_info
+    from credits.db import connect
+    from credits.providers import dodo as dd
+
+    if slot_info().get("is_active") is False or not dd.configured():
+        return None
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM subscriptions LIMIT 1").fetchone():
+            return None
+    from credits.subscriptions import sync_with_dodo
+    return sync_with_dodo()
+
+
+async def _studio_pass_sync_loop():
+    """Safety net for Studio Pass: re-checks subscriptions and grants any
+    paid cycle whose webhook never arrived. Only the live slot runs it."""
+    while True:
+        try:
+            await asyncio.sleep(STUDIO_PASS_SYNC_INTERVAL_SECONDS)
+            report = await asyncio.get_running_loop().run_in_executor(None, _studio_pass_sync_once)
+            if report and (report["payments_applied"] or report["errors"]):
+                logger.warning(f"[CREDITS] Studio Pass sync: {report}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[CREDITS] Studio Pass sync failed: {e}", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -243,6 +275,7 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_job_cleanup_loop())
     credit_sweep_task = asyncio.create_task(_credit_hold_sweep_loop())
+    pass_sync_task = asyncio.create_task(_studio_pass_sync_loop())
     log_prune_task = asyncio.create_task(_log_prune_loop())
     from routes.batch import batch_reaper_loop
     batch_reaper_task = asyncio.create_task(batch_reaper_loop())
@@ -263,9 +296,10 @@ async def lifespan(app: FastAPI):
     # a deletion in progress isn't torn down mid-write.
     cleanup_task.cancel()
     credit_sweep_task.cancel()
+    pass_sync_task.cancel()
     log_prune_task.cancel()
     batch_reaper_task.cancel()
-    for task in (cleanup_task, credit_sweep_task, log_prune_task, batch_reaper_task):
+    for task in (cleanup_task, credit_sweep_task, pass_sync_task, log_prune_task, batch_reaper_task):
         try:
             await task
         except asyncio.CancelledError:

@@ -100,7 +100,8 @@ async def send_receipt(event: PaymentEvent, balance: int) -> None:
     with connect() as conn, tx(conn):
         link = issue_magic_link(conn, email=event.email, subject_id=None, ip_hash=None)
 
-    subject, html, text = mailer.receipt_email(event.credits, balance, link)
+    subject, html, text = mailer.receipt_email(event.credits, balance, link,
+                                               renewing="pass" in (event.pack_keys or []))
     error: str | None = None
     try:
         await mailer.send_email(event.email, subject, html, text)

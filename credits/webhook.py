@@ -83,6 +83,30 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
         log.warning("rejected %s webhook: verification failed", provider)
         raise HTTPException(status_code=401, detail={"error": "bad_signature"})
 
+    event_type = str(payload.get("type") or "") if isinstance(payload, dict) else ""
+    if provider == "dodo" and event_type.startswith(("subscription.", "refund.", "dispute.")):
+        from . import reversals, subscriptions
+        data = payload.get("data") or {}
+        try:
+            if event_type.startswith("subscription."):
+                status, transition, row = subscriptions.record_dodo_event(
+                    event_type, data, str(payload.get("timestamp") or "") or None,
+                )
+                await subscriptions.notify(transition, row)
+                return {"ok": True, "subscription": status}
+            if event_type == "refund.succeeded":
+                return {"ok": True, **reversals.apply_refund(data)}
+            if event_type.startswith("dispute."):
+                return {"ok": True, **reversals.apply_dispute(event_type, data)}
+            log.info("dodo %s noted", event_type)
+            return {"ok": True, "ignored": True}
+        except ValueError as exc:
+            log.error("dodo %s unprocessable: %s", event_type, exc)
+            raise HTTPException(status_code=400, detail={"error": "unprocessable", "message": str(exc)})
+        except Exception:  # noqa: BLE001
+            log.exception("could not process dodo %s", event_type)
+            raise HTTPException(status_code=500, detail={"error": "processing_failed"})
+
     try:
         event = adapter.to_event(payload)
     except WebhookUnprocessable as exc:
