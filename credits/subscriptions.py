@@ -9,7 +9,7 @@ import logging
 import sqlite3
 
 from .config import get_settings
-from .db import connect, now_iso, tx
+from .db import connect, normalize_ts, now_iso, tx
 from .identity import Identity, get_or_create_account
 
 log = logging.getLogger("credits.subscriptions")
@@ -39,63 +39,123 @@ def _alert(message: str) -> None:
         log.critical(message)
 
 
+_TRACKED = ("account_id", "email", "customer_id", "product_id", "status",
+            "cancel_at_next_billing_date", "next_billing_date")
+
+
+def _resolve_account(conn: sqlite3.Connection, row, data: dict, email: str):
+    """Account id this server wrote into the checkout, then the stored row,
+    then the first Pass order, and only then the buyer's email."""
+    metadata = data.get("metadata") or {}
+    candidates = [str(metadata.get("af_account") or ""), row["account_id"] if row else None]
+    order = conn.execute(
+        "SELECT account_id FROM orders WHERE subscription_id=? AND account_id IS NOT NULL ORDER BY created_at LIMIT 1",
+        (str(data.get("subscription_id") or ""),)).fetchone()
+    candidates.append(order["account_id"] if order else None)
+    for candidate in candidates:
+        if candidate:
+            acc = conn.execute("SELECT id, email FROM accounts WHERE id=?", (candidate,)).fetchone()
+            if acc:
+                return acc["id"], acc["email"]
+    if email:
+        account_id = get_or_create_account(conn, email)
+        return account_id, email
+    return None, None
+
+
 def record_dodo_event(event_type: str, data: dict, event_at: str | None,
                       force: bool = False) -> tuple[str, str | None, dict]:
     """Upserts one subscription from a Dodo subscription payload. Returns
-    (status, transition, row) where transition names the email to send."""
+    (status, transition, row) where transition names the email to send.
+    updated_at only moves when a tracked field actually changes."""
     sub_id = str(data.get("subscription_id") or "")
     if not sub_id:
         raise ValueError("subscription event without subscription_id")
     status = str(data.get("status") or "").lower() or event_type.split(".", 1)[-1]
-    cancel = bool(data.get("cancel_at_next_billing_date"))
+    cancel = 1 if data.get("cancel_at_next_billing_date") else 0
     customer = data.get("customer") or {}
-    email = str(customer.get("email") or "").strip().lower()
-    stamp = event_at or now_iso()
+    buyer_email = str(customer.get("email") or "").strip().lower()
+    stamp = normalize_ts(event_at) or now_iso()
+    now = now_iso()
 
     with connect() as conn, tx(conn):
         row = conn.execute("SELECT * FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone()
-        if not force and row and row["last_event_at"] and row["last_event_at"] > stamp:
-            log.info("subscription %s: ignoring older %s", sub_id, event_type)
-            return row["status"], None, dict(row)
-        account_id = row["account_id"] if row and row["account_id"] else (
-            get_or_create_account(conn, email) if email else None)
+        if not force and row and row["last_event_at"]:
+            last = normalize_ts(row["last_event_at"]) or row["last_event_at"]
+            if last > stamp:
+                log.info("subscription %s: ignoring older %s", sub_id, event_type)
+                return row["status"], None, dict(row)
+        account_id, account_email = _resolve_account(conn, row, data, buyer_email)
+        new = {
+            "account_id": account_id,
+            "email": account_email or buyer_email or (row["email"] if row else None),
+            "customer_id": str(customer.get("customer_id") or "") or (row["customer_id"] if row else None),
+            "product_id": str(data.get("product_id") or "") or (row["product_id"] if row else None),
+            "status": status,
+            "cancel_at_next_billing_date": cancel,
+            "next_billing_date": (normalize_ts(data.get("next_billing_date"))
+                                  or (row["next_billing_date"] if row else None)),
+        }
         transition = _transition(row["status"] if row else None,
                                  bool(row["cancel_at_next_billing_date"]) if row else None,
-                                 status, cancel)
-        conn.execute(
-            """INSERT INTO subscriptions (subscription_id, provider, account_id, email, customer_id,
-                   product_id, status, cancel_at_next_billing_date, next_billing_date,
-                   last_event, last_event_at, created_at, updated_at)
-               VALUES (?, 'dodo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(subscription_id) DO UPDATE SET
-                   account_id=COALESCE(subscriptions.account_id, excluded.account_id),
-                   email=COALESCE(excluded.email, subscriptions.email),
-                   customer_id=COALESCE(excluded.customer_id, subscriptions.customer_id),
-                   product_id=COALESCE(excluded.product_id, subscriptions.product_id),
-                   status=excluded.status,
-                   cancel_at_next_billing_date=excluded.cancel_at_next_billing_date,
-                   next_billing_date=COALESCE(excluded.next_billing_date, subscriptions.next_billing_date),
-                   last_event=excluded.last_event,
-                   last_event_at=MAX(COALESCE(subscriptions.last_event_at, ''), excluded.last_event_at),
-                   updated_at=excluded.updated_at""",
-            (sub_id, account_id, email or None, str(customer.get("customer_id") or "") or None,
-             str(data.get("product_id") or "") or None, status, 1 if cancel else 0,
-             str(data.get("next_billing_date") or "") or None,
-             event_type, stamp, now_iso(), now_iso()),
-        )
+                                 status, bool(cancel))
+        last_event_at = max(stamp, normalize_ts(row["last_event_at"]) or "") if row else stamp
+        if row is None:
+            conn.execute(
+                """INSERT INTO subscriptions (subscription_id, provider, account_id, email, customer_id,
+                       product_id, status, cancel_at_next_billing_date, next_billing_date,
+                       last_event, last_event_at, created_at, updated_at, last_synced_at, ended_at)
+                   VALUES (?, 'dodo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sub_id, new["account_id"], new["email"], new["customer_id"], new["product_id"],
+                 status, cancel, new["next_billing_date"], event_type, last_event_at, now, now,
+                 now if force else None, now if status in ENDED_STATUSES else None),
+            )
+        else:
+            changed = [k for k in _TRACKED if new[k] != row[k]]
+            ended_at = row["ended_at"]
+            if status in ENDED_STATUSES and not ended_at:
+                ended_at = now
+            elif status not in ENDED_STATUSES:
+                ended_at = None
+            conn.execute(
+                f"""UPDATE subscriptions SET {", ".join(f"{k}=?" for k in _TRACKED)},
+                       last_event=?, last_event_at=?, ended_at=?,
+                       updated_at=?, last_synced_at=COALESCE(?, last_synced_at)
+                   WHERE subscription_id=?""",
+                (*[new[k] for k in _TRACKED], event_type, last_event_at, ended_at,
+                 now if changed else row["updated_at"], now if force else None, sub_id),
+            )
         saved = dict(conn.execute("SELECT * FROM subscriptions WHERE subscription_id=?", (sub_id,)).fetchone())
-        duplicate = None
+        duplicates = []
         if status == "active" and account_id:
-            duplicate = conn.execute(
-                "SELECT subscription_id FROM subscriptions WHERE account_id=? AND status='active'"
-                " AND subscription_id<>?", (account_id, sub_id)).fetchone()
+            duplicates = [dict(r) for r in conn.execute(
+                "SELECT subscription_id, created_at FROM subscriptions WHERE account_id=? AND status='active'"
+                " AND subscription_id<>?", (account_id, sub_id)).fetchall()]
 
-    if duplicate:
-        _alert(f"Studio Pass: account {account_id} ({email}) has two active subscriptions "
-               f"({duplicate['subscription_id']} and {sub_id}). Cancel one and refund it in Dodo.")
+    if duplicates:
+        _handle_duplicates(account_id, saved, duplicates)
     log.info("subscription %s -> %s (%s)%s", sub_id, status, event_type,
              f" transition={transition}" if transition else "")
     return status, transition, saved
+
+
+def _handle_duplicates(account_id: str, current: dict, others: list[dict]) -> None:
+    """A second active Pass on one account: the newer one is set to stop
+    renewing, and the owner is told to refund it."""
+    rows = sorted([current, *others], key=lambda r: (r["created_at"], r["subscription_id"]))
+    keep, extras = rows[0], rows[1:]
+    from .providers import dodo as dd
+    for extra in extras:
+        try:
+            dd.set_cancel_at_period_end(extra["subscription_id"], True)
+            set_cancel_flag(extra["subscription_id"], True)
+            outcome = "set to stop renewing"
+        except Exception:  # noqa: BLE001
+            log.exception("could not stop duplicate subscription %s", extra["subscription_id"])
+            outcome = "COULD NOT be stopped, cancel it by hand"
+        _alert(f"Studio Pass: account {account_id} had a second active subscription "
+               f"{extra['subscription_id']} (keeping {keep['subscription_id']}). It was {outcome}. "
+               f"Refund it in Dodo.")
 
 
 def set_cancel_flag(subscription_id: str, cancel: bool) -> str | None:
@@ -132,9 +192,17 @@ def has_active_pass(identity: Identity) -> bool:
     return bool(row and row["status"] in ACTIVE_STATUSES)
 
 
+def has_blocking_pass(identity: Identity):
+    """An active or on-hold Pass that should stop a second checkout."""
+    row = current_for(identity)
+    return row if row and row["status"] in ("active", "on_hold") else None
+
+
 def summary(identity: Identity) -> dict:
+    from .passlots import summary as lot_summary
     s = get_settings()
     row = current_for(identity)
+    lots = lot_summary(identity.account_id if identity else None)
     return {
         "available": s.studio_pass_enabled,
         "price_usd": s.studio_pass_price_usd,
@@ -145,29 +213,21 @@ def summary(identity: Identity) -> dict:
         "renews_at": row["next_billing_date"] if row else None,
         "cancel_at_period_end": bool(row["cancel_at_next_billing_date"]) if row else False,
         "can_manage": bool(row and row["customer_id"]),
+        "rollover_months": s.studio_pass_rollover_months,
+        "pass_credits": lots["credits"],
+        "next_expiry": lots["next_expiry"],
     }
 
 
-async def notify(transition: str | None, row: dict) -> None:
-    """Sends the lifecycle email for a transition. Never raises."""
-    if not transition or not row or not row.get("email"):
-        return
-    from . import mailer
-    s = get_settings()
-    try:
-        subject, html, text = mailer.pass_email(
-            transition, credits=s.studio_pass_credits, price_usd=s.studio_pass_price_usd,
-            date=row.get("next_billing_date"), manage_url=f"{s.frontend_url}{MANAGE_PATH}",
-        )
-        await mailer.send_email(row["email"], subject, html, text)
-        log.info("studio pass email %s sent for %s", transition, row.get("subscription_id"))
-    except Exception:  # noqa: BLE001
-        log.exception("studio pass email %s failed for %s", transition, row.get("subscription_id"))
+def notify(transition: str | None, row: dict | None, dedupe: str | None = None) -> bool:
+    """Queues the lifecycle email for a transition. Never raises."""
+    from .notifications import queue_pass_email
+    return queue_pass_email(transition, row, dedupe)
 
 
 def sync_with_dodo(days: int = 45) -> dict:
-    """Re-reads every recent subscription from Dodo, then grants any paid
-    cycle whose payment.succeeded webhook never arrived. Idempotent."""
+    """Re-reads live and recently ended subscriptions from Dodo, then grants
+    any paid cycle whose payment.succeeded webhook never arrived. Idempotent."""
     from . import fulfil
     from .providers import dodo as dd
     from .providers import WebhookUnprocessable
@@ -177,7 +237,8 @@ def sync_with_dodo(days: int = 45) -> dict:
         rows = conn.execute(
             """SELECT subscription_id FROM subscriptions
                WHERE status IN ('active','on_hold','pending')
-                  OR updated_at > strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
+                  OR ended_at IS NULL
+                  OR ended_at > strftime('%Y-%m-%dT%H:%M:%SZ','now',?)""",
             (f"-{int(days)} days",),
         ).fetchall()
 
@@ -189,7 +250,7 @@ def sync_with_dodo(days: int = 45) -> dict:
             status, transition, saved = record_dodo_event("sync", data, None, force=True)
             if transition:
                 report["updated"] += 1
-                asyncio.run(notify(transition, saved))
+                notify(transition, saved, dedupe=f"sync:{saved.get('updated_at')}")
             for item in dd.list_subscription_payments(sub_id):
                 payment_id = str(item.get("payment_id") or "")
                 if not payment_id:
@@ -217,32 +278,45 @@ def sync_with_dodo(days: int = 45) -> dict:
             log.exception("sync failed for subscription %s", sub_id)
     if report["checked"]:
         log.info("studio pass sync: %s", report)
+    if report["updated"]:
+        from .notifications import send_transactional_blocking
+        send_transactional_blocking()
     return report
 
 
 def admin_overview() -> dict:
     s = get_settings()
     with connect() as conn:
+        counts = {r["status"]: r["n"] for r in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM subscriptions GROUP BY status").fetchall()}
+        agg = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active,
+                 SUM(CASE WHEN status='active' AND cancel_at_next_billing_date=1 THEN 1 ELSE 0 END) AS cancelling,
+                 SUM(CASE WHEN created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days') THEN 1 ELSE 0 END)
+                     AS started_30d,
+                 SUM(CASE WHEN ended_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days') THEN 1 ELSE 0 END)
+                     AS churned_30d
+               FROM subscriptions""").fetchone()
         rows = [dict(r) for r in conn.execute(
-            """SELECT subscription_id, email, status, cancel_at_next_billing_date AS cancel_at_period_end,
-                      next_billing_date, created_at, updated_at
-               FROM subscriptions ORDER BY updated_at DESC LIMIT 500""").fetchall()]
-        churned_30d = conn.execute(
-            """SELECT COUNT(*) AS n FROM subscriptions WHERE status IN ('cancelled','expired')
-               AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')""").fetchone()["n"]
-        started_30d = conn.execute(
-            """SELECT COUNT(*) AS n FROM subscriptions
-               WHERE created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')""").fetchone()["n"]
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    active = counts.get("active", 0)
+            """SELECT subscription_id, account_id, email, status,
+                      cancel_at_next_billing_date AS cancel_at_period_end,
+                      next_billing_date, created_at, updated_at, last_synced_at, ended_at
+               FROM subscriptions ORDER BY updated_at DESC LIMIT 200""").fetchall()]
+        lots = conn.execute(
+            """SELECT COALESCE(SUM(CASE WHEN status='active' THEN remaining ELSE 0 END),0) AS outstanding,
+                      COALESCE(SUM(expired_credits),0) AS expired
+               FROM pass_credit_lots""").fetchone()
+    active = int(agg["active"] or 0)
+    cancelling = int(agg["cancelling"] or 0)
     return {
         "counts": counts,
         "active": active,
-        "cancelling_at_period_end": sum(1 for r in rows if r["status"] == "active" and r["cancel_at_period_end"]),
-        "mrr_usd": round(active * s.studio_pass_price_usd, 2),
-        "started_30d": started_30d,
-        "churned_30d": churned_30d,
+        "cancelling_at_period_end": cancelling,
+        "mrr_usd": round((active - cancelling) * s.studio_pass_price_usd, 2),
+        "started_30d": int(agg["started_30d"] or 0),
+        "churned_30d": int(agg["churned_30d"] or 0),
+        "pass_credits_outstanding": int(lots["outstanding"]),
+        "pass_credits_expired": int(lots["expired"]),
         "subscriptions": rows,
     }

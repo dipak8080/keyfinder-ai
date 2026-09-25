@@ -50,6 +50,8 @@ class PaymentEvent:
     # Our own checkout reference (order_sources key), when it differs
     # from the payment id.
     order_ref: str = ""
+    account_id: str = ""
+    subscription_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 

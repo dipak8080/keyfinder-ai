@@ -121,11 +121,14 @@ def _call(method: str, path: str, *, json_body=None) -> dict:
     return resp.json() or {}
 
 
-def create_checkout(pack, email: str, ref: str) -> dict:
+def create_checkout(pack, email: str, ref: str, account_id: str | None = None) -> dict:
     product_id = product_id_for(pack.key)
     if not product_id:
         raise DodoError(f"DODO_PRODUCT_{pack.key.upper()} is not set")
     clean = (email or "").strip().lower()
+    metadata = {"af_ref": ref, "pack": pack.key, "email": clean}
+    if account_id:
+        metadata["af_account"] = account_id
     return _call(
         "POST",
         "/checkouts",
@@ -133,7 +136,7 @@ def create_checkout(pack, email: str, ref: str) -> dict:
             "product_cart": [{"product_id": product_id, "quantity": 1}],
             "customer": {"email": clean},
             "return_url": return_url(),
-            "metadata": {"af_ref": ref, "pack": pack.key, "email": clean},
+            "metadata": metadata,
             "feature_flags": {"allow_discount_code": False},
         },
     )
@@ -162,6 +165,11 @@ def create_portal_link(customer_id: str, return_url: str) -> str:
 def set_cancel_at_period_end(subscription_id: str, cancel: bool) -> dict:
     return _call("PATCH", f"/subscriptions/{subscription_id}",
                  json_body={"cancel_at_next_billing_date": bool(cancel)})
+
+
+def cancel_subscription(subscription_id: str) -> dict:
+    """Ends a subscription now. Used when its payment is refunded or disputed."""
+    return _call("PATCH", f"/subscriptions/{subscription_id}", json_body={"status": "cancelled"})
 
 
 def event_from_payment(payment: dict, *, delivery_id: str = "", raw: dict | None = None):
@@ -224,6 +232,8 @@ def event_from_payment(payment: dict, *, delivery_id: str = "", raw: dict | None
         currency="USD",
         delivery_id=delivery_id or payment_id,
         order_ref=str(metadata.get("af_ref") or ""),
+        account_id=str(metadata.get("af_account") or ""),
+        subscription_id=subscription_id,
         raw=raw if raw is not None else payment,
     )
 

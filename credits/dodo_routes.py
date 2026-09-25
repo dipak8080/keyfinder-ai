@@ -44,7 +44,7 @@ def _rate_limited(max_requests: int, window_seconds: int):
 
 class CheckoutRequest(BaseModel):
     pack: str = Field(..., max_length=32)
-    email: EmailStr
+    email: EmailStr | None = None
     source: str | None = Field(default=None, max_length=64)
     tool: str | None = Field(default=None, max_length=64)
     page: str | None = Field(default=None, max_length=128)
@@ -73,15 +73,16 @@ def _require_enabled() -> None:
         raise HTTPException(status_code=503, detail={"error": "dodo_not_configured"})
 
 
-def _record_source(ref: str, body: CheckoutRequest, identity: Identity) -> None:
+def _record_source(ref: str, body: CheckoutRequest, identity: Identity,
+                   account_id: str | None = None) -> None:
     try:
         with connect() as conn, tx(conn):
             conn.execute(
                 """INSERT OR REPLACE INTO order_sources
-                   (provider, provider_order_id, source, tool, page, subject_id, created_at)
-                   VALUES ('dodo', ?, ?, ?, ?, ?, ?)""",
+                   (provider, provider_order_id, source, tool, page, subject_id, created_at, account_id)
+                   VALUES ('dodo', ?, ?, ?, ?, ?, ?, ?)""",
                 (ref, _tag(body.source), _tag(body.tool),
-                 (body.page or "").strip()[:128] or None, identity.subject_id, now_iso()),
+                 (body.page or "").strip()[:128] or None, identity.subject_id, now_iso(), account_id),
             )
     except Exception:  # noqa: BLE001
         log.exception("could not record order source for %s", ref)
@@ -106,19 +107,32 @@ def create_checkout(
     _require_enabled()
 
     settings = get_settings()
+    account_id = None
     if body.pack == "pass":
         if not settings.studio_pass_enabled or not dd.pass_product_id():
             raise HTTPException(status_code=400, detail={"error": "pass_unavailable"})
-        if subscriptions.has_active_pass(identity):
-            raise HTTPException(status_code=409, detail={"error": "already_subscribed",
-                                                         "message": "You already have an active Studio Pass."})
+        if not identity.session_id or not identity.account_id or not identity.email:
+            raise HTTPException(status_code=401, detail={"error": "sign_in_required",
+                                                         "message": "Sign in to start a Studio Pass."})
+        existing = subscriptions.has_blocking_pass(identity)
+        if existing is not None:
+            on_hold = existing["status"] == "on_hold"
+            raise HTTPException(status_code=409, detail={
+                "error": "pass_on_hold" if on_hold else "already_subscribed",
+                "message": ("Your Studio Pass is paused because a payment failed. Update your card "
+                            "from your account to switch it back on.") if on_hold else
+                           "You already have an active Studio Pass.",
+            })
         pack = settings.pass_pack()
+        account_id = identity.account_id
+        email = identity.email.strip().lower()
     else:
         pack = settings.pack(body.pack)
+        if body.email is None:
+            raise HTTPException(status_code=422, detail={"error": "email_required"})
+        email = str(body.email).strip().lower()
     if pack is None:
         raise HTTPException(status_code=400, detail={"error": "unknown_pack"})
-
-    email = str(body.email).strip().lower()
 
     try:
         claims.record_claim(
@@ -129,10 +143,10 @@ def create_checkout(
         log.exception("could not record claim for %s", email)
 
     ref = new_id("dco_")
-    _record_source(ref, body, identity)
+    _record_source(ref, body, identity, account_id)
 
     try:
-        session = dd.create_checkout(pack, email, ref)
+        session = dd.create_checkout(pack, email, ref, account_id=account_id)
     except dd.DodoError as exc:
         log.error("dodo checkout creation failed for %s: %s", pack.key, exc)
         raise HTTPException(status_code=502, detail={"error": "dodo_unavailable"})
@@ -202,11 +216,10 @@ def _set_pass_cancel(identity: Identity, cancel: bool) -> dict:
         raise HTTPException(status_code=502, detail={"error": "dodo_unavailable"})
     transition = subscriptions.set_cancel_flag(row["subscription_id"], cancel)
     if transition:
-        try:
-            fresh = subscriptions.current_for(identity)
-            asyncio.run(subscriptions.notify(transition, dict(fresh) if fresh else None))
-        except Exception:  # noqa: BLE001
-            log.exception("pass %s email failed", transition)
+        fresh = subscriptions.current_for(identity)
+        if subscriptions.notify(transition, dict(fresh) if fresh else None):
+            from .notifications import send_transactional_blocking
+            send_transactional_blocking()
     log.info("studio pass %s %s by %s", row["subscription_id"],
              "set to cancel at period end" if cancel else "resumed", identity.account_id)
     return {"ok": True, "studio_pass": subscriptions.summary(identity)}

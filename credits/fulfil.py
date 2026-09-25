@@ -22,6 +22,30 @@ from .security import new_id
 log = logging.getLogger("credits.fulfil")
 
 
+def _resolve_account(conn, event: PaymentEvent) -> str:
+    """The account a payment belongs to. The account id this server wrote
+    into the checkout wins; the buyer's email is only the fallback for
+    purchases made without an account."""
+    candidates = [event.account_id]
+    if event.order_ref:
+        src = conn.execute("SELECT account_id FROM order_sources WHERE provider=? AND provider_order_id=?",
+                           (event.provider, event.order_ref)).fetchone()
+        candidates.append(src["account_id"] if src else None)
+    if event.subscription_id:
+        for sql in ("SELECT account_id FROM subscriptions WHERE subscription_id=?",
+                    "SELECT account_id FROM orders WHERE subscription_id=? AND account_id IS NOT NULL"
+                    " ORDER BY created_at LIMIT 1"):
+            row = conn.execute(sql, (event.subscription_id,)).fetchone()
+            candidates.append(row["account_id"] if row else None)
+    for candidate in candidates:
+        if candidate:
+            row = conn.execute("SELECT id, email FROM accounts WHERE id=?", (candidate,)).fetchone()
+            if row:
+                event.email = row["email"]
+                return row["id"]
+    return get_or_create_account(conn, event.email)
+
+
 def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
     """Account, claim, order and ledger in one transaction.
 
@@ -29,7 +53,7 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
     when the ledger's idempotency key already existed.
     """
     with connect() as conn, tx(conn):
-        account_id = get_or_create_account(conn, event.email)
+        account_id = _resolve_account(conn, event)
 
         # Which browser gets linked. order_sources.subject_id is written
         # server-side when THIS order was created, from the creator's own
@@ -66,13 +90,13 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
         conn.execute(
             """INSERT OR IGNORE INTO orders (id, provider, provider_order_id, provider_ref,
                account_id, subject_id, email, pack, credits, amount_cents, currency,
-               status, test_mode, created_at, raw)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?, 'paid', ?, ?, ?)""",
+               status, test_mode, created_at, raw, subscription_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?, 'paid', ?, ?, ?, ?)""",
             (new_id("ord_"), event.provider, event.provider_txid,
              event.order_ref or str(event.raw.get("url") or ""), account_id, subject_id, event.email,
              ",".join(event.pack_keys), event.credits, round(event.amount_usd * 100),
              event.currency, 1 if _dodo.is_test() else 0,
-             now_iso(), json.dumps(event.raw)[:20000]),
+             now_iso(), json.dumps(event.raw)[:20000], event.subscription_id or None),
         )
 
         granted = grant(
@@ -82,6 +106,13 @@ def apply_payment(event: PaymentEvent) -> tuple[bool, int]:
             order_id=event.provider_txid,
             note=",".join(event.pack_keys) or f"{event.provider} order",
         )
+        if granted and "pass" in (event.pack_keys or []):
+            from .passlots import add_lot
+            add_lot(conn, account_id=account_id, payment_id=event.provider_txid,
+                    credits=event.credits, subscription_id=event.subscription_id)
+        if event.subscription_id:
+            conn.execute("UPDATE subscriptions SET account_id=? WHERE subscription_id=? AND account_id IS NULL",
+                         (account_id, event.subscription_id))
         if granted:
             referrer = referrals.on_paid_order(conn, account_id, event.provider_txid)
             if referrer:
@@ -108,8 +139,10 @@ async def send_receipt(event: PaymentEvent, balance: int) -> None:
     with connect() as conn, tx(conn):
         link = issue_magic_link(conn, email=event.email, subject_id=None, ip_hash=None)
 
+    from .config import get_settings
     subject, html, text = mailer.receipt_email(event.credits, balance, link,
-                                               renewing="pass" in (event.pack_keys or []))
+                                               renewing="pass" in (event.pack_keys or []),
+                                               rollover_months=get_settings().studio_pass_rollover_months)
     error: str | None = None
     try:
         await mailer.send_email(event.email, subject, html, text)

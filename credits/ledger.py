@@ -1,6 +1,7 @@
 """Credit ledger.
 
-credit_ledger is append-only — balance is SUM(delta), nothing expires.
+credit_ledger is append-only — balance is SUM(delta). Pack credits never
+expire; Studio Pass credits are tracked as lots in passlots.py and expire.
 The free tier is a separate monthly counter, tracked against both the owner
 (account or anonymous subject) and the IP hash, so clearing cookies gets a
 new subject but the same IP bucket.
@@ -403,6 +404,8 @@ def charge_for_job(identity: Identity, *, job_id: str, tool: str, credits_needed
                 charge_type, credits = "credit", credits_needed
                 grant(conn, owner_type=owner_type, owner_id=owner_id, amount=-credits_needed,
                      kind="job_hold", idempotency_key=f"job_hold:{job_id}", job_id=job_id, note=tool)
+                from .passlots import allocate
+                allocate(conn, owner_type=owner_type, owner_id=owner_id, job_id=job_id, credits=credits_needed)
 
         conn.execute(
             """INSERT INTO job_charges (job_id, tool, charge_type, owner_type, owner_id, subject_id,
@@ -479,6 +482,8 @@ def refund_job(job_id: str, reason: str = "job_failed") -> bool:
         if row["charge_type"] == "credit":
             grant(conn, owner_type=row["owner_type"], owner_id=row["owner_id"], amount=row["credits"],
                  kind="job_refund", idempotency_key=f"job_refund:{job_id}", job_id=job_id, note=reason)
+            from .passlots import restore
+            restore(conn, job_id)
         elif row["charge_type"] == "free":
             # Mirrors the charge exactly: every key that was bumped gets
             # decremented, read back FROM THE ROW rather than from the

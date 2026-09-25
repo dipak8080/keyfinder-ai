@@ -34,6 +34,52 @@ def now_iso() -> str:
     return utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_ts(value) -> datetime | None:
+    """Parses ISO 8601 (Z, +00:00, 0 to 9 fraction digits) or epoch seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    text = str(value).strip()
+    if text.replace(".", "", 1).isdigit():
+        return datetime.fromtimestamp(float(text), tz=timezone.utc)
+    text = text.replace(" ", "T", 1)
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    main, sep, rest = text.partition(".")
+    if sep:
+        n = 0
+        while n < len(rest) and rest[n].isdigit():
+            n += 1
+        digits, tail = rest[:n], rest[n:]
+        text = f"{main}.{(digits + '000000')[:6]}{tail}"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def normalize_ts(value) -> str | None:
+    """Any timestamp as this DB's own format, or None if unparseable."""
+    dt = parse_ts(value)
+    return iso(dt) if dt else None
+
+
+def add_months(dt: datetime, months: int) -> datetime:
+    total = dt.month - 1 + months
+    year, month = dt.year + total // 12, total % 12 + 1
+    days = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+            31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    return dt.replace(year=year, month=month, day=min(dt.day, days))
+
+
 def period_key(dt: datetime | None = None) -> str:
     """Free-tier billing period: calendar month, UTC."""
     return (dt or utcnow()).strftime("%Y-%m")

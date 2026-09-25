@@ -156,6 +156,7 @@ KNOWN_KEYS: dict[str, dict] = {
     "STUDIO_PASS_CREDITS": {"type": "int", "group": "studio pass", "min": 1, "max": 500},
     "STUDIO_PASS_PRICE_USD": {"type": "float", "group": "studio pass", "min": 1, "max": 100},
     "STUDIO_PASS_OPTIONS_INCLUDED": {"type": "bool", "group": "studio pass"},
+    "STUDIO_PASS_ROLLOVER_MONTHS": {"type": "int", "group": "studio pass", "min": 0, "max": 12},
     "EMAIL_LOW_BALANCE_ENABLED": {"type": "bool", "group": "email"},
     "LOW_BALANCE_THRESHOLD": {"type": "int", "group": "email", "min": 0, "max": 20},
     "EMAIL_MONTHLY_FREE_SONG_ENABLED": {"type": "bool", "group": "email"},

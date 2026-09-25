@@ -224,7 +224,15 @@ def magic_link_email(link: str, minutes: int) -> tuple[str, str, str]:
             text)
 
 
-def receipt_email(credits: int, balance: int, link: str, renewing: bool = False) -> tuple[str, str, str]:
+def pass_credit_life(rollover_months: int) -> str:
+    if rollover_months <= 0:
+        return "Unused Pass credits expire at your next renewal."
+    unit = "month" if rollover_months == 1 else "months"
+    return f"Unused Pass credits carry over for {rollover_months} {unit}, then expire."
+
+
+def receipt_email(credits: int, balance: int, link: str, renewing: bool = False,
+                  rollover_months: int = 2) -> tuple[str, str, str]:
     word = "credit" if credits == 1 else "credits"
     bal_word = "credit" if balance == 1 else "credits"
 
@@ -241,14 +249,14 @@ def receipt_email(credits: int, balance: int, link: str, renewing: bool = False)
         f'<p style="margin:6px 0 0;font-family:{MONO};font-size:28px;font-weight:700;'
         f'line-height:1;color:{AMBER}">{balance}</p>'
         f'<p style="margin:6px 0 0;font-family:{FONT};font-size:13px;color:{MUTED}">'
-        f'{bal_word} · never expire</p>'
+        f'{bal_word}{"" if renewing else " · never expire"}</p>'
         f'</td></tr></table></td></tr>'
     )
 
     body = (
         _heading(f"{credits} {word} added")
-        + _lede(("Your Studio Pass payment went through. It renews monthly until you "
-                 "cancel, and unused credits never expire.") if renewing else
+        + _lede((f"Your Studio Pass payment went through. It renews monthly until you "
+                 f"cancel. {pass_credit_life(rollover_months)} Pack credits never expire.") if renewing else
                 ("Thanks for your purchase. Your credits work on every paid tool "
                  "on the site, and nothing renews."))
         + balance_block
@@ -262,14 +270,15 @@ def receipt_email(credits: int, balance: int, link: str, renewing: bool = False)
     )
     text = (
         f"{credits} AudioForges {word} added\n\n"
-        + ("Studio Pass payment received. It renews monthly until you cancel.\n\n" if renewing else "")
-        + f"Balance: {balance} {bal_word}. Credits never expire.\n\n"
+        + (f"Studio Pass payment received. It renews monthly until you cancel. "
+           f"{pass_credit_life(rollover_months)} Pack credits never expire.\n\n" if renewing else "")
+        + f"Balance: {balance} {bal_word}." + ("" if renewing else " Credits never expire.") + "\n\n"
         f"Reach them on any device:\n{link}\n\n"
         "A problem with a run or your purchase? Email contact@audioforges.com.\n\n"
         "audioforges.com"
     )
     return (f"{credits} AudioForges {word} added",
-            _wrap(body, f"Balance: {balance} {bal_word}. Credits never expire."),
+            _wrap(body, f"Balance: {balance} {bal_word}." + ("" if renewing else " Credits never expire.")),
             text)
 
 def _pretty_date(value: str | None) -> str:
@@ -287,15 +296,14 @@ _PASS_COPY = {
         "Your Studio Pass is active",
         "Studio Pass is active",
         "{credits} credits are on your account, and {credits} more arrive every month. "
-        "Vocal options like de-reverb and lead/backing split cost nothing extra while "
-        "the Pass is active. Unused credits never expire.",
+        "Forge Clean and Forge Split cost nothing extra while the Pass is active. {life}",
         "It renews monthly at ${price} until you cancel. You can cancel anytime from your account.",
     ),
     "reactivated": (
         "Your Studio Pass is back on",
         "Studio Pass reactivated",
-        "Your payment went through and your Studio Pass is active again, with vocal "
-        "options included.",
+        "Your payment went through and your Studio Pass is active again, with Forge Clean "
+        "and Forge Split included.",
         "Next renewal: {date}.",
     ),
     "on_hold": (
@@ -308,8 +316,8 @@ _PASS_COPY = {
     "cancel_scheduled": (
         "Your Studio Pass will end on {date}",
         "Cancellation confirmed",
-        "Your Studio Pass won't renew. It stays active until {date}, and every credit "
-        "you have keeps working after that. Credits never expire.",
+        "Your Studio Pass won't renew. It stays active until {date}. Pass credits you "
+        "haven't used stay on your account until they expire, and pack credits never expire.",
         "Changed your mind? You can resume it from your account before that date.",
     ),
     "cancel_undone": (
@@ -321,17 +329,19 @@ _PASS_COPY = {
     "ended": (
         "Your Studio Pass has ended",
         "Studio Pass ended",
-        "Your Studio Pass is no longer active. Every credit on your account still "
-        "works and never expires.",
+        "Your Studio Pass is no longer active. Pass credits you haven't used stay on your "
+        "account until they expire, and pack credits never expire.",
         "You can start a new Pass or buy a credit pack anytime.",
     ),
 }
 
 
 def pass_email(kind: str, *, credits: int, price_usd: float, date: str | None,
-               manage_url: str) -> tuple[str, str, str]:
+               manage_url: str, rollover_months: int = 2) -> tuple[str, str, str]:
     subject, heading, lede, extra = _PASS_COPY[kind]
-    values = {"credits": credits, "price": f"{price_usd:.2f}", "date": _pretty_date(date) or "the end of this billing month"}
+    values = {"credits": credits, "price": f"{price_usd:.2f}",
+              "date": _pretty_date(date) or "the end of this billing month",
+              "life": pass_credit_life(rollover_months)}
     subject, lede, extra = (part.format(**values) for part in (subject, lede, extra))
     label = "Update my card" if kind == "on_hold" else "Open my account"
     body = _heading(heading) + _lede(lede) + (_lede(extra) if extra else "") + _cta(manage_url, label)

@@ -28,6 +28,7 @@ rather than left to whatever HTTPException happens to be raised.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -85,19 +86,25 @@ async def payment_webhook(request: Request, provider: str = Path(...)) -> dict:
 
     event_type = str(payload.get("type") or "") if isinstance(payload, dict) else ""
     if provider == "dodo" and event_type.startswith(("subscription.", "refund.", "dispute.")):
-        from . import reversals, subscriptions
+        from . import notifications, reversals, subscriptions
         data = payload.get("data") or {}
         try:
             if event_type.startswith("subscription."):
-                status, transition, row = subscriptions.record_dodo_event(
-                    event_type, data, str(payload.get("timestamp") or "") or None,
+                stamp = str(payload.get("timestamp") or "") or None
+                status, transition, row = await asyncio.to_thread(
+                    subscriptions.record_dodo_event, event_type, data, stamp,
                 )
-                await subscriptions.notify(transition, row)
+                if transition and subscriptions.notify(transition, row, dedupe=stamp or request.headers.get("webhook-id")):
+                    notifications.kick()
                 return {"ok": True, "subscription": status}
             if event_type == "refund.succeeded":
-                return {"ok": True, **reversals.apply_refund(data)}
+                result = await asyncio.to_thread(reversals.apply_refund, data)
+                notifications.kick()
+                return {"ok": True, **result}
             if event_type.startswith("dispute."):
-                return {"ok": True, **reversals.apply_dispute(event_type, data)}
+                result = await asyncio.to_thread(reversals.apply_dispute, event_type, data)
+                notifications.kick()
+                return {"ok": True, **result}
             log.info("dodo %s noted", event_type)
             return {"ok": True, "ignored": True}
         except ValueError as exc:

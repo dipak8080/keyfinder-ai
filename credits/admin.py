@@ -1186,6 +1186,18 @@ def studio_pass_sync_now() -> dict:
     return subscriptions.sync_with_dodo()
 
 
+@router.get("/scheduler", dependencies=ADMIN)
+def scheduler_status() -> dict:
+    import scheduler
+    return {**scheduler.status(), "slot": slot_info()}
+
+
+@router.post("/pass-credits/expire", dependencies=ADMIN_WRITE)
+def pass_credits_expire_now() -> dict:
+    from .passlots import expire_due
+    return expire_due()
+
+
 class UpdateEmail(BaseModel):
     subject: str = Field(..., min_length=3, max_length=120)
     message: str = Field(..., min_length=10, max_length=5000)

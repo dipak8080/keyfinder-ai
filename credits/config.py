@@ -395,6 +395,7 @@ class Settings:
     studio_pass_credits: int
     studio_pass_price_usd: float
     studio_pass_options_included: bool
+    studio_pass_rollover_months: int
 
     # lifecycle email
     email_low_balance_enabled: bool
@@ -584,6 +585,7 @@ def build_settings() -> Settings:
         studio_pass_credits=max(1, _int("STUDIO_PASS_CREDITS", 40)),
         studio_pass_price_usd=_float("STUDIO_PASS_PRICE_USD", 7.99),
         studio_pass_options_included=_bool("STUDIO_PASS_OPTIONS_INCLUDED", True),
+        studio_pass_rollover_months=min(12, max(0, _int("STUDIO_PASS_ROLLOVER_MONTHS", 2))),
         email_low_balance_enabled=_bool("EMAIL_LOW_BALANCE_ENABLED", True),
         low_balance_threshold=max(0, _int("LOW_BALANCE_THRESHOLD", 2)),
         email_monthly_free_song_enabled=_bool("EMAIL_MONTHLY_FREE_SONG_ENABLED", False),

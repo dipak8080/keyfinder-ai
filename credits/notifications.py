@@ -7,19 +7,23 @@ links, and no one gets the same email twice."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import mailer
 from .config import get_settings
-from .db import connect, now_iso, tx
+from .db import connect, iso, next_period_start_iso, now_iso, tx, utcnow
 from .identity import Identity
 from .security import sign, unsign
 
 log = logging.getLogger("credits.notifications")
 
 UNSUB_PURPOSE = "email_unsubscribe"
-PRIORITY = {"low_balance": 1, "referral": 3, "free_song": 5, "update": 9}
+PRIORITY = {"pass": 0, "low_balance": 1, "referral": 3, "free_song": 5, "update": 9}
+TRANSACTIONAL = ("pass",)
+MAX_ATTEMPTS = 5
+SENDING_STALE_MINUTES = 15
 
 
 def unsubscribe_url(account_id: str, scope: str) -> str:
@@ -67,14 +71,58 @@ def set_preferences(account_id: str, *, updates: bool | None = None, notices: bo
     return preferences(account_id)
 
 
-def _enqueue(conn, *, account_id: str, email: str, kind: str, dedupe_key: str,
-             subject: str, html: str, text: str, unsub: str) -> bool:
+def _enqueue(conn, *, account_id: str | None, email: str, kind: str, dedupe_key: str,
+             subject: str, html: str, text: str, unsub: str | None, not_after: str | None = None) -> bool:
     return conn.execute(
         """INSERT OR IGNORE INTO email_outbox (account_id, email, kind, dedupe_key, priority,
-               subject, html, text, unsubscribe_url, status, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?, 'queued', ?)""",
-        (account_id, email, kind, dedupe_key, PRIORITY.get(kind, 5), subject, html, text, unsub, now_iso()),
+               subject, html, text, unsubscribe_url, status, created_at, not_after)
+           VALUES (?,?,?,?,?,?,?,?,?, 'queued', ?, ?)""",
+        (account_id, email, kind, dedupe_key, PRIORITY.get(kind, 5), subject, html, text, unsub,
+         now_iso(), not_after),
     ).rowcount > 0
+
+
+def queue_pass_email(transition: str | None, row: dict | None, dedupe: str | None = None) -> bool:
+    """Queues the Studio Pass lifecycle email for a transition. Never raises."""
+    if not transition or not row or not row.get("email"):
+        return False
+    try:
+        from .subscriptions import MANAGE_PATH
+        s = get_settings()
+        subject, html, text = mailer.pass_email(
+            transition, credits=s.studio_pass_credits, price_usd=s.studio_pass_price_usd,
+            date=row.get("next_billing_date"), manage_url=f"{s.frontend_url}{MANAGE_PATH}",
+            rollover_months=s.studio_pass_rollover_months,
+        )
+        key = f"pass:{row.get('subscription_id')}:{transition}:{dedupe or now_iso()}"
+        with connect() as conn, tx(conn):
+            return _enqueue(conn, account_id=row.get("account_id"), email=row["email"], kind="pass",
+                            dedupe_key=key, subject=subject, html=html, text=text, unsub=None)
+    except Exception:  # noqa: BLE001
+        log.exception("studio pass email %s not queued for %s", transition, row.get("subscription_id"))
+        return False
+
+
+_kick_tasks: set = set()
+
+
+def kick() -> None:
+    """Sends queued transactional email now, from inside a running event loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(send_queued(kinds=TRANSACTIONAL))
+    _kick_tasks.add(task)
+    task.add_done_callback(_kick_tasks.discard)
+
+
+def send_transactional_blocking() -> None:
+    """Same as kick() for sync code running in a worker thread. Never raises."""
+    try:
+        asyncio.run(send_queued(kinds=TRANSACTIONAL))
+    except Exception:  # noqa: BLE001
+        log.warning("transactional send failed; the outbox retries it", exc_info=True)
 
 
 def maybe_low_balance(identity: Identity, balance_after: int | None) -> bool:
@@ -94,7 +142,8 @@ def maybe_low_balance(identity: Identity, balance_after: int | None) -> bool:
                 return False
             last = conn.execute(
                 """SELECT MAX(id) AS id FROM credit_ledger WHERE owner_type='account' AND owner_id=?
-                   AND kind IN ('purchase','bonus','admin_adjust')""", (identity.account_id,)).fetchone()["id"]
+                   AND kind IN ('purchase','bonus','admin_adjust') AND delta>0""",
+                (identity.account_id,)).fetchone()["id"]
             unsub = unsubscribe_url(identity.account_id, "notices")
             subject, html, text = mailer.low_balance_email(
                 int(balance_after), f"{s.frontend_url}/pricing", unsub)
@@ -118,14 +167,16 @@ def queue_referral_reward(conn, account_id: str, payment_id: str) -> None:
 
 
 def queue_monthly_free_song(now: datetime | None = None) -> int:
-    """On the first days of a month, queues 'your free song is ready' for
-    accounts that opted in to updates. Safe to call on every tick."""
+    """Queues 'your free song is ready' once per month for accounts that
+    opted in to updates. Runs whenever this month's batch is still missing.
+    Each email is dropped if it has not gone out by the end of the month."""
     s = get_settings()
     now = now or datetime.now(timezone.utc)
-    if not s.email_monthly_free_song_enabled or s.free_monthly_ops < 1 or now.day > 3:
+    if not s.email_monthly_free_song_enabled or s.free_monthly_ops < 1:
         return 0
     period = now.strftime("%Y-%m")
     month = now.strftime("%B")
+    not_after = next_period_start_iso(now)
     queued = 0
     with connect() as conn, tx(conn):
         if conn.execute("SELECT 1 FROM email_outbox WHERE dedupe_key=?", (f"free_song_batch:{period}",)).fetchone():
@@ -140,7 +191,7 @@ def queue_monthly_free_song(now: datetime | None = None) -> int:
             subject, html, text = mailer.free_song_email(month, f"{s.frontend_url}/vocal-remover", unsub)
             queued += _enqueue(conn, account_id=row["id"], email=row["email"], kind="free_song",
                                dedupe_key=f"free_song:{row['id']}:{period}",
-                               subject=subject, html=html, text=text, unsub=unsub)
+                               subject=subject, html=html, text=text, unsub=unsub, not_after=not_after)
         conn.execute(
             """INSERT OR IGNORE INTO email_outbox (email, kind, dedupe_key, status, created_at)
                VALUES ('-', 'marker', ?, 'marker', ?)""", (f"free_song_batch:{period}", now_iso()))
@@ -170,21 +221,59 @@ def sent_today() -> int:
         ).fetchone()["n"]
 
 
-async def send_queued(max_batch: int = 20) -> dict:
-    """Sends queued emails up to today's remaining cap, most urgent first."""
+def _housekeep(conn) -> None:
+    stamp = now_iso()
+    conn.execute("UPDATE email_outbox SET status='expired' WHERE status='queued' AND not_after IS NOT NULL"
+                 " AND not_after<=?", (stamp,))
+    stale = iso(utcnow() - timedelta(minutes=SENDING_STALE_MINUTES))
+    conn.execute("UPDATE email_outbox SET status='queued' WHERE status='sending' AND next_attempt_at<=?",
+                 (stale,))
+
+
+def _claim(row_id: int) -> bool:
+    with connect() as conn, tx(conn):
+        return conn.execute(
+            "UPDATE email_outbox SET status='sending', next_attempt_at=? WHERE id=? AND status='queued'",
+            (now_iso(), row_id)).rowcount > 0
+
+
+async def send_queued(max_batch: int = 20, kinds: tuple | None = None) -> dict:
+    """Sends queued emails, most urgent first. Transactional kinds ignore the
+    daily cap; the rest share what is left of it. Failed sends retry with
+    backoff up to MAX_ATTEMPTS."""
     s = get_settings()
     room = max(0, min(max_batch, s.email_daily_cap - sent_today()))
-    report = {"sent": 0, "failed": 0, "room": room}
-    if room == 0:
-        return report
+    report = {"sent": 0, "failed": 0, "retrying": 0, "room": room}
+    with connect() as conn, tx(conn):
+        _housekeep(conn)
+    kind_filter = ""
+    params: list = [now_iso()]
+    if kinds:
+        kind_filter = f" AND o.kind IN ({','.join('?' for _ in kinds)})"
+        params += list(kinds)
     with connect() as conn:
         rows = conn.execute(
-            """SELECT o.id, o.email, o.subject, o.html, o.text, o.unsubscribe_url, o.kind,
-                      a.email_updates, a.email_notices
-               FROM email_outbox o LEFT JOIN accounts a ON a.id=o.account_id
-               WHERE o.status='queued' ORDER BY o.priority, o.id LIMIT ?""", (room,)).fetchall()
+            f"""SELECT o.id, o.email, o.subject, o.html, o.text, o.unsubscribe_url, o.kind, o.attempts,
+                       a.email_updates, a.email_notices
+                FROM email_outbox o LEFT JOIN accounts a ON a.id=o.account_id
+                WHERE o.status='queued' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?){kind_filter}
+                ORDER BY o.priority, o.id LIMIT ?""", (*params, max_batch + room)).fetchall()
     for r in rows:
-        allowed = r["email_notices"] if r["kind"] in ("low_balance", "referral") else r["email_updates"]
+        transactional = r["kind"] in TRANSACTIONAL
+        if not transactional:
+            if room <= 0:
+                continue
+            room -= 1
+        if transactional:
+            allowed = True
+        elif r["kind"] in ("low_balance", "referral"):
+            allowed = r["email_notices"]
+        else:
+            allowed = r["email_updates"]
+        if not _claim(r["id"]):
+            continue
+        attempts = int(r["attempts"] or 0)
+        next_at = None
         if not allowed:
             status, error, sent_at = "skipped", None, None
         else:
@@ -194,12 +283,19 @@ async def send_queued(max_batch: int = 20) -> dict:
                 status, error, sent_at = "sent", None, now_iso()
                 report["sent"] += 1
             except Exception as exc:  # noqa: BLE001
-                status, error, sent_at = "failed", str(exc)[:300], None
-                report["failed"] += 1
-                log.warning("outbox email %s failed: %s", r["id"], exc)
+                attempts += 1
+                error, sent_at = str(exc)[:300], None
+                if attempts >= MAX_ATTEMPTS:
+                    status = "failed"
+                    report["failed"] += 1
+                else:
+                    status = "queued"
+                    next_at = iso(utcnow() + timedelta(minutes=5 * 2 ** (attempts - 1)))
+                    report["retrying"] += 1
+                log.warning("outbox email %s attempt %s failed: %s", r["id"], attempts, exc)
         with connect() as conn, tx(conn):
-            conn.execute("UPDATE email_outbox SET status=?, error=?, sent_at=? WHERE id=?",
-                         (status, error, sent_at, r["id"]))
+            conn.execute("UPDATE email_outbox SET status=?, error=?, sent_at=?, attempts=?, next_attempt_at=?"
+                         " WHERE id=?", (status, error, sent_at, attempts, next_at, r["id"]))
     return report
 
 
