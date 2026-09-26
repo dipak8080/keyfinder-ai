@@ -59,7 +59,8 @@ endpoint env STUDIO_ENGINE=sw (default) every Studio job runs one 6-stem
 BS-RoFormer SW pass: 6 stems as is, 4 stems fold guitar and piano into
 "other", the vocal remover's instrumental is the mix minus SW vocals.
 STUDIO_ENGINE=legacy restores the v12 chain (Kim vocals, htdemucs_ft,
-htdemucs_6s) without an image rollback.
+htdemucs_6s) without an image rollback. SW_QUALITY=max (v14) runs SW in full
+precision with overlap 4; "fast" (default) is the v13 behaviour.
   clip_start, clip_seconds  optional preview window; only that slice is
                          separated and max_duration_seconds is not applied
 
@@ -134,11 +135,28 @@ if STUDIO_ENGINE not in STUDIO_ENGINES:
     print(f"[CONFIG] Unknown STUDIO_ENGINE {STUDIO_ENGINE!r}, using 'sw'", flush=True)
     STUDIO_ENGINE = "sw"
 
-# SW stems get summed and subtracted, so per-stem peak normalisation must not
-# rescale them independently (1.0 only touches stems that would clip anyway).
-SEPARATOR_OPTIONS = {
-    SW_MODEL_FILENAME: {"normalization_threshold": 1.0},
-}
+SW_QUALITIES = ("fast", "max")
+SW_QUALITY = os.environ.get("SW_QUALITY", "fast").strip().lower()
+if SW_QUALITY not in SW_QUALITIES:
+    print(f"[CONFIG] Unknown SW_QUALITY {SW_QUALITY!r}, using 'fast'", flush=True)
+    SW_QUALITY = "fast"
+SW_MAX_OVERLAP = 4
+
+
+def _separator_options(model_filename: str) -> dict:
+    """fast: fp16 autocast, model's own overlap (2). max: full precision, overlap 4.
+    SW stems get summed and subtracted, so per-stem peak normalisation must not
+    rescale them independently (1.0 only touches stems that would clip anyway)."""
+    opts = {"use_autocast": True}
+    if model_filename == SW_MODEL_FILENAME:
+        opts["normalization_threshold"] = 1.0
+        if SW_QUALITY == "max":
+            opts["use_autocast"] = False
+            opts["mdxc_params"] = {
+                "segment_size": 256, "override_model_segment_size": False,
+                "batch_size": None, "overlap": SW_MAX_OVERLAP, "pitch_shift": 0,
+            }
+    return opts
 
 # One loaded Separator per model file, kept warm for the life of the
 # process. Each gets its own fixed output dir: a loaded model snapshots
@@ -159,8 +177,7 @@ def _get_separator(model_filename: str):
         model_file_dir=os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", "/worker/models"),
         output_dir=out_dir,
         output_format="WAV",
-        use_autocast=True,
-        **SEPARATOR_OPTIONS.get(model_filename, {}),
+        **_separator_options(model_filename),
     )
     sep.load_model(model_filename=model_filename)
     _SEPARATORS[model_filename] = (sep, out_dir)
@@ -774,6 +791,8 @@ def handler(job):
         }
         if model == "melband_roformer":
             result["studio_engine"] = STUDIO_ENGINE
+            if STUDIO_ENGINE == "sw":
+                result["sw_quality"] = SW_QUALITY
         if clip_seconds is not None:
             result["clip"] = {"start": clip_start, "seconds": clip_seconds, "source_duration": duration}
         return result
@@ -782,5 +801,5 @@ def handler(job):
 
 
 if __name__ == "__main__":
-    print(f"[CONFIG] Studio engine: {STUDIO_ENGINE}", flush=True)
+    print(f"[CONFIG] Studio engine: {STUDIO_ENGINE}, SW quality: {SW_QUALITY}", flush=True)
     runpod.serverless.start({"handler": handler})

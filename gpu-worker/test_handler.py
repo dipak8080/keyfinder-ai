@@ -182,6 +182,27 @@ class HandlerTests(unittest.TestCase):
         result, _ = self.run_job(task="stems", model="bogus")
         self.assertIn("Unsupported model", result["error"])
 
+class SeparatorOptionTests(unittest.TestCase):
+    def test_fast_is_v13_behaviour(self):
+        with mock.patch.object(H, "SW_QUALITY", "fast"):
+            self.assertEqual(H._separator_options(H.SW_MODEL_FILENAME),
+                             {"use_autocast": True, "normalization_threshold": 1.0})
+            self.assertEqual(H._separator_options(H.ROFORMER_MODEL_FILENAME), {"use_autocast": True})
+
+    def test_max_only_changes_sw(self):
+        with mock.patch.object(H, "SW_QUALITY", "max"):
+            sw = H._separator_options(H.SW_MODEL_FILENAME)
+            self.assertFalse(sw["use_autocast"])
+            self.assertEqual(sw["mdxc_params"]["overlap"], 4)
+            self.assertEqual(sw["normalization_threshold"], 1.0)
+            for other in (H.ROFORMER_MODEL_FILENAME, H.DEREVERB_MODEL_FILENAME, H.KARAOKE_MODEL_FILENAME):
+                self.assertEqual(H._separator_options(other), {"use_autocast": True})
+
+    def test_quality_reported_in_result(self):
+        with mock.patch.object(H, "SW_QUALITY", "max"):
+            result, _ = HandlerTests("run_job").run_job(task="separate", model="melband_roformer")
+        self.assertEqual(result["sw_quality"], "max")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
