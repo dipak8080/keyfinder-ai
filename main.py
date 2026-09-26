@@ -42,6 +42,7 @@ from credits.routes import router as credits_router
 from credits.auth import router as credits_auth_router
 from credits.webhook import router as credits_webhook_router
 from credits.dodo_routes import router as credits_dodo_router
+from credits.billing import router as credits_billing_router
 from credits.admin import router as credits_admin_router
 
 
@@ -554,6 +555,7 @@ app.include_router(gpu_internal_router)  # /internal/gpu/* - GPU worker file tra
 #   credits_auth_router     /auth/magic-link, /auth/verify, /auth/logout
 #   credits_webhook_router  /credits/webhook/{provider}
 #   credits_dodo_router     /credits/dodo/config, /checkout, /confirm
+#   credits_billing_router  /credits/history, /credits/orders, /credits/orders/{id}/invoice
 #
 # All three are live regardless of PAYWALL_ENABLED, on purpose. With the
 # paywall off, /credits/me reports enabled=false and the frontend renders
@@ -572,6 +574,7 @@ app.include_router(credits_router)
 app.include_router(credits_auth_router)
 app.include_router(credits_webhook_router)
 app.include_router(credits_dodo_router)
+app.include_router(credits_billing_router)
 
 # /admin/credits/* - operator surface: cost economics, user lookup,
 # webhook triage, manual adjust. Guarded by CREDITS_ADMIN_TOKEN, which is
