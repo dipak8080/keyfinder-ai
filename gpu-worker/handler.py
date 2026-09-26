@@ -50,11 +50,16 @@ INPUT (job["input"]):
   overlap                float, Demucs --overlap value
   max_duration_seconds  reject cleanly if the fetched audio exceeds this
   stem_count            optional, 4 (default) or 6; 6 adds guitar and piano
-                         from an htdemucs_6s pass on the htdemucs_ft "other"
-                         stem, and "other" becomes the remainder (v12)
   vocal_options         optional list: "dereverb" adds vocals_dry,
                          "lead_back" adds lead_vocals + backing_vocals
                          (melband_roformer only)
+
+STUDIO ENGINE (v13): model "melband_roformer" is the Studio tier. With the
+endpoint env STUDIO_ENGINE=sw (default) every Studio job runs one 6-stem
+BS-RoFormer SW pass: 6 stems as is, 4 stems fold guitar and piano into
+"other", the vocal remover's instrumental is the mix minus SW vocals.
+STUDIO_ENGINE=legacy restores the v12 chain (Kim vocals, htdemucs_ft,
+htdemucs_6s) without an image rollback.
   clip_start, clip_seconds  optional preview window; only that slice is
                          separated and max_duration_seconds is not applied
 
@@ -121,6 +126,20 @@ ALLOWED_STEM_COUNTS = (4, 6)
 MIN_CLIP_SECONDS = 5.0
 MAX_CLIP_SECONDS = 60.0
 
+SW_MODEL_FILENAME = "BS-Roformer-SW.ckpt"
+SW_STEMS = ("vocals", "drums", "bass", "other", "guitar", "piano")
+STUDIO_ENGINES = ("sw", "legacy")
+STUDIO_ENGINE = os.environ.get("STUDIO_ENGINE", "sw").strip().lower()
+if STUDIO_ENGINE not in STUDIO_ENGINES:
+    print(f"[CONFIG] Unknown STUDIO_ENGINE {STUDIO_ENGINE!r}, using 'sw'", flush=True)
+    STUDIO_ENGINE = "sw"
+
+# SW stems get summed and subtracted, so per-stem peak normalisation must not
+# rescale them independently (1.0 only touches stems that would clip anyway).
+SEPARATOR_OPTIONS = {
+    SW_MODEL_FILENAME: {"normalization_threshold": 1.0},
+}
+
 # One loaded Separator per model file, kept warm for the life of the
 # process. Each gets its own fixed output dir: a loaded model snapshots
 # output_dir at load_model() time, so retargeting it per job does not work.
@@ -141,6 +160,7 @@ def _get_separator(model_filename: str):
         output_dir=out_dir,
         output_format="WAV",
         use_autocast=True,
+        **SEPARATOR_OPTIONS.get(model_filename, {}),
     )
     sep.load_model(model_filename=model_filename)
     _SEPARATORS[model_filename] = (sep, out_dir)
@@ -167,6 +187,7 @@ def _run_separator(model_filename: str, input_path: str, work_dir: str, names: d
     started = time.monotonic()
     returned = sep.separate(input_path, custom_output_names=names)
     gpu_seconds = time.monotonic() - started
+    print(f"[TIMING] {model_filename}: {gpu_seconds:.1f}s", flush=True)
 
     by_name = {}
     for path in returned or []:
@@ -198,6 +219,77 @@ def _run_roformer_gpu(input_path: str, work_dir: str):
         },
     )
     return {"vocals": out["roformer_vocals"], "instrumental": out["roformer_instrumental"]}, gpu_seconds
+
+
+def _run_sw_gpu(input_path: str, work_dir: str):
+    """Returns ({stem: path} for all six SW stems, gpu_seconds)."""
+    out, gpu_seconds = _run_separator(
+        SW_MODEL_FILENAME, input_path, work_dir,
+        {s.capitalize(): f"sw_{s}" for s in SW_STEMS},
+    )
+    return {s: out[f"sw_{s}"] for s in SW_STEMS}, gpu_seconds
+
+
+def _write_combined(dest: str, plus, minus=()):
+    """Sums `plus` minus `minus` sample by sample and writes 16-bit PCM."""
+    import numpy as np
+    import soundfile as sf
+
+    arrays, sr = [], None
+    for path in (*plus, *minus):
+        data, part_sr = sf.read(path, dtype="float32", always_2d=True)
+        if sr is None:
+            sr = part_sr
+        elif part_sr != sr:
+            raise RuntimeError(f"sample rate mismatch: {path} is {part_sr}, expected {sr}")
+        arrays.append(data)
+    frames = min(len(a) for a in arrays)
+    total = np.zeros((frames, arrays[0].shape[1]), dtype="float32")
+    for i, data in enumerate(arrays):
+        if i < len(plus):
+            total += data[:frames]
+        else:
+            total -= data[:frames]
+    sf.write(dest, np.clip(total, -1.0, 1.0), sr, subtype="PCM_16")
+    return dest
+
+
+def _studio_sw_sources(clean_path: str, work_dir: str, task: str, stem_count: int):
+    """Returns (sources, vocals_path, gpu_seconds) for a Studio job on SW."""
+    sw, gpu_seconds = _run_sw_gpu(clean_path, work_dir)
+    if task == "separate":
+        instrumental = _write_combined(
+            os.path.join(work_dir, "sw_instrumental.wav"), (clean_path,), (sw["vocals"],),
+        )
+        return {"vocals": sw["vocals"], "instrumental": instrumental}, sw["vocals"], gpu_seconds
+    if stem_count == 6:
+        return {s: sw[s] for s in SW_STEMS}, sw["vocals"], gpu_seconds
+    other = _write_combined(
+        os.path.join(work_dir, "sw_other4.wav"), (sw["other"], sw["guitar"], sw["piano"]),
+    )
+    sources = {"vocals": sw["vocals"], "drums": sw["drums"], "bass": sw["bass"], "other": other}
+    return sources, sw["vocals"], gpu_seconds
+
+
+def _studio_legacy_sources(clean_path: str, work_dir: str, task: str, stem_count: int, overlap: float):
+    """The v12 chain: Kim vocals, htdemucs_ft on the instrumental, htdemucs_6s for 6 stems."""
+    roformer_sources, gpu_seconds = _run_roformer_gpu(clean_path, work_dir)
+    if task == "separate":
+        return dict(roformer_sources), roformer_sources["vocals"], gpu_seconds
+    track_dir, demucs_seconds = _run_demucs_gpu(
+        roformer_sources["instrumental"], work_dir,
+        ROFORMER_STEMS_SECOND_STAGE, overlap, two_stems=False,
+    )
+    gpu_seconds += demucs_seconds
+    sources = {"vocals": roformer_sources["vocals"]}
+    for s in MODEL_STEM_NAMES[ROFORMER_STEMS_SECOND_STAGE]:
+        if s != "vocals":
+            sources[s] = os.path.join(track_dir, f"{s}.wav")
+    if stem_count == 6:
+        extra, six_seconds = _split_other_six(sources["other"], work_dir, overlap)
+        gpu_seconds += six_seconds
+        sources.update(extra)
+    return sources, roformer_sources["vocals"], gpu_seconds
 
 
 def _run_vocal_options(vocals_path: str, work_dir: str, options):
@@ -504,6 +596,7 @@ def _run_demucs_gpu(input_path: str, work_dir: str, model: str, overlap: float, 
     started = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
     gpu_seconds = time.monotonic() - started
+    print(f"[TIMING] demucs {model}: {gpu_seconds:.1f}s", flush=True)
 
     if result.returncode != 0:
         stderr = result.stderr[-2000:]
@@ -636,26 +729,16 @@ def handler(job):
 
         try:
             if model == "melband_roformer":
-                roformer_sources, gpu_seconds = _run_roformer_gpu(clean_path, work_dir)
-                if task == "separate":
-                    sources = dict(roformer_sources)
-                else:
-                    # Stage 2: Demucs on the vocal-free instrumental.
-                    track_dir, demucs_seconds = _run_demucs_gpu(
-                        roformer_sources["instrumental"], work_dir,
-                        ROFORMER_STEMS_SECOND_STAGE, overlap, two_stems=False,
+                if STUDIO_ENGINE == "sw":
+                    sources, vocals_path, gpu_seconds = _studio_sw_sources(
+                        clean_path, work_dir, task, stem_count,
                     )
-                    gpu_seconds += demucs_seconds
-                    sources = {"vocals": roformer_sources["vocals"]}
-                    for s in MODEL_STEM_NAMES[ROFORMER_STEMS_SECOND_STAGE]:
-                        if s != "vocals":
-                            sources[s] = os.path.join(track_dir, f"{s}.wav")
-                    if stem_count == 6:
-                        extra, six_seconds = _split_other_six(sources["other"], work_dir, overlap)
-                        gpu_seconds += six_seconds
-                        sources.update(extra)
+                else:
+                    sources, vocals_path, gpu_seconds = _studio_legacy_sources(
+                        clean_path, work_dir, task, stem_count, overlap,
+                    )
                 if vocal_options:
-                    extra, extra_seconds = _run_vocal_options(roformer_sources["vocals"], work_dir, vocal_options)
+                    extra, extra_seconds = _run_vocal_options(vocals_path, work_dir, vocal_options)
                     gpu_seconds += extra_seconds
                     sources.update(extra)
             else:
@@ -689,6 +772,8 @@ def handler(job):
             "duration_seconds": clip_seconds if clip_seconds is not None else duration,
             "gpu_seconds": gpu_seconds,
         }
+        if model == "melband_roformer":
+            result["studio_engine"] = STUDIO_ENGINE
         if clip_seconds is not None:
             result["clip"] = {"start": clip_start, "seconds": clip_seconds, "source_duration": duration}
         return result
@@ -696,4 +781,6 @@ def handler(job):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    print(f"[CONFIG] Studio engine: {STUDIO_ENGINE}", flush=True)
+    runpod.serverless.start({"handler": handler})

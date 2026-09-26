@@ -408,7 +408,7 @@ async def _run_demucs_on_gpu(
 _CACHE_PREFIX = "af:sepcache:"
 # Bump whenever the GPU worker's models or pipeline change, so results made
 # by the old worker are never reused for the new one.
-SEPARATION_PIPELINE_VERSION = os.environ.get("SEPARATION_PIPELINE_VERSION", "worker-v12")
+SEPARATION_PIPELINE_VERSION = os.environ.get("SEPARATION_PIPELINE_VERSION", "worker-v13")
 
 
 def _fingerprint(input_path: str, task: str, model: str, overlap: float, extra_input: dict | None) -> str:

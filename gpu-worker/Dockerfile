@@ -110,6 +110,19 @@ sep_mod = __import__('audio_separator.separator', fromlist=['Separator']); \
  for m in ('dereverb-echo_mel_band_roformer_sdr_13.4843_v2.ckpt', 'mel_band_roformer_karaoke_becruily.ckpt')]; \
 "
 
+# Studio engine (v13): 6-stem SW weights, ~700 MB.
+RUN python -c "\
+import subprocess, tempfile, os; \
+work = tempfile.mkdtemp(); \
+tone = os.path.join(work, 'warmup.wav'); \
+subprocess.run(['ffmpeg', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10', '-ac', '2', tone], check=True); \
+sep_mod = __import__('audio_separator.separator', fromlist=['Separator']); \
+sep = sep_mod.Separator(model_file_dir='/worker/models', output_dir=work, output_format='WAV', normalization_threshold=1.0); \
+sep.load_model(model_filename='BS-Roformer-SW.ckpt'); \
+out = sep.separate(tone); \
+assert len(out) == 6, out; \
+"
+
 COPY handler.py .
 
 CMD ["python", "-u", "handler.py"]
